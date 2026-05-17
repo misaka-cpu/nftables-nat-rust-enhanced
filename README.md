@@ -18,6 +18,7 @@
 - 🚀 **开机自启**：支持 systemd 服务管理，开机自动启动
 - 🔍 **域名解析**：支持域名和 IP 地址，自动 DNS 解析和缓存
 - 🖥️ **Web 管理界面**：提供可视化的 WebUI 管理配置和查看规则，并且支持切换后端地址
+- 🧰 **终端管理菜单**：提供 SSH 终端交互入口，支持查看、添加、删除、备份和恢复规则
 
 ## 🖥️ 系统要求
 
@@ -57,6 +58,98 @@ systemctl disable --now iptables
 
 > 升级也使用相同的安装命令
 
+### 统一安装入口 install.sh
+
+从源码目录或已下载的 release 包中，可以使用 `install.sh` 作为统一安装入口。无参数运行时会显示交互菜单：
+
+```bash
+bash install.sh
+```
+
+菜单包含：
+
+```text
+1) 只安装核心转发服务 nat
+2) 安装核心转发服务 nat + WebUI nat-console
+3) 只安装 WebUI nat-console
+4) 只安装/更新 WebUI 静态资源 assets
+5) 卸载
+0) 退出
+```
+
+也可以使用非交互参数：
+
+```bash
+bash install.sh --core-only      # 只安装核心 nat，不安装 WebUI，不安装 nodejs/npm
+bash install.sh --with-console   # 安装核心 nat + WebUI nat-console
+bash install.sh --console-only   # 只安装 WebUI nat-console
+bash install.sh --assets-only    # 只安装/更新 WebUI 静态资源
+bash install.sh --uninstall      # 卸载
+bash install.sh --help           # 查看帮助
+```
+
+安全预演模式不会执行真实安装动作，适合先确认安装计划：
+
+```bash
+bash install.sh --dry-run --core-only
+bash install.sh --dry-run --with-console
+bash install.sh --dry-run --console-only
+bash install.sh --dry-run --assets-only
+```
+
+安装脚本会优先使用当前目录的本地编译产物：
+
+- `target/release/nat`
+- `target/release/nat-console`
+
+只有本地二进制不存在时，才下载 release 二进制。核心 nat 安装不会依赖 nodejs/npm；只有 WebUI 静态资源构建或更新流程才会检查 nodejs/npm。
+
+## 🧰 CLI 终端管理菜单
+
+除 WebUI 外，`nat` 二进制也提供 SSH 终端交互菜单，适合习惯命令行的管理员在服务器本机维护配置：
+
+```bash
+nat --menu
+nat --menu --toml /etc/nat.toml
+```
+
+菜单入口：
+
+```text
+====================================
+nftables-nat-rust 管理菜单
+====================================
+1) 查看当前转发规则
+2) 添加单端口转发
+3) 添加端口段转发
+4) 删除转发规则
+5) 启用/禁用规则
+6) 查看当前 nft 规则
+7) 查看 stats 流量统计
+8) 手动刷新 DDNS / 域名目标
+9) 备份当前配置
+10) 从备份恢复配置
+11) 白名单/黑名单管理
+12) 最近来源 IP 观察
+13) WebUI / BBR / Telegram 状态
+0) 退出
+====================================
+```
+
+Phase 4A 已实现查看规则、添加单端口、添加端口段、删除规则、只读查看本项目 nft 表、查看 stats、备份配置和恢复配置。启用/禁用、DDNS 手动刷新、白名单/黑名单、最近来源 IP 观察和状态聚合先保留为后续扩展入口。
+
+CLI 菜单与 WebUI 使用同一份 `/etc/nat.toml`。CLI 更适合 SSH 老手和应急维护；WebUI 更适合不熟悉终端操作的用户。两者都不改变本项目的安全边界：本项目不会执行 `flush ruleset`，不会清空用户其他 nftables table，只管理 `self-nat` / `self-filter` 表。
+
+配置备份目录：
+
+```text
+/etc/nftables-nat/backups/config/
+```
+
+删除或恢复配置前会先备份当前配置。备份文件权限设置为 `600`，避免配置里的敏感字段被普通用户读取。
+
+本项目借鉴 nftpf 的终端交互体验，但不会照搬其全局 flush 行为；同时继续保留 WebUI、BBR、Stats 和 Telegram 通知能力。
+
 ### 方法一：TOML 配置文件版本（推荐）
 
 ```bash
@@ -86,12 +179,24 @@ bash <(curl -sSLf https://us.arloor.dev/https://github.com/arloor/nftables-nat-r
 bash <(curl -sSLf https://us.arloor.dev/https://github.com/arloor/nftables-nat-rust/releases/download/v2.0.0/setup-console.sh) # -p 5533  -k /root/.acme.sh/arloor.dev/arloor.dev.key -c /root/.acme.sh/arloor.dev/fullchain.cer
 ```
 
-1. 安装过程会交互式提示输入用户名和密码。密码会保存在 systemd 文件中，注意安全。
+1. 安装过程会交互式提示或自动生成 WebUI 登录凭据。默认用户名为 `admin`，默认密码不再是 `admin`；如果没有通过环境变量指定密码，安装脚本会生成随机强密码。
 2. 通过 `-p` 参数可以指定 WebUI 监听端口，默认端口为 5533。
 3. 通过 `-c` 和 `-k` 参数可以指定自定义 TLS 证书和私钥文件路径，如果未提供，将自动生成自签名证书。
 4. 安装脚本会自动检测现有 NAT 服务的配置格式，并根据配置格式生成相应的 systemd service 文件。
 
 安装完成后，访问 `https://your-server-ip:5533` 即可使用管理界面。
+
+WebUI 安全相关环境变量：
+
+```bash
+export NAT_CONSOLE_USERNAME=admin
+export NAT_CONSOLE_PASSWORD='your-strong-password'
+export NAT_CONSOLE_PORT=5533
+export NAT_CONSOLE_BIND=0.0.0.0
+export NAT_CONSOLE_JWT_SECRET='your-random-jwt-secret'
+```
+
+如果未设置 `NAT_CONSOLE_PASSWORD` 或 `NAT_CONSOLE_JWT_SECRET`，安装脚本会自动生成。不要复用默认口令，不要公开 JWT secret。WebUI 默认可能监听 `0.0.0.0`，请结合防火墙、反向代理或安全组限制访问来源。
 
 **多后端管理**：登录页面可配置后端 API 地址，支持跨域访问不同服务器。在"后端设置"标签页可添加、切换多个后端地址，方便管理多台服务器。留空后端地址则使用当前服务器。
 
@@ -109,6 +214,38 @@ systemctl restart nat-console
 ![alt text](image.png)
 
 ![alt text](image1.png)
+
+### BBR API
+
+WebUI 提供 BBR 状态和开启接口：
+
+```text
+GET  /api/bbr/status
+POST /api/bbr/enable
+```
+
+`POST /api/bbr/enable` 会写入本项目自己的配置文件：
+
+```text
+/etc/sysctl.d/99-nat-bbr.conf
+```
+
+内容为：
+
+```text
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+```
+
+随后只加载本项目配置：
+
+```bash
+sysctl -w net.core.default_qdisc=fq
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+sysctl -p /etc/sysctl.d/99-nat-bbr.conf
+```
+
+不会使用 `sysctl --system`。
 
 ## 📝 配置说明
 
@@ -242,7 +379,135 @@ domain = "dual-stack.example.com"  # 域名同时有 A 和 AAAA 记录
 protocol = "tcp"
 ip_version = "all"     # 根据客户端 IP 版本自动选择
 comment = "双栈 Web 服务"
+
+# ============ DNS / fake-ip 防护 ============
+
+[dns]
+reject_fake_ip = true
+fake_ip_cidrs = ["198.18.0.0/15"]
+resolver_mode = "system"
+nameservers = ["1.1.1.1:53", "8.8.8.8:53"]
+fallback_to_system = true
+
+# ============ DDNS / 域名目标自动刷新 ============
+
+[ddns]
+refresh_interval_seconds = 60
+
+# ============ 流量统计与 Telegram 通知 ============
+
+[stats]
+enabled = false
+collect_interval_seconds = 60
+data_file = "/var/lib/nftables-nat-rust/stats.json"
+
+[telegram]
+enabled = false
+bot_token = ""
+chat_id = ""
+notify_interval_minutes = 60
+notify_daily = true
+notify_monthly = true
+
+# ============ 白名单 / 黑名单访问控制 ============
+
+[access_control]
+mode = "off" # off / whitelist / blacklist
+entries = []
 ```
+
+如果系统使用 Surge、Clash、sing-box 等 fake-ip DNS，域名转发可能被解析到 `198.18.0.0/15`。本项目默认拒绝 fake-ip，避免把错误地址写入 `dnat` 规则。当前 `resolver_mode = "system"` 沿用系统解析但会做 fake-ip 检查；`custom` resolver 作为后续扩展预留。正式环境建议使用真实 IP、正常 DDNS，或后续配置 custom DNS resolver。
+
+`[ddns]` 控制 nat 主循环重新解析配置和域名目标的间隔，单位是秒。旧配置没有 `[ddns]` 时默认 `60` 秒。低于 `10` 秒会拒绝启动；`10` 到 `59` 秒允许用于测试但会输出 WARN。建议测试环境使用 `30` 秒，正式环境使用 `300` 到 `600` 秒。项目继续复用 nat 主循环，不需要额外 systemd timer。
+
+`[access_control]` 默认关闭，只作用于本项目管理的转发端口，不影响 SSH、WebUI 或用户其他 nftables table。`entries` 只支持 IP/CIDR，不支持域名；IPv4 entries 用于 `table ip`，IPv6 entries 用于 `table ip6`。
+
+白名单示例：
+
+```toml
+[access_control]
+mode = "whitelist"
+entries = ["1.2.3.4", "5.6.7.0/24"]
+```
+
+whitelist 模式下，只有来源 IP 命中 entries 的连接才会匹配本项目 DNAT/REDIRECT 规则；未命中连接不会被本项目转发。启用前请确认需要访问转发端口的来源 IP 已加入白名单。
+
+黑名单示例：
+
+```toml
+[access_control]
+mode = "blacklist"
+entries = ["8.8.8.8", "9.9.9.0/24"]
+```
+
+blacklist 模式下，本项目只针对已配置的转发监听端口生成 drop，不生成全局 drop，不影响 SSH/WebUI。访问控制 drop counter 不计入正常转发流量统计。
+
+### 流量统计
+
+启用 `[stats]` 后，nat 会周期性执行只读命令 `nft -j list ruleset`，只解析本项目管理的表：
+
+- `table ip self-nat`
+- `table ip6 self-nat`
+- `table ip self-filter`
+- `table ip6 self-filter`
+
+统计文件默认路径：
+
+```text
+/var/lib/nftables-nat-rust/stats.json
+```
+
+当 `stats.enabled = true` 时，如果统计文件父目录不存在会自动创建；如果 `stats.json` 不存在，会自动写入初始状态。即使 `rules = []`，也会初始化统计文件。初始化失败只写日志，不影响 nat 主循环或 WebUI。
+
+当前第一版只保留当天和当月统计，不做历史报表。
+
+WebUI/API：
+
+```text
+GET  /api/stats
+POST /api/stats/reset-daily
+POST /api/stats/reset-monthly
+```
+
+### Telegram 定时通知
+
+Telegram 配置示例：
+
+```toml
+[telegram]
+enabled = true
+bot_token = "123456:example-bot-token"
+chat_id = "123456789"
+notify_interval_minutes = 60
+notify_daily = true
+notify_monthly = true
+```
+
+`notify_interval_minutes` 的单位是分钟。`bot_token` 是敏感凭据，不要提交到公开仓库，不要在日志、截图或 issue 中公开。WebUI 的 Telegram 状态接口只返回脱敏 token。
+
+WebUI/API：
+
+```text
+GET  /api/telegram/status
+POST /api/telegram/test
+```
+
+`POST /api/telegram/test` 只有在 Telegram 已启用，并且 `bot_token` 与 `chat_id` 都非空时才会发送测试消息。
+
+### 测试机验证流程
+
+以下命令用于测试机验证安装和 WebUI/API。请先确认当前 SSH 连接和防火墙策略，避免误操作影响远程访问。
+
+```bash
+cargo build --release
+bash install.sh --dry-run --with-console
+bash install.sh --console-only
+systemctl restart nat-console
+curl -k https://127.0.0.1:5533/api/stats
+curl -k https://127.0.0.1:5533/api/telegram/status
+```
+
+如果 WebUI 启用了登录认证，请先通过 `/api/login` 获取认证 Cookie 或 Bearer token，再访问受保护 API。
 
 ### 传统配置文件
 

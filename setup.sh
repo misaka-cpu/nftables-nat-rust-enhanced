@@ -1,5 +1,145 @@
 #!/bin/bash
+set -euo pipefail
+
 # NAT 服务安装脚本 - 支持 legacy 和 toml 配置格式
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+APT_UPDATED=0
+MISSING_PACKAGES=()
+OS_ID=""
+OS_VERSION_ID=""
+OS_PRETTY_NAME=""
+NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}"
+
+log_info() {
+    echo "[INFO] $1"
+}
+
+log_ok() {
+    echo "[OK] $1"
+}
+
+log_warn() {
+    echo "[WARN] $1"
+}
+
+log_err() {
+    echo "[ERR] $1"
+}
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        log_err "Please run as root"
+        exit 1
+    fi
+    log_ok "root permission confirmed"
+}
+
+detect_os() {
+    if [ ! -f /etc/os-release ]; then
+        log_err "unsupported system: /etc/os-release not found"
+        exit 1
+    fi
+
+    . /etc/os-release
+    OS_ID="${ID:-}"
+    OS_VERSION_ID="${VERSION_ID:-}"
+    OS_PRETTY_NAME="${PRETTY_NAME:-unknown}"
+
+    case "$OS_ID:$OS_VERSION_ID" in
+        debian:11|debian:12|ubuntu:20.04|ubuntu:22.04|ubuntu:24.04)
+            log_ok "supported system detected: $OS_PRETTY_NAME"
+            ;;
+        *)
+            log_err "unsupported system: $OS_PRETTY_NAME. Supported: Debian 11/12, Ubuntu 20.04/22.04/24.04"
+            exit 1
+            ;;
+    esac
+}
+
+queue_apt_package() {
+    local package="$1"
+    local existing
+    for existing in "${MISSING_PACKAGES[@]}"; do
+        if [ "$existing" = "$package" ]; then
+            return 0
+        fi
+    done
+    MISSING_PACKAGES+=("$package")
+}
+
+ensure_apt_packages() {
+    local package
+    for package in "$@"; do
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then
+            log_ok "$package found"
+        else
+            echo "[MISS] $package not found, installing..."
+            queue_apt_package "$package"
+        fi
+    done
+}
+
+ensure_commands() {
+    local item command package
+    for item in "$@"; do
+        command="${item%%:*}"
+        package="${item#*:}"
+        if command -v "$command" >/dev/null 2>&1; then
+            log_ok "$command found"
+        else
+            echo "[MISS] $command not found, installing..."
+            queue_apt_package "$package"
+        fi
+    done
+}
+
+install_queued_packages() {
+    if [ "${#MISSING_PACKAGES[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        log_err "apt-get not found"
+        exit 1
+    fi
+
+    if [ "$APT_UPDATED" -eq 0 ]; then
+        log_info "running apt-get update"
+        DEBIAN_FRONTEND=noninteractive apt-get update || {
+            log_err "apt-get update failed"
+            exit 1
+        }
+        APT_UPDATED=1
+    fi
+
+    local package
+    for package in "${MISSING_PACKAGES[@]}"; do
+        log_info "installing missing package: $package"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$package" || {
+            log_err "failed to install package: $package"
+            exit 1
+        }
+    done
+}
+
+preflight_dependencies() {
+    require_root
+    detect_os
+    ensure_apt_packages curl wget ca-certificates nftables iproute2 iptables procps systemd openssl
+    ensure_commands \
+        "curl:curl" \
+        "wget:wget" \
+        "nft:nftables" \
+        "ip:iproute2" \
+        "iptables:iptables" \
+        "sysctl:procps" \
+        "systemctl:systemd" \
+        "openssl:openssl"
+    install_queued_packages
+    log_ok "dependency check completed"
+}
 
 # 使用说明
 usage() {
@@ -26,16 +166,18 @@ if [ "$CONFIG_TYPE" != "legacy" ] && [ "$CONFIG_TYPE" != "toml" ]; then
     usage
 fi
 
-# 必须是root用户
-if [ "$(id -u)" -ne 0 ]; then
-    echo "Please run as root"
-    exit 1
-fi
+preflight_dependencies
 
-# 下载可执行文件
-echo "下载 nat 可执行文件..."
-curl -sSLf https://us.arloor.dev/https://github.com/arloor/nftables-nat-rust/releases/download/v2.0.0/nat -o /tmp/nat
-install /tmp/nat /usr/local/bin/nat
+LOCAL_NAT_BIN="$SCRIPT_DIR/target/release/nat"
+if [ -x "$LOCAL_NAT_BIN" ]; then
+    log_info "using local build: target/release/nat"
+    install -m 755 "$LOCAL_NAT_BIN" /usr/local/bin/nat
+else
+    log_info "local build not found, downloading release binary"
+    curl -sSLf https://us.arloor.dev/https://github.com/arloor/nftables-nat-rust/releases/download/v2.0.0/nat -o /tmp/nat
+    install -m 755 /tmp/nat /usr/local/bin/nat
+fi
+log_ok "nat installed to /usr/local/bin/nat"
 
 # 根据配置类型设置不同的参数
 if [ "$CONFIG_TYPE" = "legacy" ]; then
@@ -49,7 +191,7 @@ else
 fi
 
 # 创建systemd服务
-echo "创建 systemd 服务..."
+log_info "创建/更新 systemd 服务..."
 cat > /lib/systemd/system/nat.service <<EOF
 [Unit]
 Description=nat-service
@@ -72,10 +214,16 @@ EOF
 # 设置开机启动
 systemctl daemon-reload
 systemctl enable nat
+log_ok "nat.service enabled"
 
 # 创建工作目录
 mkdir -p /opt/nat
-touch /opt/nat/env
+if [ -e /opt/nat/env ]; then
+    log_warn "保留已有环境文件: /opt/nat/env"
+else
+    touch /opt/nat/env
+    log_ok "created /opt/nat/env"
+fi
 
 # 根据配置类型创建配置文件
 if [ "$CONFIG_TYPE" = "legacy" ]; then
@@ -84,6 +232,9 @@ if [ "$CONFIG_TYPE" = "legacy" ]; then
         cat > "$CONFIG_FILE" <<EOF
 # 配置方式参考 https://github.com/arloor/nftables-nat-rust/blob/master/README.md#%E4%BC%A0%E7%BB%9F%E9%85%8D%E7%BD%AE%E6%96%87%E4%BB%B6
 EOF
+        log_ok "created $CONFIG_FILE"
+    else
+        log_warn "保留已有配置文件: $CONFIG_FILE"
     fi
     
     # 生成示例配置文件
@@ -111,6 +262,9 @@ else
 # 配置方式参考 https://github.com/arloor/nftables-nat-rust/blob/master/README.md#toml-%E9%85%8D%E7%BD%AE%E6%96%87%E4%BB%B6%E6%8E%A8%E8%8D%90
 rules = []
 EOF
+        log_ok "created $CONFIG_FILE"
+    else
+        log_warn "保留已有配置文件: $CONFIG_FILE"
     fi
     
     # 生成示例配置文件
@@ -166,12 +320,26 @@ comment = "IPv6 专用转发"
 EOF
 fi
 
-# 启动服务
-systemctl restart nat
+if [ "$NAT_NONINTERACTIVE" = "1" ]; then
+    log_info "非交互模式：已 enable nat.service，不强制 start/restart"
+else
+    read -r -p "是否立即启动/重启 nat.service? [y/N]: " START_NAT
+    if [[ "$START_NAT" =~ ^[Yy]$ ]]; then
+        if systemctl is-active --quiet nat; then
+            systemctl restart nat
+            log_ok "nat.service restarted"
+        else
+            systemctl start nat
+            log_ok "nat.service started"
+        fi
+    else
+        log_info "已跳过立即启动/重启 nat.service"
+    fi
+fi
 
 echo ""
 echo "========================================="
-echo "安装成功，服务已启动！"
+echo "安装成功！"
 echo "========================================="
 echo "配置格式: $CONFIG_TYPE"
 echo "配置文件: $CONFIG_FILE"

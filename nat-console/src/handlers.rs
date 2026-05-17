@@ -10,10 +10,22 @@ use axum::{
 };
 use axum_bootstrap::jwt::{Claims, ClaimsPayload, JwtConfig, LOGOUT_COOKIE};
 use axum_extra::extract::CookieJar;
+use chrono::Local;
 use log::{error, info};
-use nat_common::{TomlConfig, validate_legacy_config};
+use nat_common::{
+    AccessControlConfig, StatsConfig, TelegramConfig, TomlConfig, stats as traffic_stats,
+    validate_legacy_config,
+};
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::process::Command;
 use std::sync::Arc;
+
+const TCP_CONGESTION_CONTROL: &str = "/proc/sys/net/ipv4/tcp_congestion_control";
+const TCP_AVAILABLE_CONGESTION_CONTROL: &str =
+    "/proc/sys/net/ipv4/tcp_available_congestion_control";
+const DEFAULT_QDISC: &str = "/proc/sys/net/core/default_qdisc";
+const BBR_SYSCTL_CONF: &str = "/etc/sysctl.d/99-nat-bbr.conf";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -275,6 +287,339 @@ pub async fn get_rules_json(_user: Claims) -> Result<Json<RulesResponse>, (Statu
     })?;
 
     Ok(Json(RulesResponse { rules }))
+}
+
+#[derive(Serialize)]
+pub struct BbrStatusResponse {
+    enabled: bool,
+    tcp_congestion_control: String,
+    available_congestion_control: String,
+    default_qdisc: String,
+    config_file: String,
+}
+
+pub async fn get_bbr_status(
+    _user: Claims,
+) -> Result<Json<BbrStatusResponse>, (StatusCode, String)> {
+    let tcp_congestion_control = read_sysctl_value(TCP_CONGESTION_CONTROL);
+    let available_congestion_control = read_sysctl_value(TCP_AVAILABLE_CONGESTION_CONTROL);
+    let default_qdisc = read_sysctl_value(DEFAULT_QDISC);
+    let enabled = tcp_congestion_control == "bbr" && default_qdisc == "fq";
+
+    Ok(Json(BbrStatusResponse {
+        enabled,
+        tcp_congestion_control,
+        available_congestion_control,
+        default_qdisc,
+        config_file: BBR_SYSCTL_CONF.to_string(),
+    }))
+}
+
+#[derive(Serialize)]
+pub struct BbrEnableResponse {
+    success: bool,
+    message: String,
+    status: BbrStatusResponse,
+}
+
+pub async fn enable_bbr(_user: Claims) -> Result<Json<BbrEnableResponse>, (StatusCode, String)> {
+    let config = "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n";
+    fs::write(BBR_SYSCTL_CONF, config).map_err(|e| {
+        error!("Failed to write BBR sysctl config: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("写入 BBR 配置失败: {}", e),
+        )
+    })?;
+
+    run_sysctl_command(&["-w", "net.core.default_qdisc=fq"])?;
+    run_sysctl_command(&["-w", "net.ipv4.tcp_congestion_control=bbr"])?;
+    run_sysctl_command(&["-p", BBR_SYSCTL_CONF])?;
+
+    let status = BbrStatusResponse {
+        tcp_congestion_control: read_sysctl_value(TCP_CONGESTION_CONTROL),
+        available_congestion_control: read_sysctl_value(TCP_AVAILABLE_CONGESTION_CONTROL),
+        default_qdisc: read_sysctl_value(DEFAULT_QDISC),
+        config_file: BBR_SYSCTL_CONF.to_string(),
+        enabled: read_sysctl_value(TCP_CONGESTION_CONTROL) == "bbr"
+            && read_sysctl_value(DEFAULT_QDISC) == "fq",
+    };
+
+    Ok(Json(BbrEnableResponse {
+        success: status.enabled,
+        message: if status.enabled {
+            "BBR 已开启".to_string()
+        } else {
+            "已写入配置，但当前内核状态未显示 BBR+fq".to_string()
+        },
+        status,
+    }))
+}
+
+#[derive(Serialize)]
+pub struct TelegramStatusResponse {
+    enabled: bool,
+    bot_token_masked: String,
+    chat_id: String,
+    notify_interval_minutes: u64,
+    notify_daily: bool,
+    notify_monthly: bool,
+}
+
+#[derive(Serialize)]
+pub struct TelegramTestResponse {
+    success: bool,
+    message: String,
+}
+
+#[derive(Serialize)]
+pub struct AccessControlStatusResponse {
+    mode: String,
+    entries: Vec<String>,
+    scope: String,
+}
+
+pub async fn get_stats(
+    _user: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<traffic_stats::StatsView>, (StatusCode, String)> {
+    let (stats_config, _) = load_observability_config(&state)?;
+    if stats_config.enabled
+        && let Err(e) = traffic_stats::ensure_state_file(&stats_config.data_file)
+    {
+        error!("Failed to initialize stats data file: {:?}", e);
+    }
+    let stats_state = traffic_stats::load_state(&stats_config.data_file);
+    Ok(Json(traffic_stats::state_to_view(
+        &stats_config,
+        &stats_state,
+    )))
+}
+
+pub async fn reset_stats_daily(
+    _user: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<traffic_stats::StatsView>, (StatusCode, String)> {
+    let (stats_config, _) = load_observability_config(&state)?;
+    let stats_state = traffic_stats::reset_daily(&stats_config.data_file).map_err(|e| {
+        error!("Failed to reset daily stats: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("重置今日统计失败: {}", e),
+        )
+    })?;
+    Ok(Json(traffic_stats::state_to_view(
+        &stats_config,
+        &stats_state,
+    )))
+}
+
+pub async fn reset_stats_monthly(
+    _user: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<traffic_stats::StatsView>, (StatusCode, String)> {
+    let (stats_config, _) = load_observability_config(&state)?;
+    let stats_state = traffic_stats::reset_monthly(&stats_config.data_file).map_err(|e| {
+        error!("Failed to reset monthly stats: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("重置本月统计失败: {}", e),
+        )
+    })?;
+    Ok(Json(traffic_stats::state_to_view(
+        &stats_config,
+        &stats_state,
+    )))
+}
+
+pub async fn get_telegram_status(
+    _user: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<TelegramStatusResponse>, (StatusCode, String)> {
+    let (_, telegram_config) = load_observability_config(&state)?;
+    Ok(Json(telegram_status_response(&telegram_config)))
+}
+
+pub async fn get_access_control_status(
+    _user: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<AccessControlStatusResponse>, (StatusCode, String)> {
+    let access_control = load_access_control_config(&state)?;
+    Ok(Json(AccessControlStatusResponse {
+        mode: access_control.mode.to_string(),
+        entries: access_control.entries,
+        scope: "只作用于本项目转发端口，不影响 SSH/WebUI".to_string(),
+    }))
+}
+
+pub async fn test_telegram(
+    _user: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<TelegramTestResponse>, (StatusCode, String)> {
+    let (stats_config, telegram_config) = load_observability_config(&state)?;
+    if !telegram_config.enabled
+        || telegram_config.bot_token.is_empty()
+        || telegram_config.chat_id.is_empty()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Telegram 未启用，或 bot_token/chat_id 为空".to_string(),
+        ));
+    }
+
+    let stats_state = traffic_stats::load_state(&stats_config.data_file);
+    let now = Local::now().naive_local();
+    let message = traffic_stats::format_telegram_message_with_options(
+        &stats_state,
+        now,
+        telegram_config.notify_daily,
+        telegram_config.notify_monthly,
+    );
+    traffic_stats::send_telegram_with(&telegram_config, &message, send_telegram_http).map_err(
+        |e| {
+            error!(
+                "Telegram test failed token={}: {}",
+                traffic_stats::mask_bot_token(&telegram_config.bot_token),
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Telegram 测试发送失败: {}", e),
+            )
+        },
+    )?;
+
+    Ok(Json(TelegramTestResponse {
+        success: true,
+        message: "Telegram 测试消息已发送".to_string(),
+    }))
+}
+
+fn load_observability_config(
+    state: &AppState,
+) -> Result<(StatsConfig, TelegramConfig), (StatusCode, String)> {
+    let config_info = match get_config_info(
+        state.toml_config.as_deref(),
+        state.compatible_config.as_deref(),
+    ) {
+        Ok(config_info) => config_info,
+        Err(e) => {
+            info!("Failed to detect NAT config for observability: {:?}", e);
+            return Ok((StatsConfig::default(), TelegramConfig::default()));
+        }
+    };
+    if !config_info.is_toml {
+        return Ok((StatsConfig::default(), TelegramConfig::default()));
+    }
+
+    let content = fs::read_to_string(&config_info.config_path).map_err(|e| {
+        error!("Failed to read TOML config for observability: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读取 TOML 配置失败: {}", e),
+        )
+    })?;
+    let config = TomlConfig::from_toml_str(&content).map_err(|e| {
+        error!("Failed to parse TOML config for observability: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("解析 TOML 配置失败: {}", e),
+        )
+    })?;
+    Ok((config.stats, config.telegram))
+}
+
+fn load_access_control_config(
+    state: &AppState,
+) -> Result<AccessControlConfig, (StatusCode, String)> {
+    let config_info = match get_config_info(
+        state.toml_config.as_deref(),
+        state.compatible_config.as_deref(),
+    ) {
+        Ok(config_info) => config_info,
+        Err(e) => {
+            info!("Failed to detect NAT config for access control: {:?}", e);
+            return Ok(AccessControlConfig::default());
+        }
+    };
+    if !config_info.is_toml {
+        return Ok(AccessControlConfig::default());
+    }
+    let content = fs::read_to_string(&config_info.config_path).map_err(|e| {
+        error!("Failed to read TOML config for access control: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读取 TOML 配置失败: {}", e),
+        )
+    })?;
+    let config = TomlConfig::from_toml_str(&content).map_err(|e| {
+        error!("Failed to parse TOML config for access control: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("解析 TOML 配置失败: {}", e),
+        )
+    })?;
+    Ok(config.access_control)
+}
+
+fn telegram_status_response(config: &TelegramConfig) -> TelegramStatusResponse {
+    TelegramStatusResponse {
+        enabled: config.enabled,
+        bot_token_masked: traffic_stats::mask_bot_token(&config.bot_token),
+        chat_id: config.chat_id.clone(),
+        notify_interval_minutes: config.notify_interval_minutes,
+        notify_daily: config.notify_daily,
+        notify_monthly: config.notify_monthly,
+    }
+}
+
+fn send_telegram_http(url: &str, params: &[(&str, &str)]) -> Result<(), String> {
+    let mut command = Command::new("curl");
+    command.arg("-sS").arg("-X").arg("POST").arg(url);
+    for (key, value) in params {
+        command
+            .arg("--data-urlencode")
+            .arg(format!("{key}={value}"));
+    }
+    let output = command
+        .output()
+        .map_err(|e| format!("执行 curl 失败: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+fn read_sysctl_value(path: &str) -> String {
+    fs::read_to_string(path)
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn run_sysctl_command(args: &[&str]) -> Result<(), (StatusCode, String)> {
+    let output = Command::new("/usr/sbin/sysctl")
+        .args(args)
+        .output()
+        .or_else(|_| Command::new("sysctl").args(args).output())
+        .map_err(|e| {
+            error!("Failed to run sysctl {:?}: {:?}", args, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("应用 sysctl 配置失败: {}", e),
+            )
+        })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        error!("sysctl {:?} failed: {}", args, stderr);
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("应用 sysctl 配置失败: {}", stderr),
+        ))
+    }
 }
 
 /// 自定义认证中间件：支持 Authorization header (Bearer token) 和 Cookie 两种方式

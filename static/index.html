@@ -638,6 +638,51 @@
             border: 1px solid #f5c6cb;
             color: #721c24;
         }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+
+        .stats-panel {
+            background: #f8f9fa;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 16px;
+        }
+
+        .stats-label {
+            color: #666;
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
+
+        .stats-value {
+            color: #222;
+            font-size: 24px;
+            font-weight: 700;
+        }
+
+        .stats-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #fff;
+            font-size: 14px;
+        }
+
+        .stats-table th,
+        .stats-table td {
+            border: 1px solid #e5e7eb;
+            padding: 10px;
+            text-align: left;
+        }
+
+        .stats-table th {
+            background: #f8f9fa;
+            color: #333;
+        }
     </style>
 </head>
 <body>
@@ -655,6 +700,8 @@
         <div class="tabs">
             <div class="tab active" onclick="switchTab('config')">📝 配置管理</div>
             <div class="tab" onclick="switchTab('rules')">📋 规则查看</div>
+            <div class="tab" onclick="switchTab('bbr')">🚀 BBR</div>
+            <div class="tab" onclick="switchTab('stats')">📊 流量统计</div>
         </div>
 
         <div id="configTab" class="tab-content active">
@@ -684,6 +731,30 @@
 
             <div id="rulesContent" class="loading">
                 点击"刷新规则"查看当前 nftables 规则
+            </div>
+        </div>
+
+        <div id="bbrTab" class="tab-content">
+            <div class="actions" style="margin-bottom: 20px;">
+                <button class="btn btn-primary" onclick="loadBbrStatus()">🔄 刷新状态</button>
+                <button class="btn btn-secondary" onclick="enableBbr()">开启 BBR</button>
+            </div>
+
+            <div id="bbrContent" class="loading">
+                点击"刷新状态"查看当前 BBR 状态
+            </div>
+        </div>
+
+        <div id="statsTab" class="tab-content">
+            <div class="actions" style="margin-bottom: 20px;">
+                <button class="btn btn-primary" onclick="loadStats()">🔄 刷新统计</button>
+                <button class="btn btn-secondary" onclick="resetStatsDaily()">重置今日</button>
+                <button class="btn btn-secondary" onclick="resetStatsMonthly()">重置本月</button>
+                <button class="btn btn-secondary" onclick="testTelegram()">测试 Telegram</button>
+            </div>
+
+            <div id="statsContent" class="loading">
+                点击"刷新统计"查看当前流量统计
             </div>
         </div>
 
@@ -873,6 +944,180 @@
             }
         }
 
+        async function loadBbrStatus() {
+            const bbrContent = document.getElementById('bbrContent');
+            bbrContent.className = 'loading';
+            bbrContent.textContent = '加载中...';
+
+            try {
+                const response = await apiRequest('/api/bbr/status');
+
+                if (!response.ok) {
+                    throw new Error('加载 BBR 状态失败');
+                }
+
+                const data = await response.json();
+                bbrContent.className = 'rules-display';
+                bbrContent.innerHTML = `<pre>状态: ${data.enabled ? '已开启' : '未开启'}
+TCP 拥塞控制: ${data.tcp_congestion_control}
+可用拥塞控制: ${data.available_congestion_control}
+默认队列算法: ${data.default_qdisc}
+配置文件: ${data.config_file}</pre>`;
+            } catch (error) {
+                bbrContent.className = 'loading';
+                bbrContent.textContent = '加载失败: ' + error.message;
+            }
+        }
+
+        async function enableBbr() {
+            const bbrContent = document.getElementById('bbrContent');
+            bbrContent.className = 'loading';
+            bbrContent.textContent = '正在开启 BBR...';
+
+            try {
+                const response = await apiRequest('/api/bbr/enable', {
+                    method: 'POST'
+                });
+
+                if (!response.ok) {
+                    const text = await response.text();
+                    throw new Error(text);
+                }
+
+                const data = await response.json();
+                showAlert(data.message, !data.success);
+                await loadBbrStatus();
+            } catch (error) {
+                bbrContent.className = 'loading';
+                bbrContent.textContent = '开启失败: ' + error.message;
+                showAlert('开启 BBR 失败: ' + error.message, true);
+            }
+        }
+
+        function formatBytes(bytes) {
+            const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+            let value = Number(bytes || 0);
+            let unit = 0;
+            while (value >= 1024 && unit < units.length - 1) {
+                value = value / 1024;
+                unit += 1;
+            }
+            return unit === 0 ? `${value} B` : `${value.toFixed(2)} ${units[unit]}`;
+        }
+
+        async function loadStats() {
+            const statsContent = document.getElementById('statsContent');
+            statsContent.className = 'loading';
+            statsContent.textContent = '加载中...';
+
+            try {
+                const [statsResponse, telegramResponse, accessResponse] = await Promise.all([
+                    apiRequest('/api/stats'),
+                    apiRequest('/api/telegram/status'),
+                    apiRequest('/api/access-control/status')
+                ]);
+
+                if (!statsResponse.ok) {
+                    throw new Error('加载流量统计失败');
+                }
+                if (!telegramResponse.ok) {
+                    throw new Error('加载 Telegram 状态失败');
+                }
+                if (!accessResponse.ok) {
+                    throw new Error('加载访问控制状态失败');
+                }
+
+                const stats = await statsResponse.json();
+                const telegram = await telegramResponse.json();
+                const access = await accessResponse.json();
+                const rows = (stats.rules || []).map(rule => `
+                    <tr>
+                        <td>${escapeHtml(rule.label)}</td>
+                        <td>${formatBytes(rule.daily_bytes)}</td>
+                        <td>${formatBytes(rule.monthly_bytes)}</td>
+                    </tr>
+                `).join('');
+
+                statsContent.className = 'rules-display';
+                statsContent.innerHTML = `
+                    <div class="stats-grid">
+                        <div class="stats-panel">
+                            <div class="stats-label">今日总流量</div>
+                            <div class="stats-value">${escapeHtml(stats.daily_total || '0 B')}</div>
+                        </div>
+                        <div class="stats-panel">
+                            <div class="stats-label">本月总流量</div>
+                            <div class="stats-value">${escapeHtml(stats.monthly_total || '0 B')}</div>
+                        </div>
+                        <div class="stats-panel">
+                            <div class="stats-label">Telegram</div>
+                            <div class="stats-value">${telegram.enabled ? '已启用' : '未启用'}</div>
+                            <div style="margin-top: 8px; color: #666;">通知间隔: ${telegram.notify_interval_minutes} 分钟</div>
+                        </div>
+                        <div class="stats-panel">
+                            <div class="stats-label">访问控制</div>
+                            <div class="stats-value">${escapeHtml(access.mode || 'off')}</div>
+                            <div style="margin-top: 8px; color: #666;">${escapeHtml(access.scope || '只作用于本项目转发端口')}</div>
+                            <div style="margin-top: 8px; color: #666;">entries: ${(access.entries || []).length}</div>
+                        </div>
+                    </div>
+                    <div style="margin-bottom: 12px; color: #666;">最近采集: ${escapeHtml(stats.last_collect_time || '-')}</div>
+                    <table class="stats-table">
+                        <thead>
+                            <tr>
+                                <th>规则</th>
+                                <th>今日流量</th>
+                                <th>本月流量</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows || '<tr><td colspan="3">暂无规则流量</td></tr>'}</tbody>
+                    </table>
+                `;
+            } catch (error) {
+                statsContent.className = 'loading';
+                statsContent.textContent = '加载失败: ' + error.message;
+            }
+        }
+
+        async function resetStatsDaily() {
+            try {
+                const response = await apiRequest('/api/stats/reset-daily', { method: 'POST' });
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+                showAlert('今日统计已重置', false);
+                await loadStats();
+            } catch (error) {
+                showAlert('重置今日统计失败: ' + error.message, true);
+            }
+        }
+
+        async function resetStatsMonthly() {
+            try {
+                const response = await apiRequest('/api/stats/reset-monthly', { method: 'POST' });
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+                showAlert('本月统计已重置', false);
+                await loadStats();
+            } catch (error) {
+                showAlert('重置本月统计失败: ' + error.message, true);
+            }
+        }
+
+        async function testTelegram() {
+            try {
+                const response = await apiRequest('/api/telegram/test', { method: 'POST' });
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+                const data = await response.json();
+                showAlert(data.message, !data.success);
+            } catch (error) {
+                showAlert('Telegram 测试失败: ' + error.message, true);
+            }
+        }
+
         function switchTab(tab) {
             const tabs = document.querySelectorAll('.tab');
             const contents = document.querySelectorAll('.tab-content');
@@ -888,6 +1133,14 @@
                 document.getElementById('rulesTab').classList.add('active');
                 // 切换到规则页面时自动加载规则
                 loadRules();
+            } else if (tab === 'bbr') {
+                tabs[2].classList.add('active');
+                document.getElementById('bbrTab').classList.add('active');
+                loadBbrStatus();
+            } else if (tab === 'stats') {
+                tabs[3].classList.add('active');
+                document.getElementById('statsTab').classList.add('active');
+                loadStats();
             }
         }
 

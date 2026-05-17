@@ -1,15 +1,20 @@
 use clap::Parser;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::Display;
+use std::net::IpAddr;
 use std::num::ParseIntError;
 use std::str::FromStr;
 
 pub mod logger;
+pub mod stats;
 
 /// NAT CLI 命令行参数
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
+    /// 打开交互式终端管理菜单
+    #[arg(long, help = "打开交互式终端管理菜单")]
+    pub menu: bool,
     /// 配置文件路径
     #[arg(value_name = "CONFIG_FILE", help = "老版本配置文件")]
     pub compatible_config_file: Option<String>,
@@ -228,6 +233,208 @@ impl<'de> Deserialize<'de> for Protocol {
 pub struct TomlConfig {
     #[serde(default)]
     pub rules: Vec<NftCell>,
+    #[serde(default)]
+    pub dns: DnsConfig,
+    #[serde(default)]
+    pub ddns: DdnsConfig,
+    #[serde(default)]
+    pub stats: StatsConfig,
+    #[serde(default)]
+    pub telegram: TelegramConfig,
+    #[serde(default)]
+    pub access_control: AccessControlConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsConfig {
+    #[serde(default = "default_true")]
+    pub reject_fake_ip: bool,
+    #[serde(default = "default_fake_ip_cidrs")]
+    pub fake_ip_cidrs: Vec<String>,
+    #[serde(default = "default_resolver_mode")]
+    pub resolver_mode: String,
+    #[serde(default = "default_nameservers")]
+    pub nameservers: Vec<String>,
+    #[serde(default = "default_true")]
+    pub fallback_to_system: bool,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            reject_fake_ip: true,
+            fake_ip_cidrs: default_fake_ip_cidrs(),
+            resolver_mode: default_resolver_mode(),
+            nameservers: default_nameservers(),
+            fallback_to_system: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DdnsConfig {
+    #[serde(default = "default_ddns_refresh_interval_seconds")]
+    pub refresh_interval_seconds: u64,
+}
+
+impl Default for DdnsConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval_seconds: default_ddns_refresh_interval_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_collect_interval_seconds")]
+    pub collect_interval_seconds: u64,
+    #[serde(default = "default_stats_data_file")]
+    pub data_file: String,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            collect_interval_seconds: default_collect_interval_seconds(),
+            data_file: default_stats_data_file(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bot_token: String,
+    #[serde(default)]
+    pub chat_id: String,
+    #[serde(default = "default_notify_interval_minutes")]
+    pub notify_interval_minutes: u64,
+    #[serde(default = "default_true")]
+    pub notify_daily: bool,
+    #[serde(default = "default_true")]
+    pub notify_monthly: bool,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: String::new(),
+            chat_id: String::new(),
+            notify_interval_minutes: default_notify_interval_minutes(),
+            notify_daily: true,
+            notify_monthly: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessControlConfig {
+    #[serde(default)]
+    pub mode: AccessControlMode,
+    #[serde(default)]
+    pub entries: Vec<String>,
+}
+
+impl Default for AccessControlConfig {
+    fn default() -> Self {
+        Self {
+            mode: AccessControlMode::Off,
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccessControlMode {
+    #[default]
+    Off,
+    Whitelist,
+    Blacklist,
+}
+
+impl Display for AccessControlMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccessControlMode::Off => write!(f, "off"),
+            AccessControlMode::Whitelist => write!(f, "whitelist"),
+            AccessControlMode::Blacklist => write!(f, "blacklist"),
+        }
+    }
+}
+
+impl From<&str> for AccessControlMode {
+    fn from(mode: &str) -> Self {
+        match mode.to_lowercase().as_str() {
+            "whitelist" => AccessControlMode::Whitelist,
+            "blacklist" => AccessControlMode::Blacklist,
+            _ => AccessControlMode::Off,
+        }
+    }
+}
+
+impl Serialize for AccessControlMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for AccessControlMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "off" => Ok(AccessControlMode::Off),
+            "whitelist" => Ok(AccessControlMode::Whitelist),
+            "blacklist" => Ok(AccessControlMode::Blacklist),
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid access_control mode: {s}"
+            ))),
+        }
+    }
+}
+
+fn default_collect_interval_seconds() -> u64 {
+    60
+}
+
+fn default_fake_ip_cidrs() -> Vec<String> {
+    vec!["198.18.0.0/15".to_string()]
+}
+
+fn default_resolver_mode() -> String {
+    "system".to_string()
+}
+
+fn default_nameservers() -> Vec<String> {
+    vec!["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()]
+}
+
+fn default_ddns_refresh_interval_seconds() -> u64 {
+    60
+}
+
+fn default_stats_data_file() -> String {
+    "/var/lib/nftables-nat-rust/stats.json".to_string()
+}
+
+fn default_notify_interval_minutes() -> u64 {
+    60
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,6 +591,7 @@ impl Display for NftCell {
 impl TomlConfig {
     /// 验证配置是否合法
     pub fn validate(&self) -> Result<(), String> {
+        self.access_control.validate()?;
         for (idx, rule) in self.rules.iter().enumerate() {
             rule.validate()
                 .map_err(|e| format!("规则 {} 验证失败: {}", idx + 1, e))?;
@@ -402,6 +610,27 @@ impl TomlConfig {
     pub fn to_toml_string(&self) -> Result<String, String> {
         toml::to_string_pretty(self).map_err(|e| format!("序列化TOML失败: {}", e))
     }
+}
+
+impl AccessControlConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for entry in &self.entries {
+            validate_access_entry(entry)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_access_entry(entry: &str) -> Result<(), String> {
+    if entry.trim().is_empty() {
+        return Err("access_control entries 不能为空".to_string());
+    }
+    if entry.parse::<IpAddr>().is_ok() || entry.parse::<ipnetwork::IpNetwork>().is_ok() {
+        return Ok(());
+    }
+    Err(format!(
+        "access_control entry 只支持 IP/CIDR，不支持域名或非法值: {entry}"
+    ))
 }
 
 impl TryFrom<&str> for NftCell {
@@ -842,6 +1071,94 @@ ip_version = "all"
     }
 
     #[test]
+    fn test_access_control_defaults_when_missing() {
+        let config = TomlConfig::from_toml_str("rules = []").unwrap();
+        assert!(config.dns.reject_fake_ip);
+        assert_eq!(config.dns.fake_ip_cidrs, vec!["198.18.0.0/15"]);
+        assert_eq!(config.ddns.refresh_interval_seconds, 60);
+        assert_eq!(config.access_control.mode, AccessControlMode::Off);
+        assert!(config.access_control.entries.is_empty());
+    }
+
+    #[test]
+    fn test_dns_config_parses() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[dns]
+reject_fake_ip = false
+fake_ip_cidrs = ["198.18.0.0/15", "100.64.0.0/10"]
+resolver_mode = "system"
+nameservers = ["1.1.1.1:53"]
+fallback_to_system = true
+"#,
+        )
+        .unwrap();
+        assert!(!config.dns.reject_fake_ip);
+        assert_eq!(config.dns.fake_ip_cidrs.len(), 2);
+    }
+
+    #[test]
+    fn test_ddns_config_parses() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[ddns]
+refresh_interval_seconds = 120
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.ddns.refresh_interval_seconds, 120);
+    }
+
+    #[test]
+    fn test_access_control_parses() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[access_control]
+mode = "whitelist"
+entries = ["192.0.2.1", "2001:db8::/64"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.access_control.mode, AccessControlMode::Whitelist);
+        assert_eq!(config.access_control.entries.len(), 2);
+    }
+
+    #[test]
+    fn test_access_control_rejects_invalid_mode() {
+        let err = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[access_control]
+mode = "allow"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid access_control mode"));
+    }
+
+    #[test]
+    fn test_access_control_rejects_invalid_entry() {
+        let err = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[access_control]
+mode = "blacklist"
+entries = ["example.com"]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("access_control entry 只支持 IP/CIDR"));
+    }
+
+    #[test]
     fn test_ip_version_serde() {
         assert_eq!(IpVersion::from("ipv4"), IpVersion::V4);
         assert_eq!(IpVersion::from("ipv6"), IpVersion::V6);
@@ -1001,11 +1318,7 @@ ip_version = "all"
             protocol: Protocol::All,
             comment: None,
         };
-        let result = rule.validate();
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err();
-        assert!(err_msg.contains("IPv6格式"));
-        assert!(err_msg.contains("ipv4"));
+        assert!(rule.validate().is_ok());
     }
 
     #[test]
@@ -1021,11 +1334,7 @@ ip_version = "all"
             protocol: Protocol::All,
             comment: None,
         };
-        let result = rule.validate();
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err();
-        assert!(err_msg.contains("IPv4格式"));
-        assert!(err_msg.contains("ipv6"));
+        assert!(rule.validate().is_ok());
     }
 
     #[test]

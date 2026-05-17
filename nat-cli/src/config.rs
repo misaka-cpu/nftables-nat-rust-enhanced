@@ -2,7 +2,10 @@
 use crate::ip;
 use ipnetwork::IpNetwork;
 use log::info;
-use nat_common::{Chain, IpVersion, NftCell, ParseError, Protocol, TomlConfig};
+use nat_common::{
+    AccessControlConfig, AccessControlMode, Chain, DdnsConfig, DnsConfig, IpVersion, NftCell,
+    ParseError, Protocol, StatsConfig, TelegramConfig, TomlConfig,
+};
 use std::env;
 use std::fmt::Display;
 use std::fs;
@@ -46,11 +49,21 @@ impl ProtocolExt for Protocol {
 
 /// NftCell构建扩展trait，提供nftables规则构建方法
 pub trait NftCellBuilder {
-    fn build(&self) -> Result<String, io::Error>;
+    fn build_with_rule_index(
+        &self,
+        rule_index: Option<usize>,
+        dns_config: &DnsConfig,
+        access_config: &AccessControlConfig,
+    ) -> Result<String, io::Error>;
 }
 
 impl NftCellBuilder for NftCell {
-    fn build(&self) -> Result<String, io::Error> {
+    fn build_with_rule_index(
+        &self,
+        rule_index: Option<usize>,
+        dns_config: &DnsConfig,
+        access_config: &AccessControlConfig,
+    ) -> Result<String, io::Error> {
         match self {
             NftCell::Drop { .. } => build_drop_rule(self),
             _ => {
@@ -63,13 +76,13 @@ impl NftCellBuilder for NftCell {
                     } => (domain, ip_version),
                     NftCell::Redirect { ip_version, .. } => {
                         // Redirect doesn't need domain resolution
-                        return build_redirect_rules(self, ip_version);
+                        return build_redirect_rules(self, ip_version, rule_index, access_config);
                     }
                     NftCell::Drop { .. } => unreachable!(),
                 };
 
                 // 根据配置的IP版本解析目标IP
-                let dst_ip = ip::remote_ip(domain, ip_version)?;
+                let dst_ip = ip::remote_ip_with_dns(domain, ip_version, dns_config)?;
 
                 let mut result = String::new();
 
@@ -84,7 +97,13 @@ impl NftCellBuilder for NftCell {
                                 "IPv6 target address resolved but rule is configured for IPv4 only",
                             ));
                         }
-                        result += &build_nat_rules(self, &dst_ip, &IpVersion::V4)?;
+                        result += &build_nat_rules(
+                            self,
+                            &dst_ip,
+                            &IpVersion::V4,
+                            rule_index,
+                            access_config,
+                        )?;
                     }
                     IpVersion::V6 => {
                         if !is_ipv6_target {
@@ -93,13 +112,31 @@ impl NftCellBuilder for NftCell {
                                 "IPv4 target address resolved but rule is configured for IPv6 only",
                             ));
                         }
-                        result += &build_nat_rules(self, &dst_ip, &IpVersion::V6)?;
+                        result += &build_nat_rules(
+                            self,
+                            &dst_ip,
+                            &IpVersion::V6,
+                            rule_index,
+                            access_config,
+                        )?;
                     }
                     IpVersion::All => {
                         if is_ipv6_target {
-                            result += &build_nat_rules(self, &dst_ip, &IpVersion::V6)?;
+                            result += &build_nat_rules(
+                                self,
+                                &dst_ip,
+                                &IpVersion::V6,
+                                rule_index,
+                                access_config,
+                            )?;
                         } else {
-                            result += &build_nat_rules(self, &dst_ip, &IpVersion::V4)?;
+                            result += &build_nat_rules(
+                                self,
+                                &dst_ip,
+                                &IpVersion::V4,
+                                rule_index,
+                                access_config,
+                            )?;
                         }
                     }
                 }
@@ -111,9 +148,16 @@ impl NftCellBuilder for NftCell {
 }
 
 impl RuntimeCell {
-    pub fn build(&self) -> Result<String, io::Error> {
+    pub fn build_with_rule_index(
+        &self,
+        rule_index: Option<usize>,
+        dns_config: &DnsConfig,
+        access_config: &AccessControlConfig,
+    ) -> Result<String, io::Error> {
         match self {
-            RuntimeCell::Rule(cell) => cell.build(),
+            RuntimeCell::Rule(cell) => {
+                cell.build_with_rule_index(rule_index, dns_config, access_config)
+            }
             RuntimeCell::Comment(content) => Ok(content.clone() + "\n"),
         }
     }
@@ -269,6 +313,8 @@ fn build_nat_rules(
     cell: &NftCell,
     dst_ip: &str,
     ip_version: &IpVersion,
+    rule_index: Option<usize>,
+    access_config: &AccessControlConfig,
 ) -> Result<String, io::Error> {
     let (family, env_var, localhost_addr, fmt_ip) = match ip_version {
         IpVersion::V4 => ("ip", "nat_local_ip", "127.0.0.1", dst_ip.to_string()),
@@ -290,14 +336,45 @@ fn build_nat_rules(
         NftCell::Range {
             port_start,
             port_end,
+            domain,
             protocol,
+            comment,
             ..
         } => {
             let proto = protocol.nft_proto();
+            let access_condition = access_condition(family, access_config);
+            if access_config.mode == AccessControlMode::Whitelist && access_condition.is_none() {
+                return Ok(String::new());
+            }
+            let access_condition = access_condition.unwrap_or_default();
+            let blacklist_drop = build_access_drop_rules(
+                family,
+                access_config,
+                protocol,
+                &format!("{port_start}-{port_end}"),
+                rule_index,
+            );
+            let stats_comment = nat_rule_comment(
+                rule_index,
+                "range",
+                &format!("{port_start}-{port_end}"),
+                domain,
+                &format!("{port_start}-{port_end}"),
+                protocol,
+                comment.as_deref(),
+            );
             let res = format!(
-                "add rule {family} self-nat PREROUTING ct state new {proto} dport {port_start}-{port_end} counter dnat to {fmt_ip}:{port_start}-{port_end} comment \"{cell}\"\n\
+                "{blacklist_drop}add rule {family} self-nat PREROUTING ct state new {access_condition}{proto} dport {port_start}-{port_end} counter dnat to {fmt_ip}:{port_start}-{port_end} comment \"{stats_comment}\"\n\
                 add rule {family} self-nat POSTROUTING ct state new {family} daddr {dst_ip} {proto} dport {port_start}-{port_end} counter {snat_to_part} comment \"{cell}\"\n\n\
+                {}\
                 ",
+                build_traffic_counter_rules(
+                    family,
+                    dst_ip,
+                    protocol,
+                    &format!("{port_start}-{port_end}"),
+                    &stats_comment,
+                ),
             );
             Ok(res)
         }
@@ -306,23 +383,53 @@ fn build_nat_rules(
             dport,
             domain,
             protocol,
+            comment,
             ..
         } => {
             let proto = protocol.nft_proto();
+            let access_condition = access_condition(family, access_config);
+            if access_config.mode == AccessControlMode::Whitelist && access_condition.is_none() {
+                return Ok(String::new());
+            }
+            let access_condition = access_condition.unwrap_or_default();
+            let blacklist_drop = build_access_drop_rules(
+                family,
+                access_config,
+                protocol,
+                &sport.to_string(),
+                rule_index,
+            );
+            let stats_comment = nat_rule_comment(
+                rule_index,
+                "single",
+                &sport.to_string(),
+                domain,
+                &dport.to_string(),
+                protocol,
+                comment.as_deref(),
+            );
             let is_localhost = domain == "localhost" || domain == localhost_addr;
             if is_localhost {
                 // 重定向到本机
                 let res = format!(
-                    "add rule {family} self-nat PREROUTING ct state new {proto} dport {sport} redirect to :{dport}  comment \"{cell}\"\n\n\
+                    "{blacklist_drop}add rule {family} self-nat PREROUTING ct state new {access_condition}{proto} dport {sport} counter redirect to :{dport}  comment \"{stats_comment}\"\n\n\
                     ",
                 );
                 Ok(res)
             } else {
                 // 转发到其他机器
                 let res = format!(
-                    "add rule {family} self-nat PREROUTING ct state new {proto} dport {sport} counter dnat to {fmt_ip}:{dport}  comment \"{cell}\"\n\
+                    "{blacklist_drop}add rule {family} self-nat PREROUTING ct state new {access_condition}{proto} dport {sport} counter dnat to {fmt_ip}:{dport}  comment \"{stats_comment}\"\n\
                     add rule {family} self-nat POSTROUTING ct state new {family} daddr {dst_ip} {proto} dport {dport} counter {snat_to_part} comment \"{cell}\"\n\n\
+                    {}\
                     ",
+                    build_traffic_counter_rules(
+                        family,
+                        dst_ip,
+                        protocol,
+                        &dport.to_string(),
+                        &stats_comment,
+                    ),
                 );
                 Ok(res)
             }
@@ -338,23 +445,33 @@ fn build_nat_rules(
     }
 }
 
-fn build_redirect_rules(cell: &NftCell, ip_version: &IpVersion) -> Result<String, io::Error> {
+fn build_redirect_rules(
+    cell: &NftCell,
+    ip_version: &IpVersion,
+    rule_index: Option<usize>,
+    access_config: &AccessControlConfig,
+) -> Result<String, io::Error> {
     let mut result = String::new();
 
     match ip_version {
         IpVersion::All => {
-            result += &build_redirect_rule(cell, &IpVersion::V4)?;
-            result += &build_redirect_rule(cell, &IpVersion::V6)?;
+            result += &build_redirect_rule(cell, &IpVersion::V4, rule_index, access_config)?;
+            result += &build_redirect_rule(cell, &IpVersion::V6, rule_index, access_config)?;
         }
         _ => {
-            result += &build_redirect_rule(cell, ip_version)?;
+            result += &build_redirect_rule(cell, ip_version, rule_index, access_config)?;
         }
     }
 
     Ok(result)
 }
 
-fn build_redirect_rule(cell: &NftCell, ip_version: &IpVersion) -> Result<String, io::Error> {
+fn build_redirect_rule(
+    cell: &NftCell,
+    ip_version: &IpVersion,
+    rule_index: Option<usize>,
+    access_config: &AccessControlConfig,
+) -> Result<String, io::Error> {
     let family = match ip_version {
         IpVersion::V4 => "ip",
         IpVersion::V6 => "ip6",
@@ -371,20 +488,54 @@ fn build_redirect_rule(cell: &NftCell, ip_version: &IpVersion) -> Result<String,
             src_port_end,
             dst_port,
             protocol,
+            comment,
             ..
         } => {
             let proto = protocol.nft_proto();
+            let access_condition = access_condition(family, access_config);
+            if access_config.mode == AccessControlMode::Whitelist && access_condition.is_none() {
+                return Ok(String::new());
+            }
+            let access_condition = access_condition.unwrap_or_default();
+            let sport = if let Some(end) = src_port_end {
+                format!("{src_port}-{end}")
+            } else {
+                src_port.to_string()
+            };
+            let stats_comment = nat_rule_comment(
+                rule_index,
+                "redirect",
+                &sport,
+                "localhost",
+                &dst_port.to_string(),
+                protocol,
+                comment.as_deref(),
+            );
             let res = if let Some(end) = src_port_end {
+                let blacklist_drop = build_access_drop_rules(
+                    family,
+                    access_config,
+                    protocol,
+                    &format!("{src_port}-{end}"),
+                    rule_index,
+                );
                 // Range redirect
                 format!(
-                    "add rule {family} self-nat PREROUTING ct state new {proto} dport {src_port}-{src_port_end} redirect to :{dst_port} comment \"{cell}\"\n\n\
+                    "{blacklist_drop}add rule {family} self-nat PREROUTING ct state new {access_condition}{proto} dport {src_port}-{src_port_end} counter redirect to :{dst_port} comment \"{stats_comment}\"\n\n\
                     ",
                     src_port_end = end,
                 )
             } else {
+                let blacklist_drop = build_access_drop_rules(
+                    family,
+                    access_config,
+                    protocol,
+                    &src_port.to_string(),
+                    rule_index,
+                );
                 // Single port redirect
                 format!(
-                    "add rule {family} self-nat PREROUTING ct state new {proto} dport {src_port} redirect to :{dst_port} comment \"{cell}\"\n\n\
+                    "{blacklist_drop}add rule {family} self-nat PREROUTING ct state new {access_condition}{proto} dport {src_port} counter redirect to :{dst_port} comment \"{stats_comment}\"\n\n\
                     ",
                 )
             };
@@ -395,6 +546,120 @@ fn build_redirect_rule(cell: &NftCell, ip_version: &IpVersion) -> Result<String,
             "Not a Redirect cell",
         )),
     }
+}
+
+fn nat_rule_comment(
+    rule_index: Option<usize>,
+    rule_type: &str,
+    sport: &str,
+    target: &str,
+    dport: &str,
+    protocol: &Protocol,
+    user_comment: Option<&str>,
+) -> String {
+    let mut comment = format!(
+        "nat-rule:index={},type={},sport={},target={},dport={},proto={}",
+        rule_index
+            .map(|index| index.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        sanitize_comment_value(rule_type),
+        sanitize_comment_value(sport),
+        sanitize_comment_value(target),
+        sanitize_comment_value(dport),
+        sanitize_comment_value(&protocol.to_string())
+    );
+    if let Some(user_comment) = user_comment
+        && !user_comment.is_empty()
+    {
+        comment.push_str(",comment=");
+        comment.push_str(&sanitize_comment_value(user_comment));
+    }
+    comment
+}
+
+fn build_traffic_counter_rules(
+    family: &str,
+    dst_ip: &str,
+    protocol: &Protocol,
+    dport: &str,
+    nat_rule_comment: &str,
+) -> String {
+    let proto = protocol.nft_proto();
+    let out_comment = nat_traffic_comment(nat_rule_comment, "out");
+    let in_comment = nat_traffic_comment(nat_rule_comment, "in");
+    format!(
+        "add rule {family} self-filter FORWARD {family} daddr {dst_ip} {proto} dport {dport} counter comment \"{out_comment}\"\n\
+        add rule {family} self-filter FORWARD {family} saddr {dst_ip} {proto} sport {dport} counter comment \"{in_comment}\"\n\n",
+    )
+}
+
+fn nat_traffic_comment(nat_rule_comment: &str, direction: &str) -> String {
+    let payload = nat_rule_comment
+        .strip_prefix("nat-rule:")
+        .unwrap_or(nat_rule_comment);
+    format!("nat-traffic:direction={direction},{payload}")
+}
+
+fn access_condition(family: &str, config: &AccessControlConfig) -> Option<String> {
+    if config.mode != AccessControlMode::Whitelist {
+        return Some(String::new());
+    }
+    access_entries_for_family(family, &config.entries)
+        .map(|entries| format!("{family} saddr {{ {entries} }} "))
+}
+
+fn build_access_drop_rules(
+    family: &str,
+    config: &AccessControlConfig,
+    protocol: &Protocol,
+    listen_port: &str,
+    rule_index: Option<usize>,
+) -> String {
+    if config.mode != AccessControlMode::Blacklist {
+        return String::new();
+    }
+    let Some(entries) = access_entries_for_family(family, &config.entries) else {
+        return String::new();
+    };
+    let proto = protocol.nft_proto();
+    format!(
+        "add rule {family} self-nat PREROUTING {family} saddr {{ {entries} }} {proto} dport {listen_port} counter drop comment \"{}\"\n",
+        nat_access_comment("blacklist", rule_index)
+    )
+}
+
+fn access_entries_for_family(family: &str, entries: &[String]) -> Option<String> {
+    let want_ipv6 = family == "ip6";
+    let values: Vec<String> = entries
+        .iter()
+        .filter(|entry| access_entry_is_ipv6(entry) == want_ipv6)
+        .cloned()
+        .collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join(", "))
+    }
+}
+
+fn access_entry_is_ipv6(entry: &str) -> bool {
+    entry.contains(':')
+}
+
+fn nat_access_comment(mode: &str, rule_index: Option<usize>) -> String {
+    format!(
+        "nat-access:mode={mode},rule={}",
+        rule_index
+            .map(|index| index.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
+fn sanitize_comment_value(value: &str) -> String {
+    value
+        .replace('\\', "/")
+        .replace('"', "'")
+        .replace([',', '\n'], " ")
 }
 
 /// 解析一行legacy配置，返回RuntimeCell或错误
@@ -555,6 +820,11 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
                 comment: Some("阻止SSH端口访问".to_string()),
             },
         ],
+        dns: DnsConfig::default(),
+        ddns: DdnsConfig::default(),
+        stats: StatsConfig::default(),
+        telegram: TelegramConfig::default(),
+        access_control: AccessControlConfig::default(),
     };
 
     let toml_str = example_config
@@ -664,9 +934,11 @@ mod redirect_build_tests {
             comment: None,
         };
 
-        let result = cell.build().unwrap();
+        let result = cell
+            .build_with_rule_index(None, &DnsConfig::default(), &Default::default())
+            .unwrap();
         // all协议使用th dport匹配所有传输层协议
-        assert!(result.contains("add rule ip self-nat PREROUTING ct state new meta l4proto { tcp, udp } th dport 8000 redirect to :3128"));
+        assert!(result.contains("add rule ip self-nat PREROUTING ct state new meta l4proto { tcp, udp } th dport 8000 counter redirect to :3128"));
         assert!(!result.contains("ip6")); // Should not have IPv6 rules
     }
 
@@ -681,10 +953,12 @@ mod redirect_build_tests {
             comment: None,
         };
 
-        let result = cell.build().unwrap();
+        let result = cell
+            .build_with_rule_index(None, &DnsConfig::default(), &Default::default())
+            .unwrap();
         // tcp协议只生成tcp规则
         assert!(result.contains(
-            "add rule ip self-nat PREROUTING ct state new tcp dport 30001-39999 redirect to :45678"
+            "add rule ip self-nat PREROUTING ct state new tcp dport 30001-39999 counter redirect to :45678"
         ));
         assert!(!result.contains("udp")); // tcp协议不应该包含udp规则
         assert!(!result.contains("ip6")); // Should not have IPv6 rules
@@ -701,11 +975,13 @@ mod redirect_build_tests {
             comment: None,
         };
 
-        let result = cell.build().unwrap();
+        let result = cell
+            .build_with_rule_index(None, &DnsConfig::default(), &Default::default())
+            .unwrap();
         // all协议应该使用th dport，同时包含IPv4和IPv6
-        assert!(result.contains("add rule ip self-nat PREROUTING ct state new meta l4proto { tcp, udp } th dport 5000 redirect to :4000"));
+        assert!(result.contains("add rule ip self-nat PREROUTING ct state new meta l4proto { tcp, udp } th dport 5000 counter redirect to :4000"));
         assert!(
-            result.contains("add rule ip6 self-nat PREROUTING ct state new meta l4proto { tcp, udp } th dport 5000 redirect to :4000")
+            result.contains("add rule ip6 self-nat PREROUTING ct state new meta l4proto { tcp, udp } th dport 5000 counter redirect to :4000")
         );
     }
 }

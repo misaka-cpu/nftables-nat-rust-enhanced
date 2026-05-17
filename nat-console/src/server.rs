@@ -1,11 +1,13 @@
 use crate::Args;
 use crate::handlers::{
-    AppState, get_config, get_current_user, get_rules, get_rules_json, login_handler,
-    logout_handler, save_config, hybrid_auth_middleware,
+    AppState, enable_bbr, get_access_control_status, get_bbr_status, get_config, get_current_user,
+    get_rules, get_rules_json, get_stats, get_telegram_status, hybrid_auth_middleware,
+    login_handler, logout_handler, reset_stats_daily, reset_stats_monthly, save_config,
+    test_telegram,
 };
 use axum::{
     Router,
-    http::{StatusCode, Method, header},
+    http::{Method, StatusCode, header},
     middleware,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -49,6 +51,14 @@ pub async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error + Se
         .route("/api/me", get(get_current_user))
         .route("/api/config", get(get_config).post(save_config))
         .route("/api/rules", get(get_rules_json))
+        .route("/api/bbr/status", get(get_bbr_status))
+        .route("/api/bbr/enable", post(enable_bbr))
+        .route("/api/stats", get(get_stats))
+        .route("/api/stats/reset-daily", post(reset_stats_daily))
+        .route("/api/stats/reset-monthly", post(reset_stats_monthly))
+        .route("/api/telegram/status", get(get_telegram_status))
+        .route("/api/telegram/test", post(test_telegram))
+        .route("/api/access-control/status", get(get_access_control_status))
         .route("/rules", get(get_rules))
         .layer(middleware::from_fn_with_state(
             Arc::new(jwt_config.clone()),
@@ -76,10 +86,7 @@ pub async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error + Se
             tower_http::cors::CorsLayer::new()
                 .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers([
-                    header::AUTHORIZATION,
-                    header::CONTENT_TYPE,
-                ])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
                 .allow_credentials(true),
             tower_http::timeout::TimeoutLayer::with_status_code(
                 StatusCode::REQUEST_TIMEOUT,

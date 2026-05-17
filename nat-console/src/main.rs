@@ -1,5 +1,6 @@
 use clap::Parser;
-use log::info;
+use log::{error, info};
+use std::env;
 mod config;
 mod handlers;
 mod server;
@@ -15,15 +16,15 @@ struct Args {
     port: u16,
 
     /// 用户名
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "admin")]
     username: String,
 
     /// 密码
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     password: String,
 
     /// JWT 密钥
-    #[arg(long, default_value = "your-secret-key-change-in-production")]
+    #[arg(long, default_value = "")]
     jwt_secret: String,
 
     /// TLS 证书路径
@@ -46,7 +47,27 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
     nat_common::logger::init(env!("CARGO_CRATE_NAME"));
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    if let Ok(username) = env::var("NAT_CONSOLE_USERNAME")
+        && args.username == "admin"
+    {
+        args.username = username;
+    }
+    if args.password.is_empty() {
+        args.password = env::var("NAT_CONSOLE_PASSWORD").unwrap_or_default();
+    }
+    if args.jwt_secret.is_empty() {
+        args.jwt_secret = env::var("NAT_CONSOLE_JWT_SECRET").unwrap_or_default();
+    }
+    if args.password.is_empty() {
+        error!("NAT_CONSOLE_PASSWORD or --password is required");
+        return Err("NAT_CONSOLE_PASSWORD or --password is required".into());
+    }
+    if args.jwt_secret.is_empty() {
+        error!("NAT_CONSOLE_JWT_SECRET or --jwt-secret is required");
+        return Err("NAT_CONSOLE_JWT_SECRET or --jwt-secret is required".into());
+    }
 
     info!("Starting WebUI server on port {}", args.port);
     info!("Username: {}", args.username);
