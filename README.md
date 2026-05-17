@@ -704,6 +704,17 @@ curl http://localhost:8000      # ❌ 不会重定向，直接访问 8000
 
 本项目采用 [MIT License](LICENSE) 开源协议。
 
+## 🙏 Acknowledgements / Credits
+
+本项目基于 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 修改，保留原项目 MIT License 与版权声明。
+
+功能设计上参考了以下 MIT License 项目的思路：
+
+- [endview/nftpf](https://github.com/endview/nftpf)：CLI 菜单、DDNS、访问控制、备份与回滚等管理体验。
+- [mora1n/pfwd](https://github.com/mora1n/pfwd)：端口转发管理思路。
+
+以上为开源项目致谢与设计思路参考说明，不表示相关作者参与了本项目开发，也不表示本项目复制了上述项目代码。详见 [NOTICE](NOTICE)。
+
 ## 🔗 相关链接
 
 - **项目地址**：https://github.com/arloor/nftables-nat-rust

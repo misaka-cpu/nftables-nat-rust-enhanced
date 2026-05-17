@@ -1,0 +1,36 @@
+nftables-nat-rust Notice
+========================
+
+This project is a modified version of arloor/nftables-nat-rust:
+
+  https://github.com/arloor/nftables-nat-rust
+
+The original project is licensed under the MIT License. The original LICENSE
+file and arloor copyright notice are retained in this repository.
+
+This project also references design ideas from the following MIT-licensed
+open source projects:
+
+- endview/nftpf
+  https://github.com/endview/nftpf
+  Referenced ideas include CLI menu flows, DDNS-oriented management,
+  access-control workflows, and backup/rollback management concepts.
+
+- mora1n/pfwd
+  https://github.com/mora1n/pfwd
+  Referenced ideas include port-forwarding management concepts.
+
+These acknowledgements describe inspiration and design references only. They
+do not state or imply that the authors of those projects participated in this
+project's development, endorsed this project, or that code was copied from
+those projects.
+
+License Summary
+---------------
+
+- arloor/nftables-nat-rust: MIT License
+- endview/nftpf: MIT License
+- mora1n/pfwd: MIT License
+
+This project remains distributed under the MIT License. See LICENSE for the
+full license text.
