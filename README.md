@@ -125,6 +125,34 @@ apt install -y \
 https://github.com/misaka-cpu/nftables-nat-rust-enhanced
 ```
 
+### 小白一行命令
+
+建议先运行 dry-run 预演，确认安装计划后再正式安装。正式 VPS 的 WebUI 建议绑定 `127.0.0.1`，并通过 SSH 隧道访问；`0.0.0.0` 只建议局域网或已配置防火墙时使用。
+
+dry-run 预演：
+
+```bash
+apt update && apt install -y git curl wget ca-certificates build-essential pkg-config libssl-dev nftables iproute2 iptables procps openssl tar nano && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env" && tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --dry-run --with-console
+```
+
+正式安装核心 + WebUI：
+
+```bash
+apt update && apt install -y git curl wget ca-certificates build-essential pkg-config libssl-dev nftables iproute2 iptables procps openssl tar nano && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env" && tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --with-console
+```
+
+只装核心转发：
+
+```bash
+apt update && apt install -y git curl wget ca-certificates build-essential pkg-config libssl-dev nftables iproute2 iptables procps openssl tar nano && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env" && tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --core-only
+```
+
+已安装依赖和 Rust 的短版：
+
+```bash
+tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --with-console
+```
+
 ### 从源码构建并安装
 
 ```bash
@@ -231,6 +259,73 @@ ssh -p 22369 -L 5533:127.0.0.1:5533 root@VPS_IP
 ```text
 https://127.0.0.1:5533
 ```
+
+如果你希望本地浏览器使用另一个端口，例如 `15533`：
+
+```bash
+ssh -p 22369 -L 15533:127.0.0.1:5533 root@VPS_IP
+```
+
+则浏览器访问：
+
+```text
+https://127.0.0.1:15533
+```
+
+端口映射关系说明：
+
+- `ssh -p 22369 -L 15533:127.0.0.1:5533 root@VPS_IP` 对应浏览器打开 `https://127.0.0.1:15533`
+- `ssh -p 22369 -L 5533:127.0.0.1:5533 root@VPS_IP` 对应浏览器打开 `https://127.0.0.1:5533`
+
+### SSH known_hosts 指纹变化
+
+如果 VPS 重装、重建、换系统或更换 SSH host key，本地 SSH 客户端可能报错：
+
+```text
+WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!
+Host key verification failed.
+```
+
+这不是本项目 bug，而是本地 `known_hosts` 缓存了旧主机指纹。
+
+Windows 下如果 SSH 端口不是 22，例如 `22369`：
+
+```bash
+ssh-keygen -R "[你的VPS_IP]:22369"
+```
+
+然后重新连接隧道：
+
+```bash
+ssh -p 22369 -L 15533:127.0.0.1:5533 root@你的VPS_IP
+```
+
+浏览器访问：
+
+```text
+https://127.0.0.1:15533
+```
+
+如果使用默认 22 端口：
+
+```bash
+ssh-keygen -R "你的VPS_IP"
+```
+
+macOS / Linux 也可能遇到同样问题，处理命令相同：
+
+```bash
+ssh-keygen -R "[你的VPS_IP]:你的SSH端口"
+```
+
+常见 `known_hosts` 路径：
+
+```text
+Windows: C:\Users\你的用户名\.ssh\known_hosts
+macOS/Linux: ~/.ssh/known_hosts
+```
+
+安全提醒：只有在确认 VPS 确实是自己重装、重建或更换系统后，才删除旧 host key。如果你没有重装或更换服务器，却突然出现该警告，应先确认是否连错 IP 或存在中间人攻击风险。
 
 如果选择 `0.0.0.0`：
 
