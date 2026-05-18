@@ -17,6 +17,26 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local haystack="$1"
+    local needle="$2"
+    if grep -F "$needle" <<<"$haystack" >/dev/null; then
+        echo "unexpected output: $needle" >&2
+        echo "$haystack" >&2
+        exit 1
+    fi
+}
+
+assert_line_not_contains() {
+    local haystack="$1"
+    local needle="$2"
+    if grep -Fx "$needle" <<<"$haystack" >/dev/null; then
+        echo "unexpected output line: $needle" >&2
+        echo "$haystack" >&2
+        exit 1
+    fi
+}
+
 bash -n "$ROOT_DIR/install.sh"
 bash -n "$ROOT_DIR/setup.sh"
 bash -n "$ROOT_DIR/setup-console.sh"
@@ -31,20 +51,39 @@ setup_core="$(cat "$ROOT_DIR/setup.sh")"
 setup_console="$(cat "$ROOT_DIR/setup-console.sh")"
 setup_assets="$(cat "$ROOT_DIR/setup-console-assets.sh")"
 install_script="$(cat "$ROOT_DIR/install.sh")"
+menu_script="$(cat "$ROOT_DIR/nat-cli/src/menu.rs")"
+main_script="$(cat "$ROOT_DIR/nat-cli/src/main.rs")"
 assert_contains "$setup_core" "当前 release 二进制与系统 glibc 不兼容"
 assert_contains "$setup_console" "当前 release 二进制与系统 glibc 不兼容"
 assert_contains "$setup_assets" "当前 release 二进制与系统 glibc 不兼容"
 assert_contains "$install_script" "当前 release 二进制与系统 glibc 不兼容"
+assert_contains "$setup_core" "systemctl restart nat"
+assert_contains "$setup_core" "systemctl is-active --quiet nat"
+assert_contains "$setup_console" "systemctl restart nat-console"
+assert_contains "$setup_console" "WebUI 服务未正常启动，请查看："
+assert_contains "$menu_script" "nat.service 未运行，转发规则不会应用。"
+assert_contains "$menu_script" "nft 规则未找到。可能原因："
+assert_contains "$main_script" "no rules configured, waiting for config changes"
 
 output="$(run_install --dry-run --with-console --use-release)"
 assert_contains "$output" "would download GitHub Release asset:"
 assert_contains "$output" "nftables-nat-rust-enhanced-linux-amd64.tar.gz"
+assert_contains "$output" "would run systemctl enable nat"
+assert_contains "$output" "would run systemctl restart nat"
+assert_contains "$output" "would check nat.service active: systemctl is-active nat"
 assert_contains "$output" "would install nat-console WebUI service"
+assert_contains "$output" "would run systemctl enable nat-console"
+assert_contains "$output" "would run systemctl restart nat-console"
+assert_contains "$output" "would run WebUI health check:"
 assert_contains "$output" "dry-run: 安装完成后可选择进入 CLI 管理菜单"
 
 output="$(run_install --dry-run --core-only --use-release)"
 assert_contains "$output" "would check core runtime dependencies"
 assert_contains "$output" "would use release payload:"
+assert_contains "$output" "would run systemctl enable nat"
+assert_contains "$output" "would run systemctl restart nat"
+assert_contains "$output" "would check nat.service active: systemctl is-active nat"
+assert_not_contains "$output" "nat-console.service"
 assert_contains "$output" "dry-run: 安装完成后可选择进入 CLI 管理菜单"
 
 output="$(run_install --dry-run --core-only --enter-menu)"
@@ -61,6 +100,10 @@ output="$(run_install --dry-run --core-only --use-release --version v0.1.0 --rep
 assert_contains "$output" "https://github.com/test-owner/test-repo/releases/download/v0.1.0/"
 
 output="$(run_install --dry-run --console-only)"
+assert_contains "$output" "would run systemctl enable nat-console"
+assert_contains "$output" "would run systemctl restart nat-console"
+assert_contains "$output" "would run WebUI health check:"
+assert_line_not_contains "$output" "[DRY-RUN] would run systemctl restart nat"
 assert_contains "$output" "console-only does not enter CLI management menu by default"
 
 output="$(run_install --dry-run --console-only --enter-menu)"
@@ -69,10 +112,6 @@ assert_contains "$output" "would enter CLI management menu only if core nat is i
 output="$(run_install --dry-run --uninstall --core)"
 assert_contains "$output" "would ask uninstall target"
 assert_contains "$output" "would never flush ruleset"
-if grep -F "CLI 管理菜单" <<<"$output" >/dev/null; then
-    echo "uninstall dry-run should not mention CLI menu entry" >&2
-    echo "$output" >&2
-    exit 1
-fi
+assert_not_contains "$output" "CLI 管理菜单"
 
 echo "install dry-run checks passed"

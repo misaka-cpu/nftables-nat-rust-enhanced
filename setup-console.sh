@@ -642,9 +642,11 @@ fi
 echo ""
 echo "========================================="
 if [ "$WEBUI_HEALTH_OK" -eq 1 ]; then
-    echo "安装成功！systemd service 已创建且 WebUI 已启动"
+    echo "安装完成。"
+    echo ""
+    echo "WebUI 已启动：OK"
 else
-    echo "安装完成，但 WebUI 服务未通过健康检查"
+    echo "安装完成，但 WebUI 服务未正常启动"
 fi
 echo "========================================="
 echo "配置格式: $CONFIG_TYPE"
@@ -694,3 +696,7 @@ if [ -x "/usr/local/bin/nat" ]; then
     echo "  /usr/local/bin/nat --menu"
 fi
 echo "========================================="
+
+if [ "$WEBUI_HEALTH_OK" -ne 1 ]; then
+    exit 1
+fi

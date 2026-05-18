@@ -841,18 +841,35 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
             "inactive/unknown"
         }
     );
+    if !nat_active {
+        println!("nat.service 未运行，转发规则不会应用。");
+        println!("请执行：");
+        println!("  systemctl restart nat");
+        println!("  systemctl status nat --no-pager -l");
+        println!("  journalctl -u nat -n 120 --no-pager");
+    }
     let nft_json = read_nft_json_ruleset();
     match nft_json {
         Ok(json) => match forward_test::parse_rule_counters(&json, &rule.id) {
             Ok(counters) => {
+                let nft_applied = forward_test::nft_rule_applied(&counters);
                 println!(
                     "nft 规则: {}",
-                    if forward_test::nft_rule_applied(&counters) {
+                    if nft_applied {
                         "已应用"
                     } else {
                         "未找到"
                     }
                 );
+                if !nft_applied {
+                    println!("nft 规则未找到。可能原因：");
+                    println!("- nat.service 未运行");
+                    println!("- /etc/nat.toml 规则尚未应用");
+                    println!("- 规则配置解析失败");
+                    println!("- fake-ip 被拒绝");
+                    println!("请查看：");
+                    println!("  journalctl -u nat -n 120 --no-pager");
+                }
                 println!(
                     "baseline counters: nat-rule={}B, out={}B, in={}B",
                     counters.nat_rule.bytes, counters.out.bytes, counters.r#in.bytes

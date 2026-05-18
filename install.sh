@@ -257,17 +257,14 @@ dry_run_core_install() {
     fi
     log_dry_run "would install /usr/local/bin/nat"
     log_dry_run "would create/update /lib/systemd/system/nat.service with $config_type config"
-    log_dry_run "would enable nat.service"
-    if [ "${NAT_START_SERVICE:-0}" = "1" ]; then
-        log_dry_run "would start or restart nat.service"
-    fi
+    log_dry_run "would run systemctl daemon-reload"
+    log_dry_run "would run systemctl enable nat"
+    log_dry_run "would run systemctl restart nat"
+    log_dry_run "would check nat.service active: systemctl is-active nat"
     log_dry_run "would preserve existing /etc/nat.conf if present"
     log_dry_run "would preserve existing /etc/nat.toml if present"
     log_dry_run "would preserve existing /opt/nat/env if present"
     log_dry_run "would show CLI management entry: nat --menu"
-    if [ "${NAT_START_SERVICE:-0}" != "1" ]; then
-        log_dry_run "would ask before starting or restarting nat.service in interactive mode"
-    fi
 }
 
 dry_run_console_install() {
@@ -302,9 +299,10 @@ dry_run_console_install() {
     log_dry_run "would create /opt/nat-console/env with mode 600"
     log_dry_run "would write NAT_CONSOLE_BIND to /opt/nat-console/env"
     log_dry_run "would not print JWT secret"
-    log_dry_run "would enable nat-console.service"
     log_dry_run "would run systemctl daemon-reload"
-    log_dry_run "would restart nat-console.service"
+    log_dry_run "would run systemctl enable nat-console"
+    log_dry_run "would run systemctl restart nat-console"
+    log_dry_run "would check nat-console.service active through WebUI health check"
     log_dry_run "would run WebUI health check: curl -k https://127.0.0.1:${NAT_CONSOLE_PORT:-5533}/health"
     log_dry_run "would preserve existing /etc/ssl/nat-webui.crt if present"
     log_dry_run "would preserve existing /etc/ssl/nat-webui.key if present"
@@ -733,7 +731,7 @@ prepare_install_payload "$ACTION"
 
 case "$ACTION" in
     --core-only)
-        NAT_NONINTERACTIVE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}"
+        NAT_NONINTERACTIVE=1 NAT_START_SERVICE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}"
         maybe_enter_cli_menu "--core-only"
         ;;
     --with-console)

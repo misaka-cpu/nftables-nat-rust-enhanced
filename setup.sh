@@ -162,6 +162,22 @@ preflight_dependencies() {
     log_ok "dependency check completed"
 }
 
+restart_and_check_nat_service() {
+    log_info "reloading systemd and restarting nat.service"
+    systemctl daemon-reload
+    systemctl enable nat
+    log_ok "nat.service enabled"
+    systemctl restart nat
+    if systemctl is-active --quiet nat; then
+        log_ok "nat.service 已启动：OK"
+        return 0
+    fi
+    log_err "nat.service 未正常启动，请查看："
+    echo "  systemctl status nat --no-pager -l"
+    echo "  journalctl -u nat -n 120 --no-pager"
+    return 1
+}
+
 # 使用说明
 usage() {
     echo "用法: $0 [legacy|toml]"
@@ -232,11 +248,6 @@ RestartSec=60
 [Install]
 WantedBy=multi-user.target
 EOF
-
-# 设置开机启动
-systemctl daemon-reload
-systemctl enable nat
-log_ok "nat.service enabled"
 
 # 创建工作目录
 mkdir -p /opt/nat
@@ -356,35 +367,15 @@ traffic_mode = "both" # both / out / in
 EOF
 fi
 
-if [ "$NAT_START_SERVICE" = "1" ]; then
-    if systemctl is-active --quiet nat; then
-        systemctl restart nat
-        log_ok "nat.service restarted"
-    else
-        systemctl start nat
-        log_ok "nat.service started"
-    fi
-elif [ "$NAT_NONINTERACTIVE" = "1" ]; then
-    log_info "非交互模式：已 enable nat.service，不强制 start/restart"
-else
-    read -r -p "是否立即启动/重启 nat.service? [y/N]: " START_NAT
-    if [[ "$START_NAT" =~ ^[Yy]$ ]]; then
-        if systemctl is-active --quiet nat; then
-            systemctl restart nat
-            log_ok "nat.service restarted"
-        else
-            systemctl start nat
-            log_ok "nat.service started"
-        fi
-    else
-        log_info "已跳过立即启动/重启 nat.service"
-    fi
-fi
+restart_and_check_nat_service
 
 echo ""
 echo "========================================="
-echo "安装成功！"
+echo "安装完成。"
 echo "========================================="
+echo ""
+echo "nat.service 已启动：OK"
+echo ""
 echo "配置格式: $CONFIG_TYPE"
 echo "配置文件: $CONFIG_FILE"
 echo "示例配置: $EXAMPLE_FILE"
@@ -402,7 +393,7 @@ echo "或："
 echo "  /usr/local/bin/nat --menu"
 echo ""
 echo "常用服务命令："
-echo "  查看状态: systemctl status nat --no-pager"
+echo "  查看状态: systemctl status nat --no-pager -l"
 echo "  启动服务: systemctl start nat"
 echo "  停止服务: systemctl stop nat"
 echo "  重启服务: systemctl restart nat"

@@ -182,7 +182,7 @@ dry-run 预演：
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --dry-run --with-console --use-release
 ```
 
-只安装核心服务后，可以通过 `nat --menu` 进入终端管理菜单。
+只安装核心服务后，安装脚本会自动启动 `nat.service` 并检查状态；安装成功后可以通过 `nat --menu` 进入终端管理菜单。
 
 ### 从源码构建并安装
 
@@ -192,7 +192,7 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --with-console
 ```
 
-安装核心 + WebUI 时，安装脚本会刷新 systemd、启用并启动/重启 `nat.service` 和 `nat-console.service`，随后对 WebUI 执行本机健康检查：
+安装核心 + WebUI 时，安装脚本会刷新 systemd、启用并启动/重启 `nat.service` 和 `nat-console.service`，检查 `nat.service` active，随后对 WebUI 执行本机健康检查：
 
 ```bash
 curl -k https://127.0.0.1:5533/health
@@ -236,6 +236,8 @@ cargo build --release
 bash install.sh --dry-run --console-only
 bash install.sh --console-only
 ```
+
+只安装 WebUI 时，安装脚本会自动启动 `nat-console.service` 并做 health check，不会主动启动或重启 `nat.service`。
 
 ### 交互式安装菜单
 
@@ -546,7 +548,7 @@ refresh_interval_seconds = 300
 核心服务：
 
 ```bash
-systemctl status nat
+systemctl status nat --no-pager -l
 systemctl start nat
 systemctl stop nat
 systemctl restart nat
@@ -556,7 +558,7 @@ journalctl -u nat -f
 WebUI 服务：
 
 ```bash
-systemctl status nat-console
+systemctl status nat-console --no-pager -l
 systemctl start nat-console
 systemctl stop nat-console
 systemctl restart nat-console
@@ -801,10 +803,18 @@ https://127.0.0.1:5533
 检查服务和 nft 表：
 
 ```bash
-systemctl status nat
-journalctl -u nat -f
+systemctl status nat --no-pager -l
+journalctl -u nat -n 120 --no-pager
 nft list table ip self-nat
 nft list table ip self-filter
+```
+
+如果 CLI 转发测试显示 `nat.service inactive/unknown` 或 `nft 规则未找到`，通常是服务未运行、配置尚未应用、规则解析失败或 fake-ip 被拒绝。先重启并查看日志：
+
+```bash
+systemctl restart nat
+systemctl status nat --no-pager -l
+journalctl -u nat -n 120 --no-pager
 ```
 
 如果 `nft -c` 检查失败，规则不会应用。请查看 `nat` 日志中的错误。

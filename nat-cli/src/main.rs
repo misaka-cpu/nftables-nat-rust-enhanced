@@ -157,6 +157,9 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
                     continue;
                 }
             };
+            if nat_cells.is_empty() {
+                info!("no rules configured, waiting for config changes");
+            }
             let script = match build_new_script(&nat_cells, &dns_config, &access_config) {
                 Ok(script) => script,
                 Err(e) => {
@@ -1124,6 +1127,21 @@ refresh_interval_seconds = 123
         };
         let script = build_new_script(&cells, &DnsConfig::default(), &access).unwrap();
         assert!(script.contains("ip6 saddr { 2001:db8::/64 } meta l4proto { tcp, udp } th dport 30000-30010 counter dnat"));
+        assert!(!script.contains("flush ruleset"));
+    }
+
+    #[test]
+    fn empty_rules_still_builds_managed_tables_script() {
+        let script = build_new_script(
+            &[],
+            &DnsConfig::default(),
+            &nat_common::AccessControlConfig::default(),
+        )
+        .unwrap();
+        assert!(script.contains("add table ip self-nat"));
+        assert!(script.contains("add table ip6 self-nat"));
+        assert!(script.contains("add table ip self-filter"));
+        assert!(script.contains("add table ip6 self-filter"));
         assert!(!script.contains("flush ruleset"));
     }
 }
