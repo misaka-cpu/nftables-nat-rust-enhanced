@@ -1,49 +1,51 @@
-name: auto_release
+name: release
 
 on:
   push:
-    branches: [ "release", "release/*" ]
-  pull_request:
-    branches: [ "master" ]
+    tags:
+      - "v*"
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  PROJECT_NAME: nftables-nat-rust-enhanced
 
 jobs:
-  all:
+  build-linux-amd64:
+    name: build linux-amd64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # - name: zig_build_glibc
-      #   run: |
-      #     version=0.15.2
-      #     name=zig-x86_64-linux-${version}
-      #     curl -SsLf https://ziglang.org/download/${version}/${name}.tar.xz -o- | tar -xJf - -C /tmp 
-      #     export PATH="/tmp/${name}:$PATH"
-      #     zig version
 
-      #     cargo install cargo-zigbuild
-      #     cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17  
-      #     ls target/x86_64-unknown-linux-gnu/release
-      - name: build_zigbuild
-        id: build_zigbuild
-        uses: arloor/rust_musl_action@latest
-        with:
-          use_zigbuild: true
-      - name: gihub release
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/heads/release/'))
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      - name: Package release asset
         run: |
-          version=$(grep -E ^version Cargo.toml|awk -F "[\"]" '{print $2}')
-          version="v${version}"
-          if $(gh release delete ${version} -y --cleanup-tag); 
-            then echo "delete old release"; 
-            else echo "no old release";
-          fi
-          git config --local user.email "admin@arloor.com"
-          git config --local user.name "arloor"
-          gh release create ${version} ${{ steps.build_zigbuild.outputs.release_dir }}/nat ${{ steps.build_zigbuild.outputs.release_dir }}/nat-console setup.sh setup-console.sh setup-console-assets.sh -n "$version" -t "$version" --latest
+          set -euo pipefail
+          asset="${PROJECT_NAME}-linux-amd64"
+          staging="dist/${asset}"
+          mkdir -p "$staging"
+          install -m 755 target/release/nat "$staging/nat"
+          install -m 755 target/release/nat-console "$staging/nat-console"
+          cp -a static "$staging/static"
+          install -m 755 install.sh "$staging/install.sh"
+          install -m 755 setup.sh "$staging/setup.sh"
+          install -m 755 setup-console.sh "$staging/setup-console.sh"
+          install -m 755 setup-console-assets.sh "$staging/setup-console-assets.sh"
+          install -m 644 README.md "$staging/README.md"
+          install -m 644 LICENSE "$staging/LICENSE"
+          install -m 644 NOTICE "$staging/NOTICE"
+          tar -C dist -czf "dist/${asset}.tar.gz" "$asset"
+          (cd dist && sha256sum "${asset}.tar.gz" > SHA256SUMS)
+
+      - name: Upload GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ env.PROJECT_NAME }}-linux-amd64.tar.gz
+            dist/SHA256SUMS

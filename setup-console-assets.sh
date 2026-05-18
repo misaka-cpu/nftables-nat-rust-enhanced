@@ -6,6 +6,7 @@ MISSING_PACKAGES=()
 OS_ID=""
 OS_VERSION_ID=""
 OS_PRETTY_NAME=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log_info() {
     echo "[INFO] $1"
@@ -164,40 +165,50 @@ check_node_versions() {
 preflight_dependencies() {
     require_root
     detect_os
-    ensure_apt_packages curl wget ca-certificates systemd
+    ensure_apt_packages curl ca-certificates systemd
     ensure_commands \
         "curl:curl" \
-        "wget:wget" \
         "install:coreutils" \
         "sed:sed" \
         "systemctl:systemd"
-    ensure_node_assets_dependencies
+    if [ -z "${NAT_STATIC_DIR:-}" ]; then
+        ensure_node_assets_dependencies
+    fi
     install_queued_packages
-    check_node_versions
+    if [ -z "${NAT_STATIC_DIR:-}" ]; then
+        check_node_versions
+    fi
     log_ok "dependency check completed"
 }
 
 preflight_dependencies
 
-# 下载 nat-console
-echo "下载 nat-console..."
-DOWNLOAD_URL="https://us.arloor.dev/https://github.com/arloor/nftables-nat-rust/releases/download/v2.0.0/nat-console"
 TMP_FILE="/tmp/nat-console"
 INSTALL_PATH="/usr/local/bin/nat-console"
+LOCAL_CONSOLE_BIN="${NAT_BINARY_DIR:-}/nat-console"
 
-if ! curl -L "$DOWNLOAD_URL" -o "$TMP_FILE"; then
-    echo "错误: 下载 nat-console 失败"
+echo "安装 nat-console 到 $INSTALL_PATH..."
+if [ -x "$LOCAL_CONSOLE_BIN" ]; then
+    TMP_FILE="$LOCAL_CONSOLE_BIN"
+elif [ -x "$SCRIPT_DIR/target/release/nat-console" ]; then
+    TMP_FILE="$SCRIPT_DIR/target/release/nat-console"
+else
+    echo "错误: nat-console binary not found; run install.sh --assets-only --use-release or cargo build --release first"
     exit 1
 fi
 
-# 安装到 /usr/local/bin
-echo "安装 nat-console 到 $INSTALL_PATH..."
 if ! install -m 755 "$TMP_FILE" "$INSTALL_PATH"; then
     echo "错误: 安装 nat-console 失败"
     exit 1
 fi
 
 echo "nat-console 安装成功"
+
+if [ -n "${NAT_STATIC_DIR:-}" ] && [ -d "$NAT_STATIC_DIR" ]; then
+    install -d -m 755 /opt/nat-console/static
+    cp -a "$NAT_STATIC_DIR/." /opt/nat-console/static/
+    echo "WebUI static assets 已安装到 /opt/nat-console/static"
+fi
 
 # 更新现有的 systemd service 文件，移除已废弃的配置文件参数
 SERVICE_FILE="/lib/systemd/system/nat-console.service"
@@ -210,6 +221,9 @@ if [ -f "$SERVICE_FILE" ]; then
         sed -i 's/^LimitNOFILE=.*/LimitNOFILE=65535/' "$SERVICE_FILE"
     else
         sed -i '/^RestartSec=/a LimitNOFILE=65535' "$SERVICE_FILE"
+    fi
+    if ! grep -q '^WorkingDirectory=' "$SERVICE_FILE"; then
+        sed -i '/^Type=/a WorkingDirectory=/opt/nat-console' "$SERVICE_FILE"
     fi
     systemctl daemon-reload
     echo "systemd service 配置已更新，配置格式将自动从 NAT 服务检测"

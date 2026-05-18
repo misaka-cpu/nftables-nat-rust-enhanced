@@ -128,10 +128,9 @@ install_queued_packages() {
 preflight_dependencies() {
     require_root
     detect_os
-    ensure_apt_packages curl wget ca-certificates nftables iproute2 iptables procps systemd openssl
+    ensure_apt_packages curl ca-certificates nftables iproute2 iptables procps systemd openssl
     ensure_commands \
         "curl:curl" \
-        "wget:wget" \
         "nft:nftables" \
         "ip:iproute2" \
         "iptables:iptables" \
@@ -169,14 +168,14 @@ fi
 
 preflight_dependencies
 
-LOCAL_NAT_BIN="$SCRIPT_DIR/target/release/nat"
+LOCAL_NAT_BIN="${NAT_BINARY_DIR:-$SCRIPT_DIR/target/release}/nat"
 if [ -x "$LOCAL_NAT_BIN" ]; then
-    log_info "using local build: target/release/nat"
+    log_info "using nat binary: $LOCAL_NAT_BIN"
     install -m 755 "$LOCAL_NAT_BIN" /usr/local/bin/nat
 else
-    log_info "local build not found, downloading release binary"
-    curl -sSLf https://us.arloor.dev/https://github.com/arloor/nftables-nat-rust/releases/download/v2.0.0/nat -o /tmp/nat
-    install -m 755 /tmp/nat /usr/local/bin/nat
+    log_err "nat binary not found: $LOCAL_NAT_BIN"
+    log_err "run install.sh with --use-release or build first with: cargo build --release"
+    exit 1
 fi
 log_ok "nat installed to /usr/local/bin/nat"
 

@@ -106,18 +106,19 @@
 - Debian 11
 - Ubuntu 20.04 / 22.04 / 24.04
 
-常用依赖：
+轻量安装依赖（使用 GitHub Release 预编译二进制，不需要 Rust 工具链）：
 
 ```bash
-apt update
-apt install -y \
-  git curl wget ca-certificates \
-  build-essential pkg-config libssl-dev \
-  nftables iproute2 iptables procps openssl \
-  tar nano
+apt update && apt install -y curl ca-certificates nftables iproute2 iptables procps openssl tar nano
 ```
 
-如果只安装 release 二进制，目标机器不需要 Rust。只有从源码构建时才需要 Rust / Cargo。
+源码编译依赖：
+
+```bash
+apt update && apt install -y git curl wget ca-certificates build-essential pkg-config libssl-dev nftables iproute2 iptables procps openssl tar nano
+```
+
+使用 release 二进制时不需要安装 `build-essential`、`pkg-config`、`libssl-dev`、`rustup`、`cargo`。只有从源码构建时才需要 Rust / Cargo。
 
 ## 快速安装
 
@@ -127,31 +128,51 @@ apt install -y \
 https://github.com/misaka-cpu/nftables-nat-rust-enhanced
 ```
 
-### 小白一行命令
+### 轻量安装 / 预编译二进制安装
 
-建议先运行 dry-run 预演，确认安装计划后再正式安装。正式 VPS 的 WebUI 建议绑定 `127.0.0.1`，并通过 SSH 隧道访问；`0.0.0.0` 只建议局域网或已配置防火墙时使用。
+推荐普通用户使用 GitHub Release 预编译安装，安装更快，占用内存更少，不需要 Rust 工具链。脚本会按当前系统架构选择 release asset：
+
+```text
+nftables-nat-rust-enhanced-linux-amd64.tar.gz
+nftables-nat-rust-enhanced-linux-arm64.tar.gz
+SHA256SUMS
+```
+
+每个 tar.gz 包含 `nat`、`nat-console`、`static/`、`install.sh`、`setup.sh`、`setup-console.sh`、`setup-console-assets.sh`、`README.md`、`LICENSE`、`NOTICE`。下载后如果 `SHA256SUMS` 可用，安装脚本会校验 SHA256；校验失败或资产不匹配会停止，不会静默执行错误版本。
+
+当前 release workflow 第一版构建并发布 `linux-amd64`。`linux-arm64` 是安装脚本支持的资产命名；如果 Release 暂未提供 arm64 包，脚本会提示没有匹配预编译包并 fallback 到源码编译，或可显式使用 `--build-from-source`。
+
+正式 VPS 的 WebUI 建议绑定 `127.0.0.1`，并通过 SSH 隧道访问；`0.0.0.0` 只建议局域网或已配置防火墙时使用。
+
+核心 + WebUI：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --with-console --use-release
+```
+
+只装核心：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release
+```
+
+只装 WebUI：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --console-only --use-release
+```
 
 dry-run 预演：
 
 ```bash
-apt update && apt install -y git curl wget ca-certificates build-essential pkg-config libssl-dev nftables iproute2 iptables procps openssl tar nano && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env" && tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --dry-run --with-console
-```
-
-正式安装核心 + WebUI：
-
-```bash
-apt update && apt install -y git curl wget ca-certificates build-essential pkg-config libssl-dev nftables iproute2 iptables procps openssl tar nano && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env" && tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --with-console
-```
-
-只装核心转发：
-
-```bash
-apt update && apt install -y git curl wget ca-certificates build-essential pkg-config libssl-dev nftables iproute2 iptables procps openssl tar nano && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env" && tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --core-only
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --dry-run --with-console --use-release
 ```
 
 只安装核心服务后，可以通过 `nat --menu` 进入终端管理菜单。
 
-已安装依赖和 Rust 的短版：
+### 从源码构建并安装
+
+开发者、需要测试最新 `main`、需要自定义修改、或当前架构没有预编译包时，使用源码编译安装：
 
 ```bash
 tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --with-console
@@ -164,8 +185,6 @@ curl -k https://127.0.0.1:5533/health
 ```
 
 如果健康检查失败，请先查看 `nat-console` 状态和日志，不要只看服务是否 enabled。
-
-### 从源码构建并安装
 
 ```bash
 apt update
@@ -184,7 +203,7 @@ cd nftables-nat-rust-enhanced
 cargo build --release
 
 bash install.sh --dry-run --with-console
-bash install.sh --with-console
+bash install.sh --with-console --build-from-source
 ```
 
 ### 只安装核心转发服务
@@ -228,6 +247,12 @@ bash install.sh
 --console-only   只安装 WebUI nat-console
 --assets-only    只安装/更新 WebUI 静态资源
 --dry-run        预演安装计划，不写文件、不启动服务、不安装依赖
+--use-release    优先从 GitHub Releases 下载预编译二进制
+--build-from-source
+                 强制源码编译 cargo build --release
+--version <tag>  指定 release 版本，例如 v0.1.0；默认 latest
+--repo <owner/repo>
+                 指定 release 仓库；默认 misaka-cpu/nftables-nat-rust-enhanced
 --uninstall      卸载服务文件和二进制，保留用户配置
 --help           显示帮助
 ```
@@ -236,21 +261,24 @@ bash install.sh
 
 ```bash
 bash install.sh --dry-run --core-only
-bash install.sh --dry-run --with-console
-bash install.sh --core-only
-bash install.sh --with-console
-bash install.sh --console-only
+bash install.sh --dry-run --with-console --use-release
+bash install.sh --core-only --use-release
+bash install.sh --with-console --use-release
+bash install.sh --console-only --use-release
 bash install.sh --assets-only
+bash install.sh --with-console --version v0.1.0 --repo misaka-cpu/nftables-nat-rust-enhanced
+bash install.sh --with-console --build-from-source
 ```
 
-安装脚本会优先使用本地编译产物：
+默认行为：
 
-```text
-target/release/nat
-target/release/nat-console
-```
+- 如果当前源码目录已有 `target/release/nat` / `target/release/nat-console`，默认优先使用本地构建产物。
+- 如果缺少所需本地二进制，默认尝试下载 GitHub Release 预编译包。
+- `--use-release` 会优先下载 release，即使本地存在构建产物。
+- release 下载失败、架构不匹配或校验失败时，会明确输出错误并 fallback 到源码编译；可用 `--build-from-source` 强制源码编译。
+- dry-run 模式只显示计划下载的 asset、校验和 fallback 流程，不会真实下载、安装、执行 systemctl、nft、apt-get。
 
-只有本地二进制不存在时，才走下载 release 逻辑。核心 nat 安装不依赖 nodejs/npm；只有 WebUI assets 构建/处理流程才检查 nodejs/npm。
+核心 nat 安装不依赖 nodejs/npm；使用 release payload 更新 WebUI assets 时也不需要 nodejs/npm。
 
 ## WebUI 安全访问
 

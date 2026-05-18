@@ -5,6 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY_RUN=0
 UNINSTALL_TARGET=""
 UNINSTALL_DATA_MODE="keep"
+RELEASE_REPO="misaka-cpu/nftables-nat-rust-enhanced"
+RELEASE_VERSION="latest"
+INSTALL_MODE="auto"
+INSTALL_SOURCE_DIR="$SCRIPT_DIR"
+RELEASE_PAYLOAD_DIR=""
+RELEASE_ASSET=""
+USE_RELEASE_SEEN=0
+BUILD_SOURCE_SEEN=0
 
 log_info() {
     echo "[INFO] $1"
@@ -36,6 +44,12 @@ usage() {
   --with-console   安装核心转发服务 nat + WebUI nat-console
   --console-only   只安装 WebUI nat-console
   --assets-only    只安装/更新 WebUI 静态资源 assets
+  --use-release    优先从 GitHub Releases 下载预编译二进制
+  --build-from-source
+                   强制从源码 cargo build --release
+  --version TAG    指定 GitHub Release 版本，默认 latest
+  --repo OWNER/REPO
+                   指定 GitHub 仓库，默认 $RELEASE_REPO
   --uninstall      交互卸载/清理本项目
   --core           与 --uninstall 组合，仅卸载核心 nat
   --console        与 --uninstall 组合，仅卸载 WebUI nat-console
@@ -49,21 +63,193 @@ usage() {
 
 示例:
   $0 --dry-run --core-only
-  $0 --core-only
-  $0 --with-console
+  $0 --core-only --use-release
+  $0 --with-console --use-release
   $0 --console-only
   $0 --assets-only
 EOF
 }
 
+detect_release_platform() {
+    local os arch
+    os="$(uname -s)"
+    arch="${NAT_TEST_UNAME_M:-$(uname -m)}"
+    if [ "$os" != "Linux" ]; then
+        echo "[WARN] no prebuilt release asset for OS: $os" >&2
+        return 1
+    fi
+    case "$arch" in
+        x86_64|amd64)
+            printf '%s' "linux-amd64"
+            ;;
+        aarch64|arm64)
+            printf '%s' "linux-arm64"
+            ;;
+        *)
+            echo "[WARN] no prebuilt release asset for architecture: $arch" >&2
+            return 1
+            ;;
+    esac
+}
+
+release_download_base_url() {
+    if [ "$RELEASE_VERSION" = "latest" ]; then
+        printf 'https://github.com/%s/releases/latest/download' "$RELEASE_REPO"
+    else
+        printf 'https://github.com/%s/releases/download/%s' "$RELEASE_REPO" "$RELEASE_VERSION"
+    fi
+}
+
+local_binary_available() {
+    local action="$1"
+    case "$action" in
+        --core-only)
+            [ -x "$SCRIPT_DIR/target/release/nat" ]
+            ;;
+        --with-console)
+            [ -x "$SCRIPT_DIR/target/release/nat" ] && [ -x "$SCRIPT_DIR/target/release/nat-console" ]
+            ;;
+        --console-only|--assets-only)
+            [ -x "$SCRIPT_DIR/target/release/nat-console" ]
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+prepare_release_payload() {
+    local platform base_url tmp_dir archive_path sums_path payload_dir
+    if ! platform="$(detect_release_platform)"; then
+        return 2
+    fi
+
+    RELEASE_ASSET="nftables-nat-rust-enhanced-${platform}.tar.gz"
+    base_url="$(release_download_base_url)"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_dry_run "would download GitHub Release asset: ${base_url}/${RELEASE_ASSET}"
+        log_dry_run "would download SHA256SUMS if available: ${base_url}/SHA256SUMS"
+        log_dry_run "would verify ${RELEASE_ASSET} with SHA256SUMS when the asset is listed"
+        log_dry_run "would extract release payload and use nat/nat-console/static from it"
+        return 0
+    fi
+
+    for command in curl tar sha256sum; do
+        if ! command -v "$command" >/dev/null 2>&1; then
+            log_err "$command not found; install lightweight dependencies first"
+            log_err "apt update && apt install -y curl ca-certificates nftables iproute2 iptables procps openssl tar nano"
+            return 1
+        fi
+    done
+
+    tmp_dir="$(mktemp -d)"
+    archive_path="$tmp_dir/$RELEASE_ASSET"
+    sums_path="$tmp_dir/SHA256SUMS"
+    log_info "downloading GitHub Release asset: ${base_url}/${RELEASE_ASSET}"
+    if ! curl -fsSL "${base_url}/${RELEASE_ASSET}" -o "$archive_path"; then
+        log_err "failed to download release asset: ${RELEASE_ASSET}"
+        return 1
+    fi
+
+    if curl -fsSL "${base_url}/SHA256SUMS" -o "$sums_path"; then
+        if grep -F "  ${RELEASE_ASSET}" "$sums_path" >/dev/null 2>&1 || grep -F " *${RELEASE_ASSET}" "$sums_path" >/dev/null 2>&1; then
+            (cd "$tmp_dir" && sha256sum -c --ignore-missing SHA256SUMS) || {
+                log_err "SHA256 verification failed for ${RELEASE_ASSET}"
+                return 1
+            }
+            log_ok "SHA256 verified: ${RELEASE_ASSET}"
+        else
+            log_warn "SHA256SUMS does not list ${RELEASE_ASSET}; refusing to silently trust a mismatched checksum file"
+            return 1
+        fi
+    else
+        log_warn "SHA256SUMS not available; continuing without checksum verification"
+    fi
+
+    mkdir -p "$tmp_dir/payload"
+    tar -xzf "$archive_path" -C "$tmp_dir/payload"
+    if [ -x "$tmp_dir/payload/nat" ] || [ -x "$tmp_dir/payload/nat-console" ]; then
+        payload_dir="$tmp_dir/payload"
+    else
+        payload_dir="$(find "$tmp_dir/payload" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    fi
+    if [ -z "${payload_dir:-}" ] || { [ ! -x "$payload_dir/nat" ] && [ ! -x "$payload_dir/nat-console" ]; }; then
+        log_err "release payload does not contain executable nat or nat-console"
+        return 1
+    fi
+
+    RELEASE_PAYLOAD_DIR="$payload_dir"
+    if [ -f "$payload_dir/setup.sh" ] && [ -f "$payload_dir/setup-console.sh" ] && [ -f "$payload_dir/setup-console-assets.sh" ]; then
+        INSTALL_SOURCE_DIR="$payload_dir"
+    elif [ -f "$SCRIPT_DIR/setup.sh" ] && [ -f "$SCRIPT_DIR/setup-console.sh" ] && [ -f "$SCRIPT_DIR/setup-console-assets.sh" ]; then
+        INSTALL_SOURCE_DIR="$SCRIPT_DIR"
+    else
+        log_err "release payload does not contain setup scripts and local setup scripts are unavailable"
+        return 1
+    fi
+    export NAT_BINARY_DIR="$payload_dir"
+    export NAT_STATIC_DIR="$payload_dir/static"
+    log_ok "release payload ready: $RELEASE_ASSET"
+}
+
+build_from_source() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_dry_run "would build from source with: cargo build --release"
+        log_dry_run "would use local binaries from target/release"
+        return 0
+    fi
+    if [ ! -f "$SCRIPT_DIR/Cargo.toml" ]; then
+        log_err "source tree not found; cannot build from source here"
+        log_err "download the source archive first, then run: cargo build --release && bash install.sh --with-console --build-from-source"
+        return 1
+    fi
+    if ! command -v cargo >/dev/null 2>&1; then
+        log_err "cargo not found; install Rust toolchain or use --use-release"
+        return 1
+    fi
+    log_info "building from source: cargo build --release"
+    cargo build --release
+}
+
+prepare_install_payload() {
+    local action="$1"
+    case "$action" in
+        --uninstall|--help|-h)
+            return 0
+            ;;
+    esac
+
+    if [ "$INSTALL_MODE" = "source" ]; then
+        build_from_source
+        return $?
+    fi
+
+    if [ "$INSTALL_MODE" = "release" ] || ! local_binary_available "$action"; then
+        if prepare_release_payload; then
+            return 0
+        fi
+        log_warn "prebuilt release is unavailable or failed"
+        log_warn "falling back to source build; use --build-from-source to make this explicit"
+        build_from_source
+        return $?
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_dry_run "would use existing local build under target/release"
+    fi
+}
+
 dry_run_core_install() {
     local config_type="$1"
     log_dry_run "would install core nat"
-    log_dry_run "would check core dependencies: curl wget ca-certificates nftables iproute2 iptables procps systemd openssl"
-    if [ -x "$SCRIPT_DIR/target/release/nat" ]; then
+    log_dry_run "would check core runtime dependencies: curl ca-certificates nftables iproute2 iptables procps systemd openssl tar"
+    if [ -n "$RELEASE_ASSET" ]; then
+        log_dry_run "would use release payload: $RELEASE_ASSET"
+    elif [ -x "$SCRIPT_DIR/target/release/nat" ]; then
         log_dry_run "would use local build: target/release/nat"
     else
-        log_dry_run "local build not found, would download release binary"
+        log_dry_run "local build not found, would try release binary then fallback to source build"
     fi
     log_dry_run "would install /usr/local/bin/nat"
     log_dry_run "would create/update /lib/systemd/system/nat.service with $config_type config"
@@ -82,11 +268,13 @@ dry_run_core_install() {
 
 dry_run_console_install() {
     log_dry_run "would install nat-console WebUI service"
-    log_dry_run "would check WebUI service dependencies: curl wget ca-certificates openssl systemd procps"
-    if [ -x "$SCRIPT_DIR/target/release/nat-console" ]; then
+    log_dry_run "would check WebUI runtime dependencies: curl ca-certificates openssl systemd procps tar"
+    if [ -n "$RELEASE_ASSET" ]; then
+        log_dry_run "would use release payload: $RELEASE_ASSET"
+    elif [ -x "$SCRIPT_DIR/target/release/nat-console" ]; then
         log_dry_run "would use local build: target/release/nat-console"
     else
-        log_dry_run "local build not found, would download release binary"
+        log_dry_run "local build not found, would try release binary then fallback to source build"
     fi
     log_dry_run "would install /usr/local/bin/nat-console"
     log_dry_run "would create/update /lib/systemd/system/nat-console.service"
@@ -123,8 +311,10 @@ dry_run_console_install() {
 
 dry_run_assets_install() {
     log_dry_run "would install/update WebUI assets"
-    log_dry_run "would check asset dependencies: curl wget ca-certificates systemd nodejs npm"
-    log_dry_run "would use apt nodejs/npm if node or npm is missing"
+    log_dry_run "would check asset runtime dependencies: curl ca-certificates systemd tar"
+    if [ -n "$RELEASE_ASSET" ]; then
+        log_dry_run "would copy static/ from release payload when present"
+    fi
     log_dry_run "would not add NodeSource or other third-party apt sources"
     log_dry_run "would install/update /usr/local/bin/nat-console via setup-console-assets.sh"
     log_dry_run "would update nat-console.service compatibility flags if the service exists"
@@ -152,7 +342,7 @@ run_core_install() {
         return 0
     fi
     log_info "installing nat core service with $config_type config"
-    NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}" NAT_START_SERVICE="${NAT_START_SERVICE:-0}" bash "$SCRIPT_DIR/setup.sh" "$config_type"
+    NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}" NAT_START_SERVICE="${NAT_START_SERVICE:-0}" bash "$INSTALL_SOURCE_DIR/setup.sh" "$config_type"
 }
 
 run_console_install() {
@@ -161,7 +351,7 @@ run_console_install() {
         return 0
     fi
     log_info "installing nat-console WebUI service"
-    NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}" NAT_SKIP_SERVICE_PROMPT="${NAT_SKIP_SERVICE_PROMPT:-0}" bash "$SCRIPT_DIR/setup-console.sh"
+    NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}" NAT_SKIP_SERVICE_PROMPT="${NAT_SKIP_SERVICE_PROMPT:-0}" bash "$INSTALL_SOURCE_DIR/setup-console.sh"
 }
 
 run_assets_install() {
@@ -170,7 +360,7 @@ run_assets_install() {
         return 0
     fi
     log_info "installing/updating WebUI assets"
-    NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}" bash "$SCRIPT_DIR/setup-console-assets.sh"
+    NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}" bash "$INSTALL_SOURCE_DIR/setup-console-assets.sh"
 }
 
 run_uninstall() {
@@ -322,17 +512,21 @@ run_menu() {
     case "$choice" in
         1)
             config_type="$(ask_config_type)"
+            prepare_install_payload "--core-only"
             run_core_install "$config_type"
             ;;
         2)
             config_type="$(ask_config_type)"
+            prepare_install_payload "--with-console"
             run_core_install "$config_type"
             run_console_install
             ;;
         3)
+            prepare_install_payload "--console-only"
             run_console_install
             ;;
         4)
+            prepare_install_payload "--assets-only"
             run_assets_install
             ;;
         5)
@@ -358,6 +552,37 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run)
             DRY_RUN=1
+            ;;
+        --use-release)
+            INSTALL_MODE="release"
+            USE_RELEASE_SEEN=1
+            ;;
+        --build-from-source)
+            INSTALL_MODE="source"
+            BUILD_SOURCE_SEEN=1
+            ;;
+        --version)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                log_err "--version requires a tag, for example v0.1.0"
+                exit 1
+            fi
+            RELEASE_VERSION="$2"
+            shift
+            ;;
+        --repo)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                log_err "--repo requires OWNER/REPO"
+                exit 1
+            fi
+            RELEASE_REPO="$2"
+            case "$RELEASE_REPO" in
+                */*) ;;
+                *)
+                    log_err "--repo must be OWNER/REPO"
+                    exit 1
+                    ;;
+            esac
+            shift
             ;;
         --core-only|--with-console|--console-only|--assets-only|--uninstall|--help|-h)
             if [ -n "$ACTION" ]; then
@@ -399,6 +624,13 @@ if [ -z "$ACTION" ]; then
     usage
     exit 1
 fi
+if [ "$USE_RELEASE_SEEN" -eq 1 ] && [ "$BUILD_SOURCE_SEEN" -eq 1 ]; then
+    log_err "--use-release and --build-from-source cannot be used together"
+    exit 1
+fi
+if [ "$INSTALL_MODE" = "source" ] && { [ "$RELEASE_VERSION" != "latest" ] || [ "$RELEASE_REPO" != "misaka-cpu/nftables-nat-rust-enhanced" ]; }; then
+    log_warn "--version/--repo are ignored with --build-from-source"
+fi
 if [ -n "$UNINSTALL_TARGET" ] && [ "$ACTION" != "--uninstall" ]; then
     log_err "--core/--console/--all 只能和 --uninstall 组合使用"
     exit 1
@@ -407,6 +639,8 @@ if [ "$UNINSTALL_DATA_MODE" = "purge" ] && [ "$ACTION" != "--uninstall" ]; then
     log_err "--purge 只能和 --uninstall 组合使用"
     exit 1
 fi
+
+prepare_install_payload "$ACTION"
 
 case "$ACTION" in
     --core-only)

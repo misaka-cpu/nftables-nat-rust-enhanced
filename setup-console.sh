@@ -130,10 +130,9 @@ install_queued_packages() {
 preflight_dependencies() {
     require_root
     detect_os
-    ensure_apt_packages curl wget ca-certificates openssl systemd procps
+    ensure_apt_packages curl ca-certificates openssl systemd procps
     ensure_commands \
         "curl:curl" \
-        "wget:wget" \
         "openssl:openssl" \
         "systemctl:systemd" \
         "sysctl:procps"
@@ -515,21 +514,25 @@ if [ -n "$USER_CERT_FILE" ] || [ -n "$USER_KEY_FILE" ]; then
     fi
 fi
 
-# 下载并安装 nat-console，可独立于 WebUI assets 流程，不检查 node/npm
-DOWNLOAD_URL="https://us.arloor.dev/https://github.com/arloor/nftables-nat-rust/releases/download/v2.0.0/nat-console"
 TMP_FILE="/tmp/nat-console"
 INSTALL_PATH="/usr/local/bin/nat-console"
-LOCAL_CONSOLE_BIN="$SCRIPT_DIR/target/release/nat-console"
+LOCAL_CONSOLE_BIN="${NAT_BINARY_DIR:-$SCRIPT_DIR/target/release}/nat-console"
 
 if [ -x "$LOCAL_CONSOLE_BIN" ]; then
-    log_info "using local build: target/release/nat-console"
+    log_info "using nat-console binary: $LOCAL_CONSOLE_BIN"
     install -m 755 "$LOCAL_CONSOLE_BIN" "$INSTALL_PATH"
 else
-    log_info "local build not found, downloading release binary"
-    curl -sSLf "$DOWNLOAD_URL" -o "$TMP_FILE"
-    install -m 755 "$TMP_FILE" "$INSTALL_PATH"
+    log_err "nat-console binary not found: $LOCAL_CONSOLE_BIN"
+    log_err "run install.sh with --use-release or build first with: cargo build --release"
+    exit 1
 fi
 log_ok "nat-console installed to $INSTALL_PATH"
+
+if [ -n "${NAT_STATIC_DIR:-}" ] && [ -d "$NAT_STATIC_DIR" ]; then
+    install -d -m 755 "$ENV_DIR/static"
+    cp -a "$NAT_STATIC_DIR/." "$ENV_DIR/static/"
+    log_ok "WebUI static assets installed to $ENV_DIR/static"
+fi
 
 # TLS 证书配置
 if [ -n "$USER_CERT_FILE" ] && [ -n "$USER_KEY_FILE" ]; then
@@ -591,6 +594,7 @@ After=network.target
 
 [Service]
 Type=simple
+WorkingDirectory=$ENV_DIR
 EnvironmentFile=$ENV_FILE
 ExecStart=$INSTALL_PATH
 Restart=on-failure
