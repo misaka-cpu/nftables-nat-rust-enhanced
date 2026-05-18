@@ -10,6 +10,10 @@ pub mod logger;
 pub mod stats;
 pub mod uninstall;
 
+pub fn build_version() -> &'static str {
+    option_env!("NAT_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 /// NAT CLI 命令行参数
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]

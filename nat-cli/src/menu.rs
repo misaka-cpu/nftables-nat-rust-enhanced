@@ -1,7 +1,7 @@
 use chrono::Local;
 use nat_common::{
     AccessControlMode, Args, DdnsConfig, IpVersion, NftCell, Protocol, StatsConfig, TomlConfig,
-    TrafficMode, forward_test, stats as traffic_stats,
+    TrafficMode, build_version, forward_test, stats as traffic_stats,
     uninstall::{self, DataMode, UninstallTarget},
 };
 use std::fs::{self, OpenOptions};
@@ -28,14 +28,21 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
         if matches!(choice.trim(), "0" | "q" | "quit" | "exit") {
             break;
         }
+        let mut should_wait = true;
         let result: Result<(), Box<dyn std::error::Error>> = match choice.trim() {
             "1" => show_rules(config_path).map_err(Into::into),
             "2" => add_single_interactive(config_path).map_err(Into::into),
             "3" => add_range_interactive(config_path).map_err(Into::into),
             "4" => delete_rule_interactive(config_path).map_err(Into::into),
-            "5" => toggle_rule_interactive(config_path).map_err(Into::into),
+            "5" => {
+                should_wait = false;
+                toggle_rule_interactive(config_path).map_err(Into::into)
+            }
             "6" => show_nft_rules().map_err(Into::into),
-            "7" => stats_menu(config_path).map_err(Into::into),
+            "7" => {
+                should_wait = false;
+                stats_menu(config_path).map_err(Into::into)
+            }
             "8" => {
                 refresh_ddns_interactive(config_path, &mut last_manual_refresh).map_err(Into::into)
             }
@@ -43,15 +50,27 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
                 .map(|backup| println!("已备份: {}", backup.display()))
                 .map_err(Into::into),
             "10" => restore_config_interactive(config_path).map_err(Into::into),
-            "11" => access_control_menu(config_path).map_err(Into::into),
+            "11" => {
+                should_wait = false;
+                access_control_menu(config_path).map_err(Into::into)
+            }
             "12" => {
                 show_recent_source_design();
                 Ok(())
             }
-            "13" => bbr_telegram_menu(config_path).map_err(Into::into),
+            "13" => {
+                should_wait = false;
+                bbr_telegram_menu(config_path).map_err(Into::into)
+            }
             "14" => test_forward_interactive(config_path).map_err(Into::into),
-            "15" => update_menu().map_err(Into::into),
-            "16" => uninstall_menu().map_err(Into::into),
+            "15" => {
+                should_wait = false;
+                update_menu().map_err(Into::into)
+            }
+            "16" => {
+                should_wait = false;
+                uninstall_menu().map_err(Into::into)
+            }
             _ => {
                 println!("未知选项: {}", choice.trim());
                 Ok(())
@@ -60,7 +79,9 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
         if let Err(e) = result {
             println!("操作失败: {e}");
         }
-        wait_enter_to_continue()?;
+        if should_wait {
+            wait_enter_to_continue()?;
+        }
     }
     Ok(())
 }
@@ -135,20 +156,6 @@ fn prompt(label: &str) -> Result<String, io::Error> {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stdin EOF"));
     }
     Ok(value.trim().to_string())
-}
-
-fn prompt_secret(label: &str) -> Result<String, io::Error> {
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg("stty -echo < /dev/tty")
-        .status();
-    let value = prompt(label);
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg("stty echo < /dev/tty")
-        .status();
-    println!();
-    value
 }
 
 fn interactive_menu_available() -> bool {
@@ -390,13 +397,14 @@ Stats 流量统计
         );
         let choice = prompt("请选择操作: ")?;
         match choice.trim() {
-            "1" | "" => {
+            "1" => {
                 wait_enter_to_return()?;
                 continue;
             }
             "2" => {
-                switch_traffic_mode(config_path)?;
-                wait_enter_to_return()?;
+                if switch_traffic_mode(config_path)? {
+                    wait_enter_to_return()?;
+                }
             }
             "3" => {
                 reset_stats(config_path, true, false)?;
@@ -408,6 +416,7 @@ Stats 流量统计
             }
             "0" | "q" | "quit" | "exit" => break,
             value if is_menu_refresh_command(value) => break,
+            "" => continue,
             _ => {
                 println!("未知选项: {}", choice.trim());
                 wait_enter_to_return()?;
@@ -417,7 +426,7 @@ Stats 流量统计
     Ok(())
 }
 
-fn switch_traffic_mode(config_path: &str) -> Result<(), io::Error> {
+fn switch_traffic_mode(config_path: &str) -> Result<bool, io::Error> {
     let mut config = load_toml_config(config_path)?;
     println!("当前统计口径：{}", config.stats.traffic_mode);
     println!(
@@ -432,10 +441,10 @@ fn switch_traffic_mode(config_path: &str) -> Result<(), io::Error> {
         "1" => TrafficMode::Both,
         "2" => TrafficMode::Out,
         "3" => TrafficMode::In,
-        "0" | "" => return Ok(()),
+        "0" | "" => return Ok(false),
         _ => {
             println!("未知选项: {}", choice.trim());
-            return Ok(());
+            return Ok(true);
         }
     };
     config.stats.traffic_mode = mode;
@@ -445,7 +454,7 @@ fn switch_traffic_mode(config_path: &str) -> Result<(), io::Error> {
     println!("后续新增流量将按新口径累计；历史 daily/monthly 不会自动重算。");
     println!("如需重新统计，请重置今日或本月统计。");
     print_config_saved_hint(config_path);
-    Ok(())
+    Ok(true)
 }
 
 fn reset_stats(config_path: &str, daily: bool, monthly: bool) -> Result<(), io::Error> {
@@ -741,7 +750,7 @@ BBR / Telegram 状态
 2) 开启 BBR
 3) 关闭 BBR
 4) 查看 Telegram 配置状态
-5) 配置 Telegram token 和 chat_id
+5) 配置 Telegram bot_token 和 chat_id
 6) 测试 Telegram 通知
 7) 启用 / 禁用 Telegram 通知
 8) 设置 Telegram 通知间隔
@@ -775,8 +784,9 @@ BBR / Telegram 状态
                 wait_enter_to_return()?;
             }
             "7" => {
-                toggle_telegram(config_path)?;
-                wait_enter_to_return()?;
+                if toggle_telegram(config_path)? {
+                    wait_enter_to_return()?;
+                }
             }
             "8" => {
                 set_telegram_interval(config_path)?;
@@ -889,7 +899,7 @@ fn show_telegram_status(config_path: &str) -> Result<(), io::Error> {
     let config = load_toml_config(config_path)?;
     let telegram = config.telegram;
     println!("enabled: {}", telegram.enabled);
-    let token_status = if telegram.bot_token.is_empty() {
+    let bot_token_status = if telegram.bot_token.is_empty() {
         "未配置".to_string()
     } else {
         format!(
@@ -897,7 +907,7 @@ fn show_telegram_status(config_path: &str) -> Result<(), io::Error> {
             traffic_stats::mask_bot_token(&telegram.bot_token)
         )
     };
-    println!("token: {token_status}");
+    println!("bot_token: {bot_token_status}");
     println!(
         "chat_id: {}",
         if telegram.chat_id.is_empty() {
@@ -917,10 +927,10 @@ fn show_telegram_status(config_path: &str) -> Result<(), io::Error> {
 
 fn configure_telegram(config_path: &str) -> Result<(), io::Error> {
     let mut config = load_toml_config(config_path)?;
-    let bot_token = prompt_secret("请输入 Telegram token: ")?;
+    let bot_token = prompt("请输入 Telegram bot_token: ")?;
     let chat_id = prompt("请输入 Telegram chat_id: ")?;
     if bot_token.trim().is_empty() || chat_id.trim().is_empty() {
-        println!("token/chat_id 不能为空。");
+        println!("bot_token/chat_id 不能为空。");
         return Ok(());
     }
     config.telegram.bot_token = bot_token;
@@ -931,7 +941,7 @@ fn configure_telegram(config_path: &str) -> Result<(), io::Error> {
     }
     backup_config(config_path)?;
     save_toml_config(config_path, &config)?;
-    println!("Telegram 配置已保存，token 不会明文显示。");
+    println!("Telegram 配置已保存，状态页默认不会明文显示 bot_token。");
     print_config_saved_hint(config_path);
     Ok(())
 }
@@ -939,7 +949,7 @@ fn configure_telegram(config_path: &str) -> Result<(), io::Error> {
 fn test_telegram_notification(config_path: &str) -> Result<(), io::Error> {
     let config = load_toml_config(config_path)?;
     if config.telegram.bot_token.is_empty() || config.telegram.chat_id.is_empty() {
-        println!("请先配置 Telegram token 和 chat_id。");
+        println!("请先配置 Telegram bot_token 和 chat_id。");
         return Ok(());
     }
     let result = traffic_stats::send_telegram_with(
@@ -980,7 +990,7 @@ fn send_telegram_http_for_cli(url: &str, params: &[(&str, &str)]) -> Result<(), 
     }
 }
 
-fn toggle_telegram(config_path: &str) -> Result<(), io::Error> {
+fn toggle_telegram(config_path: &str) -> Result<bool, io::Error> {
     let mut config = load_toml_config(config_path)?;
     println!(
         "当前 Telegram 通知状态: {}",
@@ -997,10 +1007,10 @@ fn toggle_telegram(config_path: &str) -> Result<(), io::Error> {
     match choice.trim() {
         "1" => config.telegram.enabled = true,
         "2" => config.telegram.enabled = false,
-        "0" => return Ok(()),
+        "0" => return Ok(false),
         _ => {
             println!("未知选项: {}", choice.trim());
-            return Ok(());
+            return Ok(true);
         }
     }
     backup_config(config_path)?;
@@ -1014,7 +1024,7 @@ fn toggle_telegram(config_path: &str) -> Result<(), io::Error> {
         }
     );
     print_config_saved_hint(config_path);
-    Ok(())
+    Ok(true)
 }
 
 fn set_telegram_interval(config_path: &str) -> Result<(), io::Error> {
@@ -1061,6 +1071,7 @@ fn uninstall_menu() -> Result<(), io::Error> {
         "0" => return Ok(()),
         _ => {
             println!("未知选项: {}", choice.trim());
+            wait_enter_to_return()?;
             return Ok(());
         }
     };
@@ -1068,16 +1079,19 @@ fn uninstall_menu() -> Result<(), io::Error> {
         let confirm_text = prompt("危险操作：请输入 DELETE 确认完全删除: ")?;
         if confirm_text != "DELETE" {
             println!("确认文本不匹配，已取消卸载。");
+            wait_enter_to_return()?;
             return Ok(());
         }
     }
     let confirm = prompt("即将执行卸载/清理操作。确认继续? [y/N]: ")?;
     if !matches!(confirm.as_str(), "y" | "Y") {
         println!("已取消卸载。");
+        wait_enter_to_return()?;
         return Ok(());
     }
     let report = execute_uninstall(target, data_mode);
     print_uninstall_report(&report);
+    wait_enter_to_return()?;
     Ok(())
 }
 
@@ -1257,17 +1271,18 @@ fn update_menu() -> Result<(), io::Error> {
         "1" => false,
         "2" => true,
         _ => {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "未知更新目标"));
+            println!("未知更新目标。");
+            wait_enter_to_return()?;
+            return Ok(());
         }
     };
 
     let version = if specify_version {
         let tag = prompt("请输入版本 tag，例如 v0.1.2: ")?;
         if !valid_update_version(&tag) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "无效版本，只允许 latest 或 v 开头的 tag，例如 v0.1.2",
-            ));
+            println!("无效版本，只允许 latest 或 v 开头的 tag，例如 v0.1.2");
+            wait_enter_to_return()?;
+            return Ok(());
         }
         tag
     } else {
@@ -1275,7 +1290,7 @@ fn update_menu() -> Result<(), io::Error> {
     };
 
     println!("更新摘要：");
-    println!("  当前版本: {}", env!("CARGO_PKG_VERSION"));
+    println!("  当前版本: {}", current_version_for_update());
     println!("  目标版本: {version}");
     println!("  将更新: /usr/local/bin/nat 和 nat.service");
     println!("  下载方式: GitHub Release 预编译包优先");
@@ -1285,6 +1300,7 @@ fn update_menu() -> Result<(), io::Error> {
     let confirm = prompt("继续更新？[y/N]: ")?;
     if !matches!(confirm.as_str(), "y" | "Y" | "yes" | "YES") {
         println!("已取消更新");
+        wait_enter_to_return()?;
         return Ok(());
     }
 
@@ -1302,11 +1318,42 @@ fn update_menu() -> Result<(), io::Error> {
     if status.success() {
         println!("更新完成，请重新进入菜单：");
         println!("  nat --menu");
+        wait_enter_to_return()?;
         Ok(())
     } else {
-        Err(io::Error::other(
-            "更新命令执行失败。install.sh 会保留旧二进制并在可能时回滚，请查看输出和服务日志",
-        ))
+        println!("更新命令执行失败。install.sh 会保留旧二进制并在可能时回滚，请查看输出和服务日志");
+        wait_enter_to_return()?;
+        Ok(())
+    }
+}
+
+fn current_version_for_update() -> String {
+    installed_nat_version().unwrap_or_else(|| build_version_for_update_display(build_version()))
+}
+
+fn installed_nat_version() -> Option<String> {
+    let output = Command::new("/usr/local/bin/nat")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_nat_version_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_nat_version_output(output: &str) -> Option<String> {
+    output
+        .split_whitespace()
+        .find(|part| valid_release_tag(part))
+        .map(ToString::to_string)
+}
+
+fn build_version_for_update_display(version: &str) -> String {
+    if valid_release_tag(version) {
+        version.to_string()
+    } else {
+        "unknown".to_string()
     }
 }
 
@@ -1314,6 +1361,14 @@ fn valid_update_version(version: &str) -> bool {
     if version == "latest" {
         return true;
     }
+    version.starts_with('v')
+        && version.len() > 1
+        && version
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn valid_release_tag(version: &str) -> bool {
     version.starts_with('v')
         && version.len() > 1
         && version
@@ -1511,6 +1566,7 @@ fn toggle_rule_interactive(path: &str) -> Result<(), io::Error> {
     let mut config = load_toml_config(path)?;
     if config.rules.is_empty() {
         println!("当前没有转发规则。");
+        wait_enter_to_return()?;
         return Ok(());
     }
 
@@ -1551,6 +1607,7 @@ fn toggle_rule_interactive(path: &str) -> Result<(), io::Error> {
         "0" => return Ok(()),
         _ => {
             println!("未知选项: {}", action.trim());
+            wait_enter_to_return()?;
             return Ok(());
         }
     }
@@ -1566,6 +1623,7 @@ fn toggle_rule_interactive(path: &str) -> Result<(), io::Error> {
         }
     );
     print_config_saved_hint(path);
+    wait_enter_to_return()?;
     Ok(())
 }
 
@@ -1909,6 +1967,24 @@ domain = "example.com"
         assert!(valid_update_version("v1.2.3-rc.1"));
         assert!(!valid_update_version("main"));
         assert!(!valid_update_version("v0.1.2;systemctl"));
+    }
+
+    #[test]
+    fn parses_release_version_from_nat_version_output() {
+        assert_eq!(
+            parse_nat_version_output("nat v0.2.2\n").as_deref(),
+            Some("v0.2.2")
+        );
+        assert_eq!(
+            parse_nat_version_output("nat-common 2.0.0\n").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn update_display_does_not_show_package_version_as_release() {
+        assert_eq!(build_version_for_update_display("v0.2.2"), "v0.2.2");
+        assert_eq!(build_version_for_update_display("2.0.0"), "unknown");
     }
 
     #[test]

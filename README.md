@@ -60,13 +60,14 @@
 
 ### Telegram 通知
 
-- 通过 `/etc/nat.toml` 配置 Telegram token / chat_id
-- CLI 可配置 token 和 chat_id
+- 通过 `/etc/nat.toml` 配置 Telegram bot_token / chat_id
+- CLI 可配置 bot_token 和 chat_id
+- 输入 bot_token 时为明文输入，方便复制粘贴确认
 - CLI 可发送测试通知，测试通知不会自动启用 Telegram 通知
 - CLI 可设置通知间隔，单位分钟
 - 支持定时通知
 - 支持 daily / monthly 流量通知
-- token 在状态输出中脱敏
+- bot_token 在状态输出中脱敏
 
 ### 白名单 / 黑名单
 
@@ -154,6 +155,14 @@ tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nfta
 nat --menu
 ```
 
+查看当前版本：
+
+```bash
+nat --version
+```
+
+release 构建会显示 GitHub tag，例如 `v0.2.2`。源码编译如果没有注入 tag，可能显示开发版本或在更新菜单中显示 `unknown`。
+
 菜单：
 
 ```text
@@ -188,7 +197,7 @@ systemctl restart nat
 
 `最近来源 IP 观察` 用于观察访问转发端口的来源 IP，不等同于白名单 / 黑名单，不会自动放行或封禁来源 IP，也不会修改访问控制配置。
 
-`BBR / Telegram 状态` 子菜单可查看、开启、关闭 BBR；也可查看 Telegram 配置状态、配置 token 和 chat_id、发送测试通知、启用 / 禁用通知、设置通知间隔。
+`BBR / Telegram 状态` 子菜单可查看、开启、关闭 BBR；也可查看 Telegram 配置状态、配置 bot_token 和 chat_id、发送测试通知、启用 / 禁用通知、设置通知间隔。
 
 ## 配置文件
 

@@ -36,6 +36,10 @@ const CARGO_CRATE_NAME: &str = env!("CARGO_CRATE_NAME");
 const MAIN_LOOP_MAX_SLEEP_SECS: u64 = 5;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if version_requested() {
+        println!("nat {}", nat_common::build_version());
+        return Ok(());
+    }
     logger::init(CARGO_CRATE_NAME);
     // 使用 clap 解析命令行参数
     let args = Args::parse();
@@ -51,6 +55,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     global_prepare()?;
     Ok(handle_loop(&args)?)
+}
+
+fn version_requested() -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
 }
 
 fn parse_conf(

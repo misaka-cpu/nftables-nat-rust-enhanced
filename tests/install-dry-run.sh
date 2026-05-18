@@ -95,17 +95,25 @@ assert_contains "$menu_script" "BBR / Telegram 状态"
 assert_contains "$menu_script" "开启 BBR"
 assert_contains "$menu_script" "关闭 BBR"
 assert_contains "$menu_script" "按 Enter 返回..."
-assert_contains "$menu_script" "配置 Telegram token 和 chat_id"
+assert_contains "$menu_script" "配置 Telegram bot_token 和 chat_id"
 assert_contains "$menu_script" "设置 Telegram 通知间隔"
-assert_contains "$menu_script" "prompt_secret"
+assert_not_contains "$menu_script" "prompt_secret"
+assert_contains "$menu_script" "请输入 Telegram bot_token"
 assert_contains "$menu_script" "mask_bot_token"
-assert_contains "$menu_script" "请先配置 Telegram token 和 chat_id。"
+assert_contains "$menu_script" "请先配置 Telegram bot_token 和 chat_id。"
 assert_contains "$menu_script" "是否启用 Telegram 通知？[y/N]"
 assert_contains "$menu_script" "notify_interval_minutes = minutes"
 assert_contains "$menu_script" "set_enabled(false)"
 assert_contains "$menu_script" "rule.enabled()"
 assert_contains "$menu_script" "禁用规则不会应用到 nft"
 assert_contains "$menu_script" "不会自动放行或封禁来源 IP"
+assert_contains "$menu_script" "current_version_for_update"
+assert_contains "$menu_script" "installed_nat_version"
+assert_contains "$menu_script" "parse_nat_version_output"
+assert_contains "$menu_script" "build_version_for_update_display"
+assert_not_contains "$menu_script" "当前版本: {}\", env!(\"CARGO_PKG_VERSION\")"
+assert_contains "$workflow" 'NAT_BUILD_VERSION="${GITHUB_REF_NAME}" cargo build --release --locked'
+assert_contains "$workflow" 'target/release/nat --version | grep -F "${GITHUB_REF_NAME}"'
 
 for deprecated in --with-console --console-only --assets-only; do
     set +e
