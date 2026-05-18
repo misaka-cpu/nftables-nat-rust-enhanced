@@ -203,7 +203,7 @@ ask_config_type() {
 show_menu() {
     cat <<EOF
 =========================================
- nftables-nat-rust 安装菜单
+ nftables-nat-rust-enhanced 安装菜单
 =========================================
 1) 只安装核心转发服务 nat
 2) 安装核心转发服务 nat + WebUI nat-console

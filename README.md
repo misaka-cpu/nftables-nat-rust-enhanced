@@ -514,7 +514,7 @@ nat --menu --toml /etc/nat.toml
 
 ```text
 ====================================
-nftables-nat-rust 管理菜单
+nftables-nat-rust-enhanced 管理菜单
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发

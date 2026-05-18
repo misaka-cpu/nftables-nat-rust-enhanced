@@ -230,7 +230,8 @@ if [ "$CONFIG_TYPE" = "legacy" ]; then
     echo "创建 legacy 格式配置文件..."
     if [ ! -s "$CONFIG_FILE" ]; then
         cat > "$CONFIG_FILE" <<EOF
-# 配置方式参考 https://github.com/arloor/nftables-nat-rust/blob/master/README.md#%E4%BC%A0%E7%BB%9F%E9%85%8D%E7%BD%AE%E6%96%87%E4%BB%B6
+# 配置方式参考本项目 README：
+# https://github.com/misaka-cpu/nftables-nat-rust-enhanced#传统配置文件
 EOF
         log_ok "created $CONFIG_FILE"
     else
@@ -259,7 +260,8 @@ else
     # Check if /etc/nat.toml exists, if not create it with example content
     if [ ! -s "$CONFIG_FILE" ]; then
         cat > "$CONFIG_FILE" <<EOF
-# 配置方式参考 https://github.com/arloor/nftables-nat-rust/blob/master/README.md#toml-%E9%85%8D%E7%BD%AE%E6%96%87%E4%BB%B6%E6%8E%A8%E8%8D%90
+# 配置方式参考本项目 README：
+# https://github.com/misaka-cpu/nftables-nat-rust-enhanced#toml-配置示例
 rules = []
 EOF
         log_ok "created $CONFIG_FILE"

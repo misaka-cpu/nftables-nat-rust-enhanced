@@ -428,8 +428,8 @@ NAT_SERVICE_FILE="/lib/systemd/system/nat.service"
 if [ ! -f "$NAT_SERVICE_FILE" ]; then
     echo "错误: 未检测到 NAT 服务"
     echo "请先安装 NAT 服务："
-    echo "  TOML 格式: bash <(curl -sSLf https://us.arloor.dev/https://github.com/arloor/nftables-nat-rust/releases/download/v2.0.0/setup.sh) toml"
-    echo "  传统格式: bash <(curl -sSLf https://us.arloor.dev/https://github.com/arloor/nftables-nat-rust/releases/download/v2.0.0/setup.sh) legacy"
+    echo "  bash install.sh --core-only"
+    echo "或参考: https://github.com/misaka-cpu/nftables-nat-rust-enhanced#快速安装"
     exit 1
 fi
 
@@ -565,7 +565,7 @@ echo "创建 systemd service..."
 SERVICE_FILE="/lib/systemd/system/nat-console.service"
 tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
-Description=NAT Console WebUI Service
+Description=nftables-nat-rust-enhanced WebUI Service
 After=network.target
 
 [Service]
