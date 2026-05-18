@@ -623,20 +623,34 @@ bash install.sh --core-only
 
 ## Acknowledgements
 
-本项目基于 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 修改增强，原项目采用 MIT License。
+This project is based on and modified from:
 
-设计上参考了以下项目的思路：
+- [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) — original nftables NAT forwarding project, MIT License.
 
-- [endview/nftpf](https://github.com/endview/nftpf)：CLI 菜单、DDNS、access-control、备份回滚等设计思路
-- [mora1n/pfwd](https://github.com/mora1n/pfwd)：端口转发管理思路
+Feature ideas and design references:
 
-上述项目均为 MIT License。这里的“参考”指功能和交互设计思路，不表示复制其代码，也不表示这些项目作者参与了本项目开发。
+- [endview/nftpf](https://github.com/endview/nftpf) — terminal menu, DDNS refresh, access-control, backup/rollback design ideas.
+- [mora1n/pfwd](https://github.com/mora1n/pfwd) — port-forwarding management ideas.
+
+These projects inspired parts of the design, but this fork keeps its own implementation and safety model. The referenced authors are not responsible for this fork unless explicitly stated.
 
 ## License
 
-本项目采用 MIT License。
+MIT License.
 
-本项目基于 arloor/nftables-nat-rust 修改增强。分发、修改或二次发布时，请保留原项目 LICENSE 中 arloor 的 MIT License 版权声明，并保留本项目新增修改的许可说明。
+Original project:
+
+```text
+Copyright (c) 2020 arloor
+```
+
+Enhanced modifications:
+
+```text
+Copyright (c) 2026 misaka-cpu
+```
+
+Please keep the original copyright and license notices when redistributing modified versions.
 
 详见：
 
