@@ -325,9 +325,15 @@ run_cli_menu() {
         log_warn "未检测到核心 nat，无法进入 CLI 管理菜单。请先安装核心服务。"
         return 0
     fi
+    if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+        log_warn "当前环境没有可用 TTY，无法自动进入 CLI 菜单。"
+        log_info "请手动执行："
+        echo "  nat --menu"
+        return 0
+    fi
     log_info "entering CLI management menu: $NAT_MENU_BIN --menu"
     err_file="$(mktemp)"
-    if "$NAT_MENU_BIN" --menu 2>"$err_file"; then
+    if "$NAT_MENU_BIN" --menu < /dev/tty > /dev/tty 2>"$err_file"; then
         rm -f "$err_file"
         return 0
     fi

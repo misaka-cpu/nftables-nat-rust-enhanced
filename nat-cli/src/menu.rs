@@ -1,11 +1,11 @@
 use chrono::Local;
 use nat_common::{
     AccessControlMode, Args, DdnsConfig, IpVersion, NftCell, Protocol, StatsConfig, TomlConfig,
-    forward_test, stats as traffic_stats,
+    TrafficMode, forward_test, stats as traffic_stats,
     uninstall::{self, DataMode, UninstallTarget},
 };
-use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -15,11 +15,17 @@ const CONFIG_BACKUP_DIR: &str = "/etc/nftables-nat/backups/config";
 pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config_path.unwrap_or(DEFAULT_TOML_CONFIG);
     let mut last_manual_refresh: Option<chrono::DateTime<Local>> = None;
+    if !interactive_menu_available() {
+        return Err("当前环境不支持交互式菜单，请在终端中运行 nat --menu。".into());
+    }
     loop {
         clear_screen();
         print_menu();
         let choice = prompt("请选择操作: ")?;
-        if choice.trim() == "0" {
+        if is_menu_refresh_command(&choice) || choice.trim().is_empty() {
+            continue;
+        }
+        if matches!(choice.trim(), "0" | "q" | "quit" | "exit") {
             break;
         }
         let result: Result<(), Box<dyn std::error::Error>> = match choice.trim() {
@@ -27,15 +33,9 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
             "2" => add_single_interactive(config_path).map_err(Into::into),
             "3" => add_range_interactive(config_path).map_err(Into::into),
             "4" => delete_rule_interactive(config_path).map_err(Into::into),
-            "5" => {
-                println!("TODO: 当前规则模型没有 enabled 字段，Phase 4A 暂不实现启用/禁用。");
-                Ok(())
-            }
+            "5" => show_apply_hint(config_path).map_err(Into::into),
             "6" => show_nft_rules().map_err(Into::into),
-            "7" => {
-                show_stats(config_path);
-                Ok(())
-            }
+            "7" => stats_menu(config_path).map_err(Into::into),
             "8" => {
                 refresh_ddns_interactive(config_path, &mut last_manual_refresh).map_err(Into::into)
             }
@@ -48,10 +48,7 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
                 show_recent_source_design();
                 Ok(())
             }
-            "13" => {
-                show_status_design();
-                Ok(())
-            }
+            "13" => bbr_telegram_menu(config_path).map_err(Into::into),
             "14" => test_forward_interactive(config_path).map_err(Into::into),
             "15" => update_menu().map_err(Into::into),
             "16" => uninstall_menu().map_err(Into::into),
@@ -76,11 +73,7 @@ fn clear_screen() {
 }
 
 fn wait_enter_to_continue() -> Result<(), io::Error> {
-    if io::stdin().is_terminal() {
-        let _ = prompt("按 Enter 返回主菜单...")?;
-    } else {
-        println!("按 Enter 返回主菜单...");
-    }
+    let _ = prompt("按 Enter 返回主菜单...")?;
     Ok(())
 }
 
@@ -93,13 +86,13 @@ nftables-nat-rust-enhanced 管理菜单
 2) 添加单端口转发
 3) 添加端口段转发
 4) 删除转发规则
-5) 启用/禁用规则
+5) 启用 / 禁用规则
 6) 查看当前 nft 规则
-7) 查看 stats 流量统计
+7) 查看 Stats 流量统计
 8) 手动刷新 DDNS / 域名目标
 9) 备份当前配置
 10) 从备份恢复配置
-11) 白名单/黑名单管理
+11) 白名单 / 黑名单管理
 12) 最近来源 IP 观察
 13) BBR / Telegram 状态
 14) 测试转发规则连通性
@@ -111,11 +104,61 @@ nftables-nat-rust-enhanced 管理菜单
 }
 
 fn prompt(label: &str) -> Result<String, io::Error> {
+    if let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        tty.write_all(label.as_bytes())?;
+        tty.flush()?;
+        let mut reader = io::BufReader::new(tty);
+        let mut value = String::new();
+        let bytes = reader.read_line(&mut value)?;
+        if bytes == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stdin EOF"));
+        }
+        return Ok(value.trim().to_string());
+    }
+    if !io::stdin().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "当前环境不支持交互式菜单，请在终端中运行 nat --menu。",
+        ));
+    }
     print!("{label}");
     io::stdout().flush()?;
     let mut value = String::new();
-    io::stdin().read_line(&mut value)?;
+    let bytes = io::stdin().read_line(&mut value)?;
+    if bytes == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stdin EOF"));
+    }
     Ok(value.trim().to_string())
+}
+
+fn prompt_secret(label: &str) -> Result<String, io::Error> {
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("stty -echo < /dev/tty")
+        .status();
+    let value = prompt(label);
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("stty echo < /dev/tty")
+        .status();
+    println!();
+    value
+}
+
+fn interactive_menu_available() -> bool {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .is_ok()
+        || io::stdin().is_terminal()
+}
+
+fn is_menu_refresh_command(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        "nat --menu" | "nat menu" | "menu" | "main" | "m"
+    )
 }
 
 fn load_toml_config(path: &str) -> Result<TomlConfig, io::Error> {
@@ -163,8 +206,8 @@ fn add_single_interactive(path: &str) -> Result<(), io::Error> {
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     backup_config(path)?;
     save_toml_config(path, &config)?;
-    println!("已添加规则。未自动应用；如需立即生效，请通过已有 nat 服务安全重载流程处理。");
-    ask_apply_hint();
+    println!("已添加规则。");
+    print_config_saved_hint(path);
     Ok(())
 }
 
@@ -190,7 +233,7 @@ fn add_range_interactive(path: &str) -> Result<(), io::Error> {
     backup_config(path)?;
     save_toml_config(path, &config)?;
     println!("已添加端口段规则。当前模型会转发到目标同端口段。");
-    ask_apply_hint();
+    print_config_saved_hint(path);
     Ok(())
 }
 
@@ -219,13 +262,27 @@ fn delete_rule_interactive(path: &str) -> Result<(), io::Error> {
     delete_rule(&mut config, index).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     save_toml_config(path, &config)?;
     println!("已删除规则。");
-    ask_apply_hint();
+    print_config_saved_hint(path);
     Ok(())
 }
 
-fn ask_apply_hint() {
-    println!("Phase 4A 不会绕过安全应用流程直接执行 nft -f。");
-    println!("如需应用配置，请使用现有 nat 服务，由其执行 nft -c、备份和失败回滚。");
+fn print_config_saved_hint(path: &str) {
+    println!("已保存配置到 {path}。");
+    println!("nat.service 通常会自动检测配置变化，并通过安全流程应用规则。");
+    println!("安全流程包括：nft -c 检查、备份当前规则、应用失败自动回滚。");
+    println!("本工具不会直接绕过安全流程执行 nft -f。");
+    println!("如需确认当前规则是否已应用，可执行：");
+    println!("  nft list table ip self-nat");
+    println!("  nft list table ip self-filter");
+    println!("  journalctl -u nat -n 120 --no-pager");
+    println!("如果未自动生效，可手动执行：");
+    println!("  systemctl restart nat");
+}
+
+fn show_apply_hint(path: &str) -> Result<(), io::Error> {
+    println!("当前规则模型没有 enabled 字段，暂不提供逐条启用 / 禁用。");
+    print_config_saved_hint(path);
+    Ok(())
 }
 
 fn refresh_ddns_interactive(
@@ -315,6 +372,81 @@ fn show_stats(config_path: &str) {
     for line in format_stats_overview(&stats_config, &state) {
         println!("{line}");
     }
+}
+
+fn stats_menu(config_path: &str) -> Result<(), io::Error> {
+    loop {
+        show_stats(config_path);
+        println!(
+            r#"====================================
+Stats 流量统计
+====================================
+1) 刷新统计
+2) 切换统计口径
+3) 重置今日统计
+4) 重置本月统计
+0) 返回主菜单
+===================================="#
+        );
+        let choice = prompt("请选择操作: ")?;
+        match choice.trim() {
+            "1" | "" => continue,
+            "2" => switch_traffic_mode(config_path)?,
+            "3" => reset_stats(config_path, true, false)?,
+            "4" => reset_stats(config_path, false, true)?,
+            "0" | "q" | "quit" | "exit" => break,
+            value if is_menu_refresh_command(value) => break,
+            _ => println!("未知选项: {}", choice.trim()),
+        }
+    }
+    Ok(())
+}
+
+fn switch_traffic_mode(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    println!("当前统计口径：{}", config.stats.traffic_mode);
+    println!(
+        r#"请选择新的统计口径：
+1) both 双向 out + in，默认推荐
+2) out 仅 client -> VPS -> target
+3) in 仅 target -> VPS -> client
+0) 取消"#
+    );
+    let choice = prompt("请选择 [0/1/2/3]: ")?;
+    let mode = match choice.trim() {
+        "1" => TrafficMode::Both,
+        "2" => TrafficMode::Out,
+        "3" => TrafficMode::In,
+        "0" | "" => return Ok(()),
+        _ => {
+            println!("未知选项: {}", choice.trim());
+            return Ok(());
+        }
+    };
+    config.stats.traffic_mode = mode;
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    println!("已保存统计口径到 {config_path}。");
+    println!("后续新增流量将按新口径累计；历史 daily/monthly 不会自动重算。");
+    println!("如需重新统计，请重置今日或本月统计。");
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn reset_stats(config_path: &str, daily: bool, monthly: bool) -> Result<(), io::Error> {
+    let config = load_toml_config(config_path)?;
+    let mut state = traffic_stats::load_state(&config.stats.data_file);
+    if daily {
+        state.daily_total_bytes = 0;
+        state.per_rule_daily_bytes.clear();
+    }
+    if monthly {
+        state.monthly_total_bytes = 0;
+        state.per_rule_monthly_bytes.clear();
+    }
+    traffic_stats::save_state(&config.stats.data_file, &state)?;
+    println!("统计已重置。");
+    Ok(())
 }
 
 fn collect_stats_for_cli(stats_config: &StatsConfig, config_path: &str) {
@@ -431,7 +563,7 @@ fn restore_config_interactive(path: &str) -> Result<(), io::Error> {
     backup_config(path)?;
     fs::copy(&backups[index], path)?;
     println!("已恢复配置: {}", backups[index].display());
-    ask_apply_hint();
+    print_config_saved_hint(path);
     Ok(())
 }
 
@@ -496,14 +628,7 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
                 backup_config(path)?;
                 save_toml_config(path, &config)?;
                 println!("访问控制配置已保存。");
-                if confirm("是否立即通过安全流程应用? [y/N]: ")? {
-                    let args = Args {
-                        menu: false,
-                        compatible_config_file: None,
-                        toml: Some(path.to_string()),
-                    };
-                    super::refresh_once(&args)?;
-                }
+                print_config_saved_hint(path);
             }
             "0" => break,
             _ => println!("未知选项: {}", choice.trim()),
@@ -568,9 +693,237 @@ fn show_recent_source_design() {
     println!("后续可由用户手动选择加入 blacklist，避免误封。");
 }
 
-fn show_status_design() {
-    println!("BBR / Telegram 状态可通过配置文件、服务日志和 stats 输出检查。");
-    println!("Telegram 配置位于 /etc/nat.toml 的 [telegram] 段。");
+fn bbr_telegram_menu(config_path: &str) -> Result<(), io::Error> {
+    loop {
+        println!(
+            r#"====================================
+BBR / Telegram 状态
+====================================
+1) 查看 BBR 状态
+2) 开启 BBR
+3) 关闭 BBR
+4) 查看 Telegram 配置状态
+5) 配置 Telegram bot_token 和 chat_id
+6) 测试 Telegram 通知
+7) 启用 / 禁用 Telegram 通知
+0) 返回主菜单
+===================================="#
+        );
+        let choice = prompt("请选择操作: ")?;
+        match choice.trim() {
+            "1" => show_bbr_status(),
+            "2" => enable_bbr_interactive()?,
+            "3" => disable_bbr_interactive()?,
+            "4" => show_telegram_status(config_path)?,
+            "5" => configure_telegram(config_path)?,
+            "6" => test_telegram_notification(config_path)?,
+            "7" => toggle_telegram(config_path)?,
+            "0" | "q" | "quit" | "exit" => break,
+            value if is_menu_refresh_command(value) => break,
+            "" => continue,
+            _ => println!("未知选项: {}", choice.trim()),
+        }
+    }
+    Ok(())
+}
+
+fn read_proc_value(path: &str) -> String {
+    fs::read_to_string(path)
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn show_bbr_status() {
+    println!(
+        "当前 tcp_congestion_control: {}",
+        read_proc_value("/proc/sys/net/ipv4/tcp_congestion_control")
+    );
+    println!(
+        "可用 congestion control: {}",
+        read_proc_value("/proc/sys/net/ipv4/tcp_available_congestion_control")
+    );
+    println!(
+        "当前 default_qdisc: {}",
+        read_proc_value("/proc/sys/net/core/default_qdisc")
+    );
+    println!(
+        "本项目 BBR 配置文件 /etc/sysctl.d/99-nat-bbr.conf: {}",
+        if Path::new("/etc/sysctl.d/99-nat-bbr.conf").exists() {
+            "存在"
+        } else {
+            "不存在"
+        }
+    );
+}
+
+fn run_sysctl_set(key: &str, value: &str) -> Result<(), io::Error> {
+    let status = Command::new("sysctl")
+        .arg("-w")
+        .arg(format!("{key}={value}"))
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("sysctl -w {key}={value} 失败")))
+    }
+}
+
+fn enable_bbr_interactive() -> Result<(), io::Error> {
+    if !confirm("开启 BBR？[y/N]: ")? {
+        println!("已取消。");
+        return Ok(());
+    }
+    let path = "/etc/sysctl.d/99-nat-bbr.conf";
+    if Path::new(path).exists() {
+        let backup = format!("{path}.bak-{}", Local::now().format("%Y%m%d-%H%M%S"));
+        fs::copy(path, &backup)?;
+        println!("已备份旧配置: {backup}");
+    }
+    fs::write(
+        path,
+        "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n",
+    )?;
+    run_sysctl_set("net.core.default_qdisc", "fq")?;
+    run_sysctl_set("net.ipv4.tcp_congestion_control", "bbr")?;
+    println!("BBR 已开启。");
+    show_bbr_status();
+    Ok(())
+}
+
+fn disable_bbr_interactive() -> Result<(), io::Error> {
+    if !confirm("关闭 BBR？[y/N]: ")? {
+        println!("已取消。");
+        return Ok(());
+    }
+    let path = "/etc/sysctl.d/99-nat-bbr.conf";
+    if Path::new(path).exists() {
+        let disabled = format!("{path}.disabled");
+        fs::rename(path, &disabled)?;
+        println!("已禁用本项目 BBR 配置: {disabled}");
+    } else {
+        println!("未发现本项目 BBR 配置文件，未删除用户其他 sysctl 配置。");
+    }
+    let available = read_proc_value("/proc/sys/net/ipv4/tcp_available_congestion_control");
+    if available.split_whitespace().any(|item| item == "cubic") {
+        run_sysctl_set("net.ipv4.tcp_congestion_control", "cubic")?;
+    } else if available.split_whitespace().any(|item| item == "reno") {
+        run_sysctl_set("net.ipv4.tcp_congestion_control", "reno")?;
+    } else {
+        println!("warning: 系统未报告支持 cubic 或 reno，未强制切换拥塞控制算法。");
+    }
+    println!(
+        "当前拥塞控制算法: {}",
+        read_proc_value("/proc/sys/net/ipv4/tcp_congestion_control")
+    );
+    Ok(())
+}
+
+fn show_telegram_status(config_path: &str) -> Result<(), io::Error> {
+    let config = load_toml_config(config_path)?;
+    let telegram = config.telegram;
+    println!("enabled: {}", telegram.enabled);
+    println!(
+        "bot_token: {}",
+        if telegram.bot_token.is_empty() {
+            "(未配置)".to_string()
+        } else {
+            traffic_stats::mask_bot_token(&telegram.bot_token)
+        }
+    );
+    println!(
+        "chat_id: {}",
+        if telegram.chat_id.is_empty() {
+            "(未配置)"
+        } else {
+            &telegram.chat_id
+        }
+    );
+    println!(
+        "notify_interval_minutes: {}",
+        telegram.notify_interval_minutes
+    );
+    println!("notify_daily: {}", telegram.notify_daily);
+    println!("notify_monthly: {}", telegram.notify_monthly);
+    Ok(())
+}
+
+fn configure_telegram(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    let bot_token = prompt_secret("请输入 Telegram bot_token: ")?;
+    let chat_id = prompt("请输入 Telegram chat_id: ")?;
+    if bot_token.trim().is_empty() || chat_id.trim().is_empty() {
+        println!("bot_token/chat_id 不能为空。");
+        return Ok(());
+    }
+    config.telegram.enabled = true;
+    config.telegram.bot_token = bot_token;
+    config.telegram.chat_id = chat_id;
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    println!("Telegram 配置已保存，bot_token 不会明文显示。");
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn test_telegram_notification(config_path: &str) -> Result<(), io::Error> {
+    let config = load_toml_config(config_path)?;
+    if config.telegram.bot_token.is_empty() || config.telegram.chat_id.is_empty() {
+        println!("请先配置 Telegram bot_token 和 chat_id。");
+        return Ok(());
+    }
+    let result = traffic_stats::send_telegram_with(
+        &config.telegram,
+        "nftables-nat-rust-enhanced Telegram 测试通知",
+        send_telegram_http_for_cli,
+    );
+    match result {
+        Ok(()) => println!("Telegram 测试通知发送成功"),
+        Err(e) => println!("Telegram 测试通知发送失败: {e}"),
+    }
+    Ok(())
+}
+
+fn send_telegram_http_for_cli(url: &str, params: &[(&str, &str)]) -> Result<(), String> {
+    let mut command = Command::new("curl");
+    command.arg("-sS").arg("-X").arg("POST").arg(url);
+    for (key, value) in params {
+        command
+            .arg("--data-urlencode")
+            .arg(format!("{key}={value}"));
+    }
+    let output = command
+        .output()
+        .map_err(|e| format!("执行 curl 失败: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let status = output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        Err(format!(
+            "HTTP 状态 {status}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+fn toggle_telegram(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    config.telegram.enabled = !config.telegram.enabled;
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    println!(
+        "Telegram 通知已{}。",
+        if config.telegram.enabled {
+            "启用"
+        } else {
+            "禁用"
+        }
+    );
+    print_config_saved_hint(config_path);
+    Ok(())
 }
 
 fn uninstall_menu() -> Result<(), io::Error> {
@@ -948,7 +1301,7 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
         "注意：本机 curl 127.0.0.1:{} 通常不能完整验证 DNAT PREROUTING。",
         rule.sport
     );
-    println!("如果测试后 counter 有变化，可回到 CLI 查看 stats 流量统计。");
+    println!("如果测试后 counter 有变化，可回到 CLI 查看 Stats 流量统计。");
     Ok(())
 }
 

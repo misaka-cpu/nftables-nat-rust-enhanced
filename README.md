@@ -1,6 +1,6 @@
 # nftables-nat-rust-enhanced
 
-`nftables-nat-rust-enhanced` 是基于 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 增强的 CLI-first nftables NAT 转发管理工具。当前项目定位为纯核心服务 + `nat --menu` 终端管理，不提供浏览器管理界面。
+`nftables-nat-rust-enhanced` 是基于 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 增强的 CLI-first nftables NAT 转发管理工具。本项目当前为纯 CLI-first 工具，不提供 WebUI。
 
 核心原则：
 
@@ -36,7 +36,7 @@
 - `nat --menu` 终端交互菜单
 - 查看、添加、删除转发规则
 - 备份 / 恢复配置
-- 查看 stats
+- 查看 Stats
 - 查看当前 nft 规则
 - 白名单 / 黑名单管理
 - 一键更新
@@ -55,10 +55,14 @@
 - 每条规则每日/月流量
 - 通过 `self-filter FORWARD` 中的 `nat-traffic` counter 统计
 - 支持 `traffic_mode = "both"` / `"out"` / `"in"`
+- CLI 可在 Stats 页面切换统计口径
+- 切换统计口径后，历史 daily/monthly 不会自动重算
 
 ### Telegram 通知
 
 - 通过 `/etc/nat.toml` 配置 Bot Token / Chat ID
+- CLI 可配置 bot_token / chat_id
+- CLI 可发送测试通知
 - 支持定时通知
 - 支持 daily / monthly 流量通知
 - token 在状态输出中脱敏
@@ -72,7 +76,7 @@
 
 ### BBR
 
-如果当前 CLI 版本提供 BBR 菜单或命令，可用于查看、启用或关闭 BBR。项目不会调用 `sysctl --system`。
+CLI 菜单可查看、启用或关闭 BBR。开启/关闭只处理本项目配置文件 `/etc/sysctl.d/99-nat-bbr.conf`，不会删除用户其他 sysctl 配置，也不会调用 `sysctl --system`。
 
 ## 系统要求
 
@@ -158,7 +162,7 @@ nat --menu
 4) 删除转发规则
 5) 启用 / 禁用规则
 6) 查看当前 nft 规则
-7) 查看 stats 流量统计
+7) 查看 Stats 流量统计
 8) 手动刷新 DDNS / 域名目标
 9) 备份当前配置
 10) 从备份恢复配置
@@ -169,6 +173,14 @@ nat --menu
 15) 一键更新本项目
 16) 卸载 / 清理本项目
 0) 退出
+```
+
+菜单内误输入 `menu`、`main`、`m`、`nat --menu` 会刷新主菜单；输入 `q`、`quit`、`exit` 或 `0` 退出。
+
+配置变更后，`nat.service` 通常会自动检测并通过安全流程应用规则。安全流程包括 `nft -c` 检查、备份当前规则、应用失败自动回滚。如未自动生效，可执行：
+
+```bash
+systemctl restart nat
 ```
 
 ## 配置文件
@@ -281,25 +293,7 @@ nat --menu
 
 选择：`卸载 / 清理本项目`
 
-默认保留 `/etc/nat.toml`、stats、backups。完全删除需要输入 `DELETE`。卸载只清理本项目 `self-*` 表，不会 `flush ruleset`，不会删除用户其他 nftables table。
-
-## 关于旧版浏览器界面
-
-从 CLI-first 版本开始，本项目移除了旧版浏览器界面相关组件，原因是：
-
-- 项目定位改为轻量 CLI-first
-- 减少证书、登录、端口、SSH 隧道、浏览器缓存和安全暴露问题
-- 降低维护成本
-
-如果你之前安装过旧版浏览器界面，可以手动清理残留。删除前请确认这些文件没有其他用途：
-
-```bash
-systemctl stop nat-console 2>/dev/null || true
-systemctl disable nat-console 2>/dev/null || true
-rm -f /usr/local/bin/nat-console
-rm -f /lib/systemd/system/nat-console.service
-rm -rf /opt/nat-console
-```
+默认保留 `/etc/nat.toml`、Stats、backups。完全删除需要输入 `DELETE`。卸载只清理本项目 `self-*` 表，不会 `flush ruleset`，不会删除用户其他 nftables table。
 
 ## 故障排查
 
@@ -326,13 +320,21 @@ journalctl -u nat -n 120 --no-pager
 - 规则配置解析失败
 - fake-ip 被拒绝
 
-### stats 为 0
+### Stats 为 0
 
 首次采集可能只是建立 baseline。请确认：
 
 - `stats.enabled = true`
 - 有外部流量经过转发规则
 - `traffic_mode` 符合你的统计口径
+
+统计口径：
+
+- `both`：双向 out + in，默认推荐
+- `out`：仅 client -> VPS -> target
+- `in`：仅 target -> VPS -> client
+
+可在 CLI 的 Stats 页面切换统计口径。切换后历史 daily/monthly 不会自动重算。
 
 ### 白名单导致不通
 

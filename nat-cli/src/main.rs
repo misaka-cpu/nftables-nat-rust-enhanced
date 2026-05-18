@@ -909,8 +909,8 @@ exit 1
     }
 
     #[test]
-    fn ddns_refresh_interval_defaults_to_sixty() {
-        assert_eq!(ddns_refresh_interval(&DdnsConfig::default()).unwrap(), 60);
+    fn ddns_refresh_interval_defaults_to_three_hundred() {
+        assert_eq!(ddns_refresh_interval(&DdnsConfig::default()).unwrap(), 300);
     }
 
     #[test]

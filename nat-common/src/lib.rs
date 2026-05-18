@@ -471,7 +471,7 @@ fn default_nameservers() -> Vec<String> {
 }
 
 fn default_ddns_refresh_interval_seconds() -> u64 {
-    60
+    300
 }
 
 fn default_stats_data_file() -> String {
@@ -1124,7 +1124,7 @@ ip_version = "all"
         let config = TomlConfig::from_toml_str("rules = []").unwrap();
         assert!(config.dns.reject_fake_ip);
         assert_eq!(config.dns.fake_ip_cidrs, vec!["198.18.0.0/15"]);
-        assert_eq!(config.ddns.refresh_interval_seconds, 60);
+        assert_eq!(config.ddns.refresh_interval_seconds, 300);
         assert_eq!(config.access_control.mode, AccessControlMode::Off);
         assert!(config.access_control.entries.is_empty());
     }
