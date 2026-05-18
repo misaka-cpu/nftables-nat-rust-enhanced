@@ -396,11 +396,12 @@ fn collect_and_maybe_notify(
     }
 
     let json = String::from_utf8_lossy(&output.stdout);
-    let mut state = match traffic_stats::collect_from_nft_json_with_labels(
+    let mut state = match traffic_stats::collect_from_nft_json_with_config(
         &stats_config.data_file,
         &json,
         rule_labels,
         now,
+        stats_config,
     ) {
         Ok(state) => state,
         Err(e) => {
@@ -427,6 +428,7 @@ fn maybe_send_telegram(
         now,
         telegram_config.notify_daily,
         telegram_config.notify_monthly,
+        stats_config.traffic_mode,
     );
     match traffic_stats::send_telegram_with(telegram_config, &message, send_telegram_http) {
         Ok(()) => {

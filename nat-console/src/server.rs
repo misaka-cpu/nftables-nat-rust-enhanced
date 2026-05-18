@@ -1,9 +1,10 @@
 use crate::Args;
 use crate::handlers::{
-    AppState, collect_stats_now, enable_bbr, get_access_control_status, get_bbr_status, get_config,
-    get_current_user, get_rules, get_rules_json, get_stats, get_telegram_status,
-    hybrid_auth_middleware, login_handler, logout_handler, reset_stats_daily, reset_stats_monthly,
-    save_config, save_telegram_config, test_telegram,
+    AppState, check_forward_test, collect_stats_now, enable_bbr, get_access_control_status,
+    get_bbr_status, get_config, get_current_user, get_forward_test_rules, get_rules,
+    get_rules_json, get_stats, get_telegram_status, hybrid_auth_middleware, login_handler,
+    logout_handler, observe_forward_test, reset_stats_daily, reset_stats_monthly, save_config,
+    save_stats_config, save_telegram_config, test_telegram,
 };
 use axum::{
     Router,
@@ -68,6 +69,7 @@ pub async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error + Se
         .route("/api/bbr/status", get(get_bbr_status))
         .route("/api/bbr/enable", post(enable_bbr))
         .route("/api/stats", get(get_stats))
+        .route("/api/stats/config", post(save_stats_config))
         .route("/api/stats/collect-now", post(collect_stats_now))
         .route("/api/stats/reset-daily", post(reset_stats_daily))
         .route("/api/stats/reset-monthly", post(reset_stats_monthly))
@@ -75,6 +77,9 @@ pub async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error + Se
         .route("/api/telegram/config", post(save_telegram_config))
         .route("/api/telegram/test", post(test_telegram))
         .route("/api/access-control/status", get(get_access_control_status))
+        .route("/api/forward-test/rules", get(get_forward_test_rules))
+        .route("/api/forward-test/check", post(check_forward_test))
+        .route("/api/forward-test/observe", post(observe_forward_test))
         .route("/rules", get(get_rules))
         .layer(middleware::from_fn_with_state(
             Arc::new(jwt_config.clone()),
@@ -106,7 +111,7 @@ pub async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error + Se
                 .allow_credentials(true),
             tower_http::timeout::TimeoutLayer::with_status_code(
                 StatusCode::REQUEST_TIMEOUT,
-                Duration::from_secs(30),
+                Duration::from_secs(70),
             ),
             tower_http::compression::CompressionLayer::new()
                 .gzip(true)

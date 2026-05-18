@@ -644,4 +644,12 @@ case "$PASSWORD_SOURCE" in
         ;;
 esac
 echo "  凭据文件: $ENV_FILE"
+echo "  WebUI 中可在规则查看/转发测试区域测试规则连通性。"
+if [ -x "/usr/local/bin/nat" ]; then
+    echo ""
+    echo "已检测到核心 nat，可使用 CLI 菜单管理转发规则："
+    echo "  nat --menu"
+    echo "或："
+    echo "  /usr/local/bin/nat --menu"
+fi
 echo "========================================="

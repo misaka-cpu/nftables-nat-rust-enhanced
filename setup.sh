@@ -263,6 +263,12 @@ else
 # 配置方式参考本项目 README：
 # https://github.com/misaka-cpu/nftables-nat-rust-enhanced#toml-配置示例
 rules = []
+
+[stats]
+enabled = true
+collect_interval_seconds = 60
+data_file = "/var/lib/nftables-nat-rust/stats.json"
+traffic_mode = "both"
 EOF
         log_ok "created $CONFIG_FILE"
     else
@@ -319,6 +325,12 @@ domain = "ipv6.example.com"
 protocol = "all"
 ip_version = "ipv6"    # 仅使用 IPv6
 comment = "IPv6 专用转发"
+
+[stats]
+enabled = true
+collect_interval_seconds = 60
+data_file = "/var/lib/nftables-nat-rust/stats.json"
+traffic_mode = "both" # both / out / in
 EOF
 fi
 
@@ -354,10 +366,17 @@ echo "----------------------------------------"
 cat "$EXAMPLE_FILE"
 echo "----------------------------------------"
 echo ""
-echo "服务管理命令："
-echo "  查看状态: systemctl status nat"
-echo "  停止服务: systemctl stop nat"
+echo "后续维护 / 管理："
+echo "  nat --menu"
+echo "或："
+echo "  /usr/local/bin/nat --menu"
+echo ""
+echo "常用服务命令："
+echo "  查看状态: systemctl status nat --no-pager"
 echo "  启动服务: systemctl start nat"
+echo "  停止服务: systemctl stop nat"
 echo "  重启服务: systemctl restart nat"
 echo "  查看日志: journalctl -u nat -f"
+echo ""
+echo "进入 CLI 菜单后可使用“测试转发规则连通性”检查规则是否命中。"
 echo "========================================="

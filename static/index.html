@@ -780,10 +780,35 @@
         <div id="rulesTab" class="tab-content">
             <div class="actions" style="margin-bottom: 20px;">
                 <button class="btn btn-primary" onclick="loadRules()">🔄 刷新规则</button>
+                <button class="btn btn-secondary" onclick="loadForwardTestRules()">加载转发测试</button>
             </div>
 
             <div id="rulesContent" class="loading">
                 点击"刷新规则"查看当前 nftables 规则
+            </div>
+
+            <div class="telegram-settings" style="margin-top: 20px;">
+                <h3 style="margin: 0 0 10px 0;">转发测试</h3>
+                <div style="color: #666; font-size: 13px; margin-bottom: 12px;">
+                    本机 curl 127.0.0.1:监听端口通常不能完整验证 DNAT。建议从另一台机器访问服务器 IP:监听端口，再观察 nft counter 变化。
+                </div>
+                <div class="telegram-form-grid">
+                    <div class="telegram-field">
+                        <label for="forwardTestRule">选择规则</label>
+                        <select class="telegram-input" id="forwardTestRule"></select>
+                    </div>
+                    <div class="telegram-field">
+                        <label for="forwardTestSeconds">观察时间</label>
+                        <input class="telegram-input" id="forwardTestSeconds" type="number" min="1" max="60" value="30">
+                        <div class="telegram-hint">单位为秒，最大 60。</div>
+                    </div>
+                </div>
+                <div class="actions">
+                    <button class="btn btn-primary" onclick="checkForwardRule()">开始测试</button>
+                    <button class="btn btn-secondary" onclick="observeForwardRule()">观察 counter</button>
+                    <button class="btn btn-secondary" onclick="collectStatsNow()">测试完成后刷新统计</button>
+                </div>
+                <div id="forwardTestContent" class="loading">点击“加载转发测试”获取规则列表。</div>
             </div>
         </div>
 
@@ -998,6 +1023,118 @@
             }
         }
 
+        async function loadForwardTestRules() {
+            const select = document.getElementById('forwardTestRule');
+            const content = document.getElementById('forwardTestContent');
+            content.className = 'loading';
+            content.textContent = '加载转发测试规则...';
+            try {
+                const response = await apiRequest('/api/forward-test/rules');
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+                const data = await response.json();
+                select.innerHTML = (data.rules || []).map(rule =>
+                    `<option value="${Number(rule.index)}">${Number(rule.index)}) ${escapeHtml(rule.label)}</option>`
+                ).join('');
+                content.className = 'rules-display';
+                content.innerHTML = (data.rules || []).length
+                    ? '<pre>请选择规则后点击“开始测试”。</pre>'
+                    : '<pre>当前没有可测试的转发规则。</pre>';
+            } catch (error) {
+                content.className = 'loading';
+                content.textContent = '加载失败: ' + error.message;
+            }
+        }
+
+        function selectedForwardRuleIndex() {
+            const select = document.getElementById('forwardTestRule');
+            if (!select.value) {
+                throw new Error('请先加载并选择规则');
+            }
+            return Number(select.value);
+        }
+
+        function renderCounter(counter) {
+            return `${Number((counter || {}).packets || 0)} packets / ${formatBytes(Number((counter || {}).bytes || 0))}`;
+        }
+
+        async function checkForwardRule() {
+            const content = document.getElementById('forwardTestContent');
+            content.className = 'loading';
+            content.textContent = '正在检查规则...';
+            try {
+                const response = await apiRequest('/api/forward-test/check', {
+                    method: 'POST',
+                    body: JSON.stringify({ index: selectedForwardRuleIndex() })
+                });
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+                const data = await response.json();
+                const rule = data.rule;
+                const examples = data.external_test_examples || {};
+                const accessEntries = ((data.access_control || {}).entries || []).join(', ') || '-';
+                content.className = 'rules-display';
+                content.innerHTML = `<pre>规则：${escapeHtml(rule.label)}
+type：${escapeHtml(rule.type)}
+sport：${Number(rule.sport)}
+target/domain：${escapeHtml(rule.target)}
+resolved ip：${escapeHtml(rule.resolved_ip || '解析失败或暂不可用')}
+dport：${Number(rule.dport)}
+protocol：${escapeHtml(rule.protocol)}
+ip_version：${escapeHtml(rule.ip_version)}
+access_control：${escapeHtml((data.access_control || {}).mode || 'off')}
+entries：${escapeHtml(accessEntries)}
+${data.access_control_note ? '提示：' + escapeHtml(data.access_control_note) + '\n' : ''}
+nat.service：${data.nat_service_active ? 'active' : 'inactive / unknown'}
+nft 规则：${data.nft_rule_applied ? '已应用' : '未找到'}
+目标 TCP：${data.target_tcp_reachable === null ? 'UDP/all 无法可靠判断' : (data.target_tcp_reachable ? '可达' : '不可达')}
+${data.udp_note ? 'UDP 提示：' + escapeHtml(data.udp_note) + '\n' : ''}
+baseline nat-rule：${renderCounter(data.baseline_counters && data.baseline_counters.nat_rule)}
+baseline out：${renderCounter(data.baseline_counters && data.baseline_counters.out)}
+baseline in：${renderCounter(data.baseline_counters && data.baseline_counters.in)}
+
+请在另一台机器执行下面命令测试外部访问，然后点击“观察 counter”：
+HTTP 示例：${escapeHtml(examples.http || '')}
+TCP 示例：${escapeHtml(examples.tcp || '')}
+HTTPS/SNI 示例：${escapeHtml(examples.https_sni || '')}</pre>`;
+            } catch (error) {
+                content.className = 'loading';
+                content.textContent = '测试失败: ' + error.message;
+            }
+        }
+
+        async function observeForwardRule() {
+            const content = document.getElementById('forwardTestContent');
+            const seconds = Math.min(60, Math.max(1, Number(document.getElementById('forwardTestSeconds').value || 30)));
+            content.className = 'loading';
+            content.textContent = `正在观察 counter ${seconds} 秒...`;
+            try {
+                const response = await apiRequest('/api/forward-test/observe', {
+                    method: 'POST',
+                    body: JSON.stringify({ index: selectedForwardRuleIndex(), seconds })
+                });
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+                const data = await response.json();
+                content.className = 'rules-display';
+                content.innerHTML = `<pre>观察时间：${Number(data.seconds)} 秒
+rule_id：${escapeHtml(data.rule_id)}
+DNAT 命中增量：${renderCounter(data.delta && data.delta.nat_rule)}
+转发出站 out 增量：${renderCounter(data.delta && data.delta.out)}
+返回入站 in 增量：${renderCounter(data.delta && data.delta.in)}
+结论：${escapeHtml(data.verdict)}
+说明：${escapeHtml(data.message)}
+
+counter 有变化后，可以点击“测试完成后刷新统计”更新 stats。</pre>`;
+            } catch (error) {
+                content.className = 'loading';
+                content.textContent = '观察失败: ' + error.message;
+            }
+        }
+
         async function loadBbrStatus() {
             const bbrContent = document.getElementById('bbrContent');
             bbrContent.className = 'loading';
@@ -1105,6 +1242,11 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
                             <div class="stats-value">${escapeHtml(stats.monthly_total || '0 B')}</div>
                         </div>
                         <div class="stats-panel">
+                            <div class="stats-label">统计口径</div>
+                            <div class="stats-value">${escapeHtml(stats.traffic_mode || 'both')}</div>
+                            <div style="margin-top: 8px; color: #666;">${escapeHtml(stats.traffic_mode_label || '双向 out + in')}</div>
+                        </div>
+                        <div class="stats-panel">
                             <div class="stats-label">Telegram</div>
                             <div class="stats-value">${telegram.enabled ? '已启用' : '未启用'}</div>
                             <div style="margin-top: 8px; color: #666;">通知间隔: ${telegram.notify_interval_minutes} 分钟</div>
@@ -1116,6 +1258,7 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
                             <div style="margin-top: 8px; color: #666;">entries: ${(access.entries || []).length}</div>
                         </div>
                     </div>
+                    ${renderStatsSettings(stats)}
                     ${renderTelegramSettings(telegram)}
                     <div style="margin-bottom: 12px; color: #666;">最近采集: ${escapeHtml(stats.last_collect_time || '-')}</div>
                     <table class="stats-table">
@@ -1133,6 +1276,32 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
                 statsContent.className = 'loading';
                 statsContent.textContent = '加载失败: ' + error.message;
             }
+        }
+
+        function renderStatsSettings(stats) {
+            const mode = stats.traffic_mode || 'both';
+            return `
+                <div class="telegram-settings">
+                    <h3 style="margin: 0 0 6px 0;">统计口径</h3>
+                    <div style="color: #666; font-size: 13px; margin-bottom: 12px;">
+                        切换统计口径后，后续新增流量按新口径累计；历史累计值不会自动重算。需要重新统计请点击重置今日/月。
+                    </div>
+                    <div class="telegram-form-grid">
+                        <div class="telegram-field">
+                            <label for="statsTrafficMode">统计口径</label>
+                            <select class="telegram-input" id="statsTrafficMode">
+                                <option value="both" ${mode === 'both' ? 'selected' : ''}>双向 out + in</option>
+                                <option value="out" ${mode === 'out' ? 'selected' : ''}>仅 out</option>
+                                <option value="in" ${mode === 'in' ? 'selected' : ''}>仅 in</option>
+                            </select>
+                            <div class="telegram-hint">out = client -> VPS -> target；in = target -> VPS -> client。</div>
+                        </div>
+                    </div>
+                    <div class="actions">
+                        <button class="btn btn-primary" onclick="saveStatsConfig()">保存统计口径</button>
+                    </div>
+                </div>
+            `;
         }
 
         function renderTelegramSettings(telegram) {
@@ -1235,6 +1404,26 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
                 await loadStats();
             } catch (error) {
                 showAlert('保存 Telegram 配置失败: ' + error.message, true);
+            }
+        }
+
+        async function saveStatsConfig() {
+            const trafficMode = document.getElementById('statsTrafficMode').value;
+            try {
+                const response = await apiRequest('/api/stats/config', {
+                    method: 'POST',
+                    body: JSON.stringify({ traffic_mode: trafficMode })
+                });
+                const { data, text } = await readJsonOrText(response);
+                if (!response.ok) {
+                    throw new Error((data && data.message) || text);
+                }
+                showAlert(data.message || '统计口径已保存。', false);
+                currentConfig = null;
+                await loadConfig();
+                await loadStats();
+            } catch (error) {
+                showAlert('保存统计口径失败: ' + error.message, true);
             }
         }
 

@@ -13,15 +13,18 @@ use axum_extra::extract::CookieJar;
 use chrono::Local;
 use log::{error, info};
 use nat_common::{
-    AccessControlConfig, StatsConfig, TelegramConfig, TomlConfig, stats as traffic_stats,
-    validate_legacy_config,
+    AccessControlConfig, StatsConfig, TelegramConfig, TomlConfig, TrafficMode, forward_test,
+    stats as traffic_stats, validate_legacy_config,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::{sleep, timeout};
 
 const TCP_CONGESTION_CONTROL: &str = "/proc/sys/net/ipv4/tcp_congestion_control";
 const TCP_AVAILABLE_CONGESTION_CONTROL: &str =
@@ -224,11 +227,11 @@ pub async fn save_config(
     let new_config = match req.format.as_str() {
         "toml" => {
             // 使用 nat-common 的验证功能
-            TomlConfig::from_toml_str(&req.content).map_err(|e| {
+            let parsed = TomlConfig::from_toml_str(&req.content).map_err(|e| {
                 error!("Invalid TOML config: {:?}", e);
                 (StatusCode::BAD_REQUEST, format!("配置验证失败: {}", e))
             })?;
-            ConfigFormat::Toml(req.content)
+            ConfigFormat::Toml(update_stats_section(&req.content, &parsed.stats)?)
         }
         "legacy" => {
             // 使用 nat-common 的验证功能
@@ -290,6 +293,209 @@ pub async fn get_rules_json(_user: Claims) -> Result<Json<RulesResponse>, (Statu
     })?;
 
     Ok(Json(RulesResponse { rules }))
+}
+
+#[derive(Deserialize)]
+pub struct ForwardTestIndexRequest {
+    index: usize,
+}
+
+#[derive(Deserialize)]
+pub struct ForwardTestObserveRequest {
+    index: usize,
+    #[serde(default = "default_observe_seconds")]
+    seconds: u64,
+}
+
+fn default_observe_seconds() -> u64 {
+    30
+}
+
+#[derive(Serialize)]
+pub struct ForwardTestRulesResponse {
+    rules: Vec<forward_test::TestableRule>,
+}
+
+#[derive(Serialize)]
+pub struct ForwardTestCheckResponse {
+    rule: forward_test::TestableRule,
+    nat_service_active: bool,
+    nft_rule_applied: bool,
+    target_tcp_reachable: Option<bool>,
+    udp_note: Option<String>,
+    access_control: AccessControlConfig,
+    access_control_note: Option<String>,
+    baseline_counters: forward_test::RuleTestCounters,
+    external_test_examples: forward_test::ExternalTestExamples,
+}
+
+#[derive(Serialize)]
+pub struct ForwardTestObserveResponse {
+    rule_id: String,
+    seconds: u64,
+    delta: forward_test::CounterDelta,
+    verdict: String,
+    message: String,
+}
+
+pub async fn get_forward_test_rules(
+    _user: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ForwardTestRulesResponse>, (StatusCode, String)> {
+    let config = load_toml_config_for_forward_test(&state)?;
+    Ok(Json(ForwardTestRulesResponse {
+        rules: forward_test::list_testable_rules(&config),
+    }))
+}
+
+pub async fn check_forward_test(
+    _user: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ForwardTestIndexRequest>,
+) -> Result<Json<ForwardTestCheckResponse>, (StatusCode, String)> {
+    let config = load_toml_config_for_forward_test(&state)?;
+    let rule = find_testable_rule(&config, req.index)?;
+    let nft_json = read_nft_json_ruleset().unwrap_or_default();
+    let baseline_counters =
+        forward_test::parse_rule_counters(&nft_json, &rule.id).unwrap_or_default();
+    let target_tcp_reachable = async_tcp_connect_target(&rule).await;
+
+    Ok(Json(ForwardTestCheckResponse {
+        nft_rule_applied: forward_test::nft_rule_applied(&baseline_counters),
+        nat_service_active: is_nat_service_active(),
+        target_tcp_reachable,
+        udp_note: if rule.protocol == "udp" || rule.protocol == "all" {
+            Some("UDP 无连接，无法通过 connect 准确判断是否可达，请结合外部客户端访问和 counter 变化确认。".to_string())
+        } else {
+            None
+        },
+        access_control_note: forward_test::access_control_note(&config.access_control),
+        access_control: config.access_control,
+        external_test_examples: forward_test::external_examples(&rule),
+        baseline_counters,
+        rule,
+    }))
+}
+
+pub async fn observe_forward_test(
+    _user: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ForwardTestObserveRequest>,
+) -> Result<Json<ForwardTestObserveResponse>, (StatusCode, String)> {
+    let seconds = req.seconds.clamp(1, 60);
+    let config = load_toml_config_for_forward_test(&state)?;
+    let rule = find_testable_rule(&config, req.index)?;
+    let before_json = read_nft_json_ruleset().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读取 nft counters 失败: {e}"),
+        )
+    })?;
+    let before = forward_test::parse_rule_counters(&before_json, &rule.id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("解析 nft counters 失败: {e}"),
+        )
+    })?;
+    sleep(Duration::from_secs(seconds)).await;
+    let after_json = read_nft_json_ruleset().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读取 nft counters 失败: {e}"),
+        )
+    })?;
+    let after = forward_test::parse_rule_counters(&after_json, &rule.id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("解析 nft counters 失败: {e}"),
+        )
+    })?;
+    let delta = forward_test::counter_delta(&before, &after);
+    let verdict = forward_test::verdict_from_delta(&delta, forward_test::nft_rule_applied(&before));
+    Ok(Json(ForwardTestObserveResponse {
+        rule_id: rule.id,
+        seconds,
+        delta,
+        verdict: verdict.verdict,
+        message: verdict.message,
+    }))
+}
+
+fn load_toml_config_for_forward_test(state: &AppState) -> Result<TomlConfig, (StatusCode, String)> {
+    let config_info = get_config_info(
+        state.toml_config.as_deref(),
+        state.compatible_config.as_deref(),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("获取配置信息失败: {e}"),
+        )
+    })?;
+    if !config_info.is_toml {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "转发测试当前仅支持 TOML 配置。".to_string(),
+        ));
+    }
+    let content = fs::read_to_string(&config_info.config_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读取配置失败: {e}"),
+        )
+    })?;
+    TomlConfig::from_toml_str(&content)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("解析 TOML 配置失败: {e}")))
+}
+
+fn find_testable_rule(
+    config: &TomlConfig,
+    index: usize,
+) -> Result<forward_test::TestableRule, (StatusCode, String)> {
+    forward_test::list_testable_rules(config)
+        .into_iter()
+        .find(|rule| rule.index == index)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "规则 index 超出范围".to_string()))
+}
+
+fn read_nft_json_ruleset() -> Result<String, io::Error> {
+    let output = Command::new("/usr/sbin/nft")
+        .arg("-j")
+        .arg("list")
+        .arg("ruleset")
+        .output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
+    }
+}
+
+fn is_nat_service_active() -> bool {
+    Command::new("systemctl")
+        .arg("is-active")
+        .arg("nat")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+async fn async_tcp_connect_target(rule: &forward_test::TestableRule) -> Option<bool> {
+    if rule.protocol == "udp" {
+        return None;
+    }
+    let target = rule.resolved_ip.as_deref().unwrap_or(&rule.target);
+    let Ok(addr) = format!("{target}:{}", rule.dport).parse::<SocketAddr>() else {
+        return None;
+    };
+    Some(
+        timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
+            .await
+            .map(|result| result.is_ok())
+            .unwrap_or(false),
+    )
 }
 
 #[derive(Serialize)]
@@ -393,6 +599,18 @@ pub struct TelegramConfigResponse {
     status: TelegramStatusResponse,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct StatsConfigRequest {
+    traffic_mode: TrafficMode,
+}
+
+#[derive(Serialize)]
+pub struct StatsConfigResponse {
+    success: bool,
+    message: String,
+    status: traffic_stats::StatsView,
+}
+
 #[derive(Serialize)]
 pub struct AccessControlStatusResponse {
     mode: String,
@@ -460,6 +678,36 @@ pub async fn collect_stats_now(
         &config.stats,
         &stats_state,
     )))
+}
+
+pub async fn save_stats_config(
+    _user: Claims,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<StatsConfigRequest>,
+) -> Result<Json<StatsConfigResponse>, (StatusCode, String)> {
+    let config_info = get_config_info(
+        state.toml_config.as_deref(),
+        state.compatible_config.as_deref(),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("获取配置信息失败: {e}"),
+        )
+    })?;
+    if !config_info.is_toml {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Stats 配置仅支持 TOML 配置文件".to_string(),
+        ));
+    }
+    let config = save_stats_config_to_path(&config_info.config_path, &req, CONFIG_BACKUP_DIR)?;
+    let stats_state = traffic_stats::load_state(&config.stats.data_file);
+    Ok(Json(StatsConfigResponse {
+        success: true,
+        message: "统计口径已保存。后续新增流量按新口径累计；历史累计值不会自动重算。".to_string(),
+        status: traffic_stats::state_to_view(&config.stats, &stats_state),
+    }))
 }
 
 pub async fn reset_stats_daily(
@@ -572,6 +820,7 @@ pub async fn test_telegram(
         now,
         telegram_config.notify_daily,
         telegram_config.notify_monthly,
+        stats_config.traffic_mode,
     );
     traffic_stats::send_telegram_with(&telegram_config, &message, send_telegram_http).map_err(
         |e| {
@@ -648,6 +897,7 @@ fn save_telegram_config_to_path(
         )
     })?;
     let updated = update_telegram_section(&content, &config.telegram)?;
+    let updated = update_stats_section(&updated, &config.stats)?;
     fs::write(config_path, updated).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -696,6 +946,69 @@ fn update_telegram_section(
         toml::Value::Boolean(telegram.notify_monthly),
     );
     root.insert("telegram".to_string(), toml::Value::Table(telegram_table));
+    toml::to_string_pretty(&root).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("序列化 TOML 配置失败: {e}"),
+        )
+    })
+}
+
+fn save_stats_config_to_path(
+    config_path: &str,
+    req: &StatsConfigRequest,
+    backup_dir: &str,
+) -> Result<TomlConfig, (StatusCode, String)> {
+    let content = fs::read_to_string(config_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读取 TOML 配置失败: {e}"),
+        )
+    })?;
+    let mut config = TomlConfig::from_toml_str(&content)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("解析 TOML 配置失败: {e}")))?;
+    config.stats.traffic_mode = req.traffic_mode;
+
+    backup_toml_config(config_path, backup_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("备份 TOML 配置失败: {e}"),
+        )
+    })?;
+    let updated = update_stats_section(&content, &config.stats)?;
+    fs::write(config_path, updated).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("保存 Stats 配置失败: {e}"),
+        )
+    })?;
+    Ok(config)
+}
+
+fn update_stats_section(
+    content: &str,
+    stats: &StatsConfig,
+) -> Result<String, (StatusCode, String)> {
+    let mut root: toml::Table = toml::from_str(content)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("解析 TOML 配置失败: {e}")))?;
+    let mut stats_table = root
+        .remove("stats")
+        .and_then(|value| value.as_table().cloned())
+        .unwrap_or_default();
+    stats_table.insert("enabled".to_string(), toml::Value::Boolean(stats.enabled));
+    stats_table.insert(
+        "collect_interval_seconds".to_string(),
+        toml::Value::Integer(stats.collect_interval_seconds as i64),
+    );
+    stats_table.insert(
+        "data_file".to_string(),
+        toml::Value::String(stats.data_file.clone()),
+    );
+    stats_table.insert(
+        "traffic_mode".to_string(),
+        toml::Value::String(stats.traffic_mode.to_string()),
+    );
+    root.insert("stats".to_string(), toml::Value::Table(stats_table));
     toml::to_string_pretty(&root).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -817,14 +1130,20 @@ fn collect_stats_from_json_now(
     json: &str,
     now: chrono::NaiveDateTime,
 ) -> Result<traffic_stats::StatsState, (StatusCode, String)> {
-    traffic_stats::collect_from_nft_json_with_labels(&stats_config.data_file, json, labels, now)
-        .map_err(|e| {
-            error!("Failed to collect stats now: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("采集 nft counter 失败: {}", e),
-            )
-        })
+    traffic_stats::collect_from_nft_json_with_config(
+        &stats_config.data_file,
+        json,
+        labels,
+        now,
+        stats_config,
+    )
+    .map_err(|e| {
+        error!("Failed to collect stats now: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("采集 nft counter 失败: {}", e),
+        )
+    })
 }
 
 fn load_access_control_config(
@@ -925,7 +1244,7 @@ fn run_sysctl_command(args: &[&str]) -> Result<(), (StatusCode, String)> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use nat_common::{AccessControlMode, NftCell};
+    use nat_common::{AccessControlMode, NftCell, TrafficMode};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -953,6 +1272,7 @@ comment = "keep-rule"
 enabled = true
 collect_interval_seconds = 30
 data_file = "/tmp/stats.json"
+traffic_mode = "both"
 
 [ddns]
 refresh_interval_seconds = 300
@@ -1159,6 +1479,69 @@ chat_id = ""
     }
 
     #[test]
+    fn saving_stats_config_updates_traffic_mode_and_preserves_sections() {
+        let dir = temp_dir("stats-mode");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nat.toml");
+        let backup_dir = dir.join("backups");
+        write_config(&path);
+
+        let config = save_stats_config_to_path(
+            path.to_str().unwrap(),
+            &StatsConfigRequest {
+                traffic_mode: TrafficMode::Out,
+            },
+            backup_dir.to_str().unwrap(),
+        )
+        .unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(config.stats.traffic_mode, TrafficMode::Out);
+        assert!(saved.contains("traffic_mode = \"out\""));
+        assert_eq!(section_count(&saved, "[stats]"), 1);
+        assert_eq!(section_count(&saved, "[telegram]"), 1);
+        assert_eq!(TomlConfig::from_toml_str(&saved).unwrap().rules.len(), 1);
+        assert!(backup_dir.exists());
+    }
+
+    #[test]
+    fn saving_telegram_backfills_default_stats_traffic_mode() {
+        let dir = temp_dir("telegram-backfill-stats-mode");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nat.toml");
+        let backup_dir = dir.join("backups");
+        fs::write(
+            &path,
+            r#"
+rules = []
+
+[stats]
+enabled = true
+collect_interval_seconds = 60
+data_file = "/tmp/stats.json"
+
+[telegram]
+enabled = false
+bot_token = ""
+chat_id = ""
+"#,
+        )
+        .unwrap();
+
+        save_telegram_config_to_path(
+            path.to_str().unwrap(),
+            &request(false, None, "", 60),
+            backup_dir.to_str().unwrap(),
+        )
+        .unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+
+        assert!(saved.contains("traffic_mode = \"both\""));
+        assert_eq!(section_count(&saved, "[stats]"), 1);
+        assert_eq!(section_count(&saved, "[telegram]"), 1);
+    }
+
+    #[test]
     fn saving_telegram_preserves_unknown_future_sections() {
         let dir = temp_dir("preserve-unknown");
         fs::create_dir_all(&dir).unwrap();
@@ -1279,6 +1662,7 @@ enabled = true
             enabled: true,
             collect_interval_seconds: 10,
             data_file: stats_path.to_string_lossy().to_string(),
+            ..Default::default()
         };
         let mut state = traffic_stats::StatsState::default();
         state.last_counters.insert(
@@ -1329,6 +1713,7 @@ enabled = true
             enabled: true,
             collect_interval_seconds: 10,
             data_file: stats_path.to_string_lossy().to_string(),
+            ..Default::default()
         };
         let labels = std::collections::HashMap::new();
         let json = r#"{"nftables":[

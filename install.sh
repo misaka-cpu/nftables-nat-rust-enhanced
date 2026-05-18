@@ -64,6 +64,7 @@ dry_run_core_install() {
     log_dry_run "would preserve existing /etc/nat.conf if present"
     log_dry_run "would preserve existing /etc/nat.toml if present"
     log_dry_run "would preserve existing /opt/nat/env if present"
+    log_dry_run "would show CLI management entry: nat --menu"
     log_dry_run "would ask before starting or restarting nat.service in interactive mode"
 }
 
@@ -100,6 +101,9 @@ dry_run_console_install() {
     log_dry_run "would enable nat-console.service"
     log_dry_run "would preserve existing /etc/ssl/nat-webui.crt if present"
     log_dry_run "would preserve existing /etc/ssl/nat-webui.key if present"
+    if [ -x "/usr/local/bin/nat" ]; then
+        log_dry_run "would mention existing core nat CLI menu: nat --menu"
+    fi
     log_dry_run "would ask before starting or restarting nat-console.service in interactive mode"
 }
 

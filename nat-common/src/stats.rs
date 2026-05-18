@@ -1,4 +1,4 @@
-use crate::{NftCell, StatsConfig, TelegramConfig, TomlConfig};
+use crate::{NftCell, StatsConfig, TelegramConfig, TomlConfig, TrafficMode};
 use chrono::{Local, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -78,6 +78,8 @@ pub struct RuleTraffic {
 pub struct StatsView {
     pub enabled: bool,
     pub data_file: String,
+    pub traffic_mode: String,
+    pub traffic_mode_label: String,
     pub daily_total_bytes: u64,
     pub monthly_total_bytes: u64,
     pub daily_total: String,
@@ -324,6 +326,16 @@ pub fn apply_counter_snapshot(
     labels: &HashMap<String, String>,
     now: NaiveDateTime,
 ) {
+    apply_counter_snapshot_with_mode(state, counters, labels, now, TrafficMode::Both);
+}
+
+pub fn apply_counter_snapshot_with_mode(
+    state: &mut StatsState,
+    counters: &[RuleCounter],
+    labels: &HashMap<String, String>,
+    now: NaiveDateTime,
+    traffic_mode: TrafficMode,
+) {
     let day = now.format("%Y-%m-%d").to_string();
     let month = now.format("%Y-%m").to_string();
     if state.last_day != day {
@@ -338,7 +350,7 @@ pub fn apply_counter_snapshot(
     }
 
     for rule in counters {
-        let delta = match state.last_counters.get(&rule.counter_id).cloned() {
+        let raw_delta = match state.last_counters.get(&rule.counter_id).cloned() {
             Some(previous) if rule.bytes >= previous.bytes => rule.bytes - previous.bytes,
             Some(previous) => {
                 log::warn!(
@@ -350,6 +362,11 @@ pub fn apply_counter_snapshot(
                 0
             }
             None => 0,
+        };
+        let delta = if counter_matches_mode(&rule.counter_id, traffic_mode) {
+            raw_delta
+        } else {
+            0
         };
         state.daily_total_bytes = state.daily_total_bytes.saturating_add(delta);
         state.monthly_total_bytes = state.monthly_total_bytes.saturating_add(delta);
@@ -380,6 +397,14 @@ pub fn apply_counter_snapshot(
     state.rules = build_rule_traffic(state);
 }
 
+fn counter_matches_mode(counter_id: &str, traffic_mode: TrafficMode) -> bool {
+    match traffic_mode {
+        TrafficMode::Both => counter_id.ends_with(":out") || counter_id.ends_with(":in"),
+        TrafficMode::Out => counter_id.ends_with(":out"),
+        TrafficMode::In => counter_id.ends_with(":in"),
+    }
+}
+
 pub fn collect_from_nft_json(
     path: &str,
     json: &str,
@@ -394,9 +419,19 @@ pub fn collect_from_nft_json_with_labels(
     labels: &HashMap<String, String>,
     now: NaiveDateTime,
 ) -> Result<StatsState, String> {
+    collect_from_nft_json_with_config(path, json, labels, now, &StatsConfig::default())
+}
+
+pub fn collect_from_nft_json_with_config(
+    path: &str,
+    json: &str,
+    labels: &HashMap<String, String>,
+    now: NaiveDateTime,
+    config: &StatsConfig,
+) -> Result<StatsState, String> {
     let counters = parse_nft_counters(json)?;
     let mut state = load_state(path);
-    apply_counter_snapshot(&mut state, &counters, labels, now);
+    apply_counter_snapshot_with_mode(&mut state, &counters, labels, now, config.traffic_mode);
     save_state(path, &state).map_err(|e| format!("保存统计状态失败: {e}"))?;
     Ok(state)
 }
@@ -450,6 +485,8 @@ pub fn state_to_view(config: &StatsConfig, state: &StatsState) -> StatsView {
     StatsView {
         enabled: config.enabled,
         data_file: config.data_file.clone(),
+        traffic_mode: config.traffic_mode.to_string(),
+        traffic_mode_label: traffic_mode_label(config.traffic_mode).to_string(),
         daily_total_bytes: state.daily_total_bytes,
         monthly_total_bytes: state.monthly_total_bytes,
         daily_total: format_bytes(state.daily_total_bytes),
@@ -458,6 +495,24 @@ pub fn state_to_view(config: &StatsConfig, state: &StatsState) -> StatsView {
         last_month: state.last_month.clone(),
         last_collect_time: state.last_collect_time.clone(),
         rules: build_rule_traffic(state),
+    }
+}
+
+pub fn traffic_mode_label(mode: TrafficMode) -> &'static str {
+    match mode {
+        TrafficMode::Both => "双向 out + in",
+        TrafficMode::Out => "仅 out",
+        TrafficMode::In => "仅 in",
+    }
+}
+
+pub fn traffic_mode_cli_description(mode: TrafficMode) -> &'static str {
+    match mode {
+        TrafficMode::Both => {
+            "统计口径：both 双向 out + in\nout = client -> VPS -> target\nin  = target -> VPS -> client"
+        }
+        TrafficMode::Out => "统计口径：out 仅 client -> VPS -> target",
+        TrafficMode::In => "统计口径：in 仅 target -> VPS -> client",
     }
 }
 
@@ -487,7 +542,7 @@ pub fn mask_bot_token(token: &str) -> String {
 }
 
 pub fn format_telegram_message(state: &StatsState, now: NaiveDateTime) -> String {
-    format_telegram_message_with_options(state, now, true, true)
+    format_telegram_message_with_options(state, now, true, true, TrafficMode::Both)
 }
 
 pub fn format_telegram_message_with_options(
@@ -495,6 +550,7 @@ pub fn format_telegram_message_with_options(
     now: NaiveDateTime,
     notify_daily: bool,
     notify_monthly: bool,
+    traffic_mode: TrafficMode,
 ) -> String {
     let mut rules: Vec<RuleTraffic> = state
         .per_rule_daily_bytes
@@ -513,6 +569,7 @@ pub fn format_telegram_message_with_options(
     rules.sort_by_key(|rule| Reverse(rule.daily_bytes));
 
     let mut msg = format!("NAT 流量统计\n时间：{}", now.format("%Y-%m-%d %H:%M:%S"));
+    msg.push_str(&format!("\n统计口径：{}", traffic_mode_label(traffic_mode)));
     if notify_daily {
         msg.push_str(&format!(
             "\n今日流量：{}",
@@ -737,6 +794,19 @@ dport = 3128
         assert!(!config.stats.enabled);
         assert!(!config.telegram.enabled);
         assert_eq!(config.stats.collect_interval_seconds, 60);
+        assert_eq!(config.stats.traffic_mode, TrafficMode::Both);
+    }
+
+    #[test]
+    fn rejects_invalid_traffic_mode() {
+        let err = TomlConfig::from_toml_str(
+            r#"
+[stats]
+traffic_mode = "sideways"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("stats.traffic_mode must be one of: both, out, in"));
     }
 
     #[test]
@@ -827,6 +897,61 @@ dport = 3128
         assert_eq!(state.daily_total_bytes, 879);
         assert_eq!(state.monthly_total_bytes, 879);
         assert_eq!(state.per_rule_daily_bytes.get("r0"), Some(&879));
+    }
+
+    #[test]
+    fn traffic_mode_controls_counted_delta_but_preserves_raw_counters() {
+        let json = r#"{
+  "nftables": [
+    {"rule": {"family":"ip","table":"self-filter","chain":"FORWARD","handle":10,
+      "expr":[{"counter":{"packets":10,"bytes":200}},{"comment":"nat-traffic:id=r0,dir=out"}]}},
+    {"rule": {"family":"ip","table":"self-filter","chain":"FORWARD","handle":11,
+      "expr":[{"counter":{"packets":50,"bytes":400}},{"comment":"nat-traffic:id=r0,dir=in"}]}}
+  ]
+}"#;
+        let now =
+            NaiveDateTime::parse_from_str("2026-05-17 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let counters = parse_nft_counters(json).unwrap();
+
+        for (mode, expected) in [
+            (TrafficMode::Both, 400),
+            (TrafficMode::Out, 100),
+            (TrafficMode::In, 300),
+        ] {
+            let mut state = StatsState::default();
+            state.last_counters.insert(
+                "r0:out".to_string(),
+                Counter {
+                    packets: 1,
+                    bytes: 100,
+                },
+            );
+            state.last_counters.insert(
+                "r0:in".to_string(),
+                Counter {
+                    packets: 1,
+                    bytes: 100,
+                },
+            );
+            apply_counter_snapshot_with_mode(&mut state, &counters, &HashMap::new(), now, mode);
+            assert_eq!(state.daily_total_bytes, expected);
+            assert_eq!(state.monthly_total_bytes, expected);
+            assert_eq!(state.per_rule_daily_bytes.get("r0"), Some(&expected));
+            assert_eq!(
+                state
+                    .last_counters
+                    .get("r0:out")
+                    .map(|counter| counter.bytes),
+                Some(200)
+            );
+            assert_eq!(
+                state
+                    .last_counters
+                    .get("r0:in")
+                    .map(|counter| counter.bytes),
+                Some(400)
+            );
+        }
     }
 
     #[test]

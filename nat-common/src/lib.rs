@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use std::num::ParseIntError;
 use std::str::FromStr;
 
+pub mod forward_test;
 pub mod logger;
 pub mod stats;
 
@@ -293,6 +294,8 @@ pub struct StatsConfig {
     pub collect_interval_seconds: u64,
     #[serde(default = "default_stats_data_file")]
     pub data_file: String,
+    #[serde(default)]
+    pub traffic_mode: TrafficMode,
 }
 
 impl Default for StatsConfig {
@@ -301,6 +304,51 @@ impl Default for StatsConfig {
             enabled: false,
             collect_interval_seconds: default_collect_interval_seconds(),
             data_file: default_stats_data_file(),
+            traffic_mode: TrafficMode::Both,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrafficMode {
+    #[default]
+    Both,
+    Out,
+    In,
+}
+
+impl Display for TrafficMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrafficMode::Both => write!(f, "both"),
+            TrafficMode::Out => write!(f, "out"),
+            TrafficMode::In => write!(f, "in"),
+        }
+    }
+}
+
+impl Serialize for TrafficMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for TrafficMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "both" => Ok(TrafficMode::Both),
+            "out" => Ok(TrafficMode::Out),
+            "in" => Ok(TrafficMode::In),
+            _ => Err(serde::de::Error::custom(
+                "stats.traffic_mode must be one of: both, out, in",
+            )),
         }
     }
 }

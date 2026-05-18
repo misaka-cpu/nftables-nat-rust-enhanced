@@ -55,6 +55,7 @@
 - 查看 stats
 - 查看本项目 nft 表
 - 白名单 / 黑名单管理入口
+- 每次操作完成后按 Enter 返回主菜单，主菜单会重新清屏绘制
 
 ### Stats 流量统计
 
@@ -65,6 +66,7 @@
 - 不统计 DNAT 新连接包
 - 不统计 POSTROUTING masquerade
 - 不统计 blacklist drop counter
+- 支持 `traffic_mode = "both"` / `"out"` / `"in"` 选择统计口径
 - 支持 `POST /api/stats/collect-now` 立即采集
 
 ### Telegram 通知
@@ -146,6 +148,8 @@ apt update && apt install -y git curl wget ca-certificates build-essential pkg-c
 ```bash
 apt update && apt install -y git curl wget ca-certificates build-essential pkg-config libssl-dev nftables iproute2 iptables procps openssl tar nano && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env" && tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --core-only
 ```
+
+只安装核心服务后，可以通过 `nat --menu` 进入终端管理菜单。
 
 已安装依赖和 Rust 的短版：
 
@@ -417,8 +421,9 @@ comment = "local-redirect"
 
 [stats]
 enabled = true
-collect_interval_seconds = 10
+collect_interval_seconds = 60
 data_file = "/var/lib/nftables-nat-rust/stats.json"
+traffic_mode = "both" # both / out / in
 
 [telegram]
 enabled = false
@@ -442,6 +447,16 @@ fallback_to_system = true
 mode = "off" # off / whitelist / blacklist
 entries = []
 ```
+
+`traffic_mode` 说明：
+
+- `both`：双向统计，`out + in`，默认推荐。
+- `out`：只统计 `client -> VPS -> target`。
+- `in`：只统计 `target -> VPS -> client`。
+- 旧配置不写 `traffic_mode` 也会按 `both` 处理；建议显式写出，方便确认当前统计口径。
+- 如果 VPS/商家按单向流量计费，可根据实际计费方向选择 `out` 或 `in`。
+- 切换 `traffic_mode` 后，历史 daily/monthly 不会自动重算；建议重置今日/月后重新统计。
+- 首次采集可能仅建立 baseline，不会把历史 nft counter 全部算入今日流量。
 
 白名单示例：
 
@@ -507,7 +522,18 @@ nft list table ip6 self-filter
 
 ```bash
 nat --menu
+/usr/local/bin/nat --menu
 nat --menu --toml /etc/nat.toml
+```
+
+核心安装完成后，直接执行 `nat --menu` 即可进入终端管理菜单；如果 PATH 未刷新，也可以使用 `/usr/local/bin/nat --menu`。
+
+菜单中的“测试转发规则连通性”可选择某条规则，查看规则详情、当前 counter baseline、目标 TCP 可达性，并给出外部客户端测试命令。本机直接 `curl 127.0.0.1:监听端口` 通常不能完整验证 DNAT，因为本机流量不一定走 PREROUTING；推荐从另一台机器访问 `服务器IP:监听端口`，再观察 `nat-rule` / `nat-traffic out` / `nat-traffic in` counter 是否增长。
+
+HTTPS/SNI 场景建议使用：
+
+```bash
+curl -vk --connect-to 目标域名:目标端口:服务器IP:监听端口 https://目标域名/
 ```
 
 菜单示例：
@@ -529,6 +555,7 @@ nftables-nat-rust-enhanced 管理菜单
 11) 白名单/黑名单管理
 12) 最近来源 IP 观察
 13) WebUI / BBR / Telegram 状态
+14) 测试转发规则连通性
 0) 退出
 ```
 
@@ -550,6 +577,7 @@ GET  /api/bbr/status
 POST /api/bbr/enable
 
 GET  /api/stats
+POST /api/stats/config
 POST /api/stats/collect-now
 POST /api/stats/reset-daily
 POST /api/stats/reset-monthly
@@ -559,7 +587,12 @@ POST /api/telegram/config
 POST /api/telegram/test
 
 GET  /api/access-control/status
+GET  /api/forward-test/rules
+POST /api/forward-test/check
+POST /api/forward-test/observe
 ```
+
+WebUI 的“规则查看”页包含“转发测试”区域。它只做只读检查和 counter 观察：读取配置、读取 `nft -j list ruleset`、检查 `nat.service` 状态、对 TCP 目标做 3 秒 connect 测试，并生成外部测试命令；不会修改配置、不会执行 `nft -f`、不会重启 systemd。测试完成后可点击“测试完成后刷新统计”调用现有 `POST /api/stats/collect-now` 更新流量统计。
 
 `POST /api/stats/collect-now` 只执行只读 `nft -j list ruleset` 并更新 `stats.json`，不会执行 `nft -f`、不会重启服务、不会改规则、不会发送 Telegram。
 
