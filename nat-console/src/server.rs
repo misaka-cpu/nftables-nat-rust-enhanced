@@ -1,9 +1,9 @@
 use crate::Args;
 use crate::handlers::{
-    AppState, enable_bbr, get_access_control_status, get_bbr_status, get_config, get_current_user,
-    get_rules, get_rules_json, get_stats, get_telegram_status, hybrid_auth_middleware,
-    login_handler, logout_handler, reset_stats_daily, reset_stats_monthly, save_config,
-    test_telegram,
+    AppState, collect_stats_now, enable_bbr, get_access_control_status, get_bbr_status, get_config,
+    get_current_user, get_rules, get_rules_json, get_stats, get_telegram_status,
+    hybrid_auth_middleware, login_handler, logout_handler, reset_stats_daily, reset_stats_monthly,
+    save_config, save_telegram_config, test_telegram,
 };
 use axum::{
     Router,
@@ -12,11 +12,21 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{get, post},
 };
-use axum_bootstrap::TlsParam;
 use axum_bootstrap::jwt::JwtConfig;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use hyper_util::service::TowerToHyperService;
 use log::info;
+use rustls::ServerConfig;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+use tower::Service;
 use tower_http::services::ServeDir;
 
 // 嵌入 HTML 文件
@@ -54,9 +64,11 @@ pub async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error + Se
         .route("/api/bbr/status", get(get_bbr_status))
         .route("/api/bbr/enable", post(enable_bbr))
         .route("/api/stats", get(get_stats))
+        .route("/api/stats/collect-now", post(collect_stats_now))
         .route("/api/stats/reset-daily", post(reset_stats_daily))
         .route("/api/stats/reset-monthly", post(reset_stats_monthly))
         .route("/api/telegram/status", get(get_telegram_status))
+        .route("/api/telegram/config", post(save_telegram_config))
         .route("/api/telegram/test", post(test_telegram))
         .route("/api/access-control/status", get(get_access_control_status))
         .route("/rules", get(get_rules))
@@ -100,26 +112,79 @@ pub async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error + Se
         ))
         .with_state(state);
 
-    // 启动服务器
-    let server =
-        axum_bootstrap::new_server(args.port, app, axum_bootstrap::generate_shutdown_receiver())
-            .with_timeout(Duration::from_secs(600));
+    let bind_addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
 
-    // 如果提供了证书，使用 TLS
-    let server = if let (Some(cert), Some(key)) = (args.cert, args.key) {
-        info!("Starting HTTPS server on port {}", args.port);
-        server.with_tls_param(Some(TlsParam {
-            tls: true,
-            cert,
-            key,
-        }))
+    if let (Some(cert), Some(key)) = (args.cert, args.key) {
+        info!("Starting HTTPS server on {bind_addr}");
+        serve_tls(bind_addr, app, cert, key).await?;
     } else {
-        info!("Starting HTTP server on port {}", args.port);
-        info!("⚠️  Warning: Running without TLS! This is not secure for production.");
-        server
-    };
-
-    server.run().await?;
+        info!("Starting HTTP server on {bind_addr}");
+        info!("Warning: Running without TLS! This is not secure for production.");
+        let listener = TcpListener::bind(bind_addr).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
+    }
 
     Ok(())
+}
+
+fn load_tls_config(key: &str, cert: &str) -> Result<Arc<ServerConfig>, io::Error> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let certs = CertificateDer::pem_file_iter(cert)
+        .map_err(|_| io::Error::other("open cert failed"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| io::Error::other("invalid cert pem"))?;
+    let key = PrivateKeyDer::from_pem_file(key)
+        .map_err(|_| io::Error::other("failed to read private key"))?;
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(io::Error::other)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+async fn serve_tls(
+    bind_addr: SocketAddr,
+    app: Router,
+    cert: String,
+    key: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = TcpListener::bind(bind_addr).await?;
+    let tls_acceptor = TlsAcceptor::from(load_tls_config(&key, &cert)?);
+    loop {
+        let (stream, remote_addr) = listener.accept().await?;
+        let tls_acceptor = tls_acceptor.clone();
+        let mut make_service = app
+            .clone()
+            .into_make_service_with_connect_info::<SocketAddr>();
+
+        tokio::spawn(async move {
+            let tls_stream = match tls_acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    log::warn!("TLS accept error from {remote_addr}: {e}");
+                    return;
+                }
+            };
+            let service = match make_service.call(remote_addr).await {
+                Ok(service) => service,
+                Err(e) => {
+                    log::warn!("build service error from {remote_addr}: {e}");
+                    return;
+                }
+            };
+            let io = TokioIo::new(tls_stream);
+            let service = TowerToHyperService::new(service);
+            if let Err(e) = auto::Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+            {
+                log::warn!("HTTPS connection error from {remote_addr}: {e}");
+            }
+        });
+    }
 }

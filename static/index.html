@@ -683,6 +683,56 @@
             background: #f8f9fa;
             color: #333;
         }
+
+        .telegram-settings {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 16px;
+            margin-bottom: 20px;
+        }
+
+        .telegram-form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .telegram-field {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .telegram-field label {
+            color: #333;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .telegram-input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        .telegram-checks {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            margin-top: 12px;
+            color: #333;
+            font-size: 14px;
+        }
+
+        .telegram-hint {
+            margin-top: 6px;
+            color: #666;
+            font-size: 12px;
+        }
     </style>
 </head>
 <body>
@@ -712,6 +762,9 @@
                     配置格式: <span id="configFormat">-</span>
                 </div>
                 <a href="https://github.com/arloor/nftables-nat-rust/blob/master/README.md#-%E9%85%8D%E7%BD%AE%E8%AF%B4%E6%98%8E" target="_blank" style="color: #1890ff; text-decoration: none; font-size: 14px;">📖 配置说明</a>
+            </div>
+            <div style="margin-bottom: 12px; padding: 10px; border: 1px solid #f5c2c7; background: #f8d7da; color: #842029; border-radius: 6px; font-size: 13px;">
+                配置管理内容可能包含敏感信息，例如 Telegram bot_token，请勿截图或公开分享。
             </div>
 
             <div class="config-editor">
@@ -747,7 +800,7 @@
 
         <div id="statsTab" class="tab-content">
             <div class="actions" style="margin-bottom: 20px;">
-                <button class="btn btn-primary" onclick="loadStats()">🔄 刷新统计</button>
+                <button class="btn btn-primary" onclick="collectStatsNow()">🔄 立即采集并刷新</button>
                 <button class="btn btn-secondary" onclick="resetStatsDaily()">重置今日</button>
                 <button class="btn btn-secondary" onclick="resetStatsMonthly()">重置本月</button>
                 <button class="btn btn-secondary" onclick="testTelegram()">测试 Telegram</button>
@@ -821,6 +874,7 @@
     <script>
         let currentConfig = null;
         let currentFormat = null;
+        let currentTelegram = null;
 
         // 统一的 API 请求函数
         async function apiRequest(endpoint, options = {}) {
@@ -1029,6 +1083,7 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
 
                 const stats = await statsResponse.json();
                 const telegram = await telegramResponse.json();
+                currentTelegram = telegram;
                 const access = await accessResponse.json();
                 const rows = (stats.rules || []).map(rule => `
                     <tr>
@@ -1061,6 +1116,7 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
                             <div style="margin-top: 8px; color: #666;">entries: ${(access.entries || []).length}</div>
                         </div>
                     </div>
+                    ${renderTelegramSettings(telegram)}
                     <div style="margin-bottom: 12px; color: #666;">最近采集: ${escapeHtml(stats.last_collect_time || '-')}</div>
                     <table class="stats-table">
                         <thead>
@@ -1079,6 +1135,109 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
             }
         }
 
+        function renderTelegramSettings(telegram) {
+            return `
+                <div class="telegram-settings">
+                    <div style="display: flex; justify-content: space-between; gap: 12px; align-items: center;">
+                        <div>
+                            <h3 style="margin: 0 0 6px 0;">Telegram 通知</h3>
+                            <div style="color: #666; font-size: 13px;">状态：${telegram.enabled ? '已启用' : '未启用'}，Bot Token：${escapeHtml(telegram.bot_token_masked || '未配置')}</div>
+                        </div>
+                    </div>
+                    <div class="telegram-checks">
+                        <label><input type="checkbox" id="telegramEnabled" ${telegram.enabled ? 'checked' : ''}> 启用 Telegram 通知</label>
+                    </div>
+                    <div class="telegram-form-grid">
+                        <div class="telegram-field">
+                            <label for="telegramBotToken">Bot Token</label>
+                            <input class="telegram-input" id="telegramBotToken" type="password" placeholder="${escapeHtml(telegram.bot_token_masked || '输入新的 bot token')}">
+                            <div class="telegram-hint">留空表示保留已有 token；状态接口不会返回明文 token。</div>
+                        </div>
+                        <div class="telegram-field">
+                            <label for="telegramChatId">Chat ID</label>
+                            <input class="telegram-input" id="telegramChatId" type="text" value="${escapeHtml(telegram.chat_id || '')}">
+                        </div>
+                        <div class="telegram-field">
+                            <label for="telegramInterval">通知间隔</label>
+                            <input class="telegram-input" id="telegramInterval" type="number" min="1" value="${Number(telegram.notify_interval_minutes || 60)}">
+                            <div class="telegram-hint">单位为分钟，最小值 1。</div>
+                        </div>
+                    </div>
+                    <div class="telegram-checks">
+                        <label><input type="checkbox" id="telegramNotifyDaily" ${telegram.notify_daily ? 'checked' : ''}> 通知今日流量</label>
+                        <label><input type="checkbox" id="telegramNotifyMonthly" ${telegram.notify_monthly ? 'checked' : ''}> 通知本月流量</label>
+                    </div>
+                    <div class="actions">
+                        <button class="btn btn-primary" onclick="saveTelegramConfig()">保存 Telegram 配置</button>
+                        <button class="btn btn-secondary" onclick="testTelegram()">测试 Telegram</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        async function readJsonOrText(response) {
+            const text = await response.text();
+            if (!text) {
+                return { data: null, text: '' };
+            }
+            try {
+                return { data: JSON.parse(text), text };
+            } catch (_) {
+                return { data: null, text };
+            }
+        }
+
+        async function saveTelegramConfig() {
+            const enabled = document.getElementById('telegramEnabled').checked;
+            const botToken = document.getElementById('telegramBotToken').value.trim();
+            const chatId = document.getElementById('telegramChatId').value.trim();
+            const interval = Number(document.getElementById('telegramInterval').value);
+            const notifyDaily = document.getElementById('telegramNotifyDaily').checked;
+            const notifyMonthly = document.getElementById('telegramNotifyMonthly').checked;
+
+            if (!Number.isInteger(interval) || interval < 1) {
+                showAlert('通知间隔必须大于等于 1 分钟', true);
+                return;
+            }
+            if (enabled && !chatId) {
+                showAlert('启用 Telegram 前需要填写 Chat ID', true);
+                return;
+            }
+            if (enabled && !botToken && !(currentTelegram && currentTelegram.bot_token_masked)) {
+                showAlert('启用 Telegram 前需要填写 Bot Token', true);
+                return;
+            }
+
+            const payload = {
+                enabled,
+                chat_id: chatId,
+                notify_interval_minutes: interval,
+                notify_daily: notifyDaily,
+                notify_monthly: notifyMonthly
+            };
+            if (botToken) {
+                payload.bot_token = botToken;
+            }
+
+            try {
+                const response = await apiRequest('/api/telegram/config', {
+                    method: 'POST',
+                    body: JSON.stringify(payload)
+                });
+                const { data, text } = await readJsonOrText(response);
+                if (!response.ok) {
+                    throw new Error((data && data.message) || text);
+                }
+                currentTelegram = data.status;
+                showAlert(data.message || 'Telegram 配置已保存。', false);
+                currentConfig = null;
+                await loadConfig();
+                await loadStats();
+            } catch (error) {
+                showAlert('保存 Telegram 配置失败: ' + error.message, true);
+            }
+        }
+
         async function resetStatsDaily() {
             try {
                 const response = await apiRequest('/api/stats/reset-daily', { method: 'POST' });
@@ -1089,6 +1248,19 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
                 await loadStats();
             } catch (error) {
                 showAlert('重置今日统计失败: ' + error.message, true);
+            }
+        }
+
+        async function collectStatsNow() {
+            try {
+                const response = await apiRequest('/api/stats/collect-now', { method: 'POST' });
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+                showAlert('统计已采集并刷新', false);
+                await loadStats();
+            } catch (error) {
+                showAlert('刷新统计失败: ' + error.message, true);
             }
         }
 
@@ -1107,11 +1279,15 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
 
         async function testTelegram() {
             try {
-                const response = await apiRequest('/api/telegram/test', { method: 'POST' });
-                if (!response.ok) {
-                    throw new Error(await response.text());
+                if (currentTelegram && (!currentTelegram.enabled || !currentTelegram.bot_token_masked || !currentTelegram.chat_id)) {
+                    showAlert('请先启用 Telegram 并配置 Bot Token / Chat ID', true);
+                    return;
                 }
-                const data = await response.json();
+                const response = await apiRequest('/api/telegram/test', { method: 'POST' });
+                const { data, text } = await readJsonOrText(response);
+                if (!response.ok) {
+                    throw new Error((data && data.message) || text);
+                }
                 showAlert(data.message, !data.success);
             } catch (error) {
                 showAlert('Telegram 测试失败: ' + error.message, true);
@@ -1128,6 +1304,7 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
             if (tab === 'config') {
                 tabs[0].classList.add('active');
                 document.getElementById('configTab').classList.add('active');
+                loadConfig();
             } else if (tab === 'rules') {
                 tabs[1].classList.add('active');
                 document.getElementById('rulesTab').classList.add('active');

@@ -158,6 +158,20 @@ env_quote() {
     printf '"%s"' "$value"
 }
 
+env_unquote() {
+    local value="$1"
+    value="${value%\"}"
+    value="${value#\"}"
+    printf '%s' "$value"
+}
+
+read_env_value() {
+    local key="$1"
+    if [ -f "$ENV_FILE" ]; then
+        grep -E "^${key}=" "$ENV_FILE" | tail -n1 | cut -d= -f2- || true
+    fi
+}
+
 # 使用说明
 usage() {
     echo "用法: $0 [选项]"
@@ -178,6 +192,7 @@ usage() {
     echo "  - 可通过 NAT_CONSOLE_USERNAME/NAT_CONSOLE_PASSWORD/NAT_CONSOLE_PORT/NAT_CONSOLE_JWT_SECRET/NAT_CONSOLE_BIND 覆盖默认值"
     echo "  - 未指定 NAT_CONSOLE_PASSWORD 时交互选择自定义密码或自动生成随机强密码"
     echo "  - 未指定 NAT_CONSOLE_JWT_SECRET 时自动生成随机 JWT secret"
+    echo "  - 未指定 NAT_CONSOLE_BIND 时交互选择监听地址，默认推荐 127.0.0.1"
     echo "  - 如果未提供证书和私钥，将自动生成自签发证书"
     echo "  - 证书和私钥必须同时提供"
     exit 1
@@ -294,11 +309,69 @@ choose_credentials_interactively() {
     done
 }
 
+prompt_bind_addr() {
+    local choice custom_bind
+    while true; do
+        echo "请选择 WebUI 监听地址："
+        echo "1) 仅本机访问 127.0.0.1，推荐，需 SSH 隧道访问"
+        echo "2) 所有网卡访问 0.0.0.0，适合局域网或已限制防火墙"
+        echo "3) 自定义绑定地址"
+        read -r -p "请输入选择 [1/2/3]: " choice
+        case "${choice:-1}" in
+            1)
+                BIND_ADDR="127.0.0.1"
+                return 0
+                ;;
+            2)
+                BIND_ADDR="0.0.0.0"
+                log_warn "WebUI will listen on all interfaces. Please use a strong password and firewall rules to restrict access."
+                return 0
+                ;;
+            3)
+                read -r -p "请输入 WebUI 绑定地址: " custom_bind
+                if [ -z "$custom_bind" ]; then
+                    log_warn "绑定地址不能为空"
+                    continue
+                fi
+                BIND_ADDR="$custom_bind"
+                return 0
+                ;;
+            *)
+                log_warn "请输入 1、2 或 3"
+                ;;
+        esac
+    done
+}
+
+prepare_bind_addr() {
+    if [ -n "${NAT_CONSOLE_BIND:-}" ]; then
+        BIND_ADDR="$NAT_CONSOLE_BIND"
+        log_info "using WebUI bind address from environment variable"
+    elif [ -f "$ENV_FILE" ]; then
+        local existing_bind
+        existing_bind="$(env_unquote "$(read_env_value NAT_CONSOLE_BIND)")"
+        if [ -n "$existing_bind" ]; then
+            BIND_ADDR="$existing_bind"
+            log_info "preserving existing WebUI bind address from $ENV_FILE"
+        fi
+    elif [ "$NAT_NONINTERACTIVE" = "1" ]; then
+        BIND_ADDR="127.0.0.1"
+        log_info "non-interactive mode: using default WebUI bind address 127.0.0.1"
+    else
+        prompt_bind_addr
+    fi
+
+    BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
+    if [ "$BIND_ADDR" = "0.0.0.0" ]; then
+        log_warn "WebUI will listen on all interfaces. Please use a strong password and firewall rules to restrict access."
+    fi
+}
+
 write_env_file() {
     local should_write=0
     if [ ! -f "$ENV_FILE" ]; then
         should_write=1
-    elif [ "$PASSWORD_SOURCE" != "existing" ] || [ -n "${NAT_CONSOLE_PORT:-}" ] || [ -n "${NAT_CONSOLE_USERNAME:-}" ] || [ -n "${NAT_CONSOLE_JWT_SECRET:-}" ]; then
+    elif [ "$PASSWORD_SOURCE" != "existing" ] || [ -n "${NAT_CONSOLE_PORT:-}" ] || [ -n "${NAT_CONSOLE_BIND:-}" ] || [ -n "${NAT_CONSOLE_USERNAME:-}" ] || [ -n "${NAT_CONSOLE_JWT_SECRET:-}" ]; then
         should_write=1
     fi
 
@@ -307,18 +380,20 @@ write_env_file() {
         return 0
     fi
 
-    local existing_password="" existing_jwt_secret="" existing_username="$USERNAME" existing_port="$PORT"
+    local existing_password="" existing_jwt_secret="" existing_username="$USERNAME" existing_port="$PORT" existing_bind="$BIND_ADDR"
     if [ -f "$ENV_FILE" ]; then
-        existing_password="$(grep -E '^NAT_CONSOLE_PASSWORD=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
-        existing_jwt_secret="$(grep -E '^NAT_CONSOLE_JWT_SECRET=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
-        existing_username="$(grep -E '^NAT_CONSOLE_USERNAME=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
-        existing_port="$(grep -E '^NAT_CONSOLE_PORT=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
+        existing_password="$(env_unquote "$(read_env_value NAT_CONSOLE_PASSWORD)")"
+        existing_jwt_secret="$(env_unquote "$(read_env_value NAT_CONSOLE_JWT_SECRET)")"
+        existing_username="$(env_unquote "$(read_env_value NAT_CONSOLE_USERNAME)")"
+        existing_port="$(env_unquote "$(read_env_value NAT_CONSOLE_PORT)")"
+        existing_bind="$(env_unquote "$(read_env_value NAT_CONSOLE_BIND)")"
     fi
 
     USERNAME="${USERNAME:-${existing_username:-admin}}"
     PASSWORD="${PASSWORD:-$existing_password}"
     JWT_SECRET="${JWT_SECRET:-$existing_jwt_secret}"
     PORT="${PORT:-${existing_port:-5533}}"
+    BIND_ADDR="${BIND_ADDR:-${existing_bind:-127.0.0.1}}"
 
     if [ -z "$PASSWORD" ]; then
         PASSWORD="$(generate_password)"
@@ -332,7 +407,8 @@ write_env_file() {
     fi
 
     install -d -m 700 "$ENV_DIR"
-    cat > "$ENV_FILE" <<EOF
+cat > "$ENV_FILE" <<EOF
+NAT_CONSOLE_BIND=$(env_quote "$BIND_ADDR")
 NAT_CONSOLE_PORT=$(env_quote "$PORT")
 NAT_CONSOLE_USERNAME=$(env_quote "$USERNAME")
 NAT_CONSOLE_PASSWORD=$(env_quote "$PASSWORD")
@@ -371,7 +447,7 @@ echo ""
 
 # 解析命令行参数
 PORT="${NAT_CONSOLE_PORT:-5533}"
-BIND_ADDR="${NAT_CONSOLE_BIND:-0.0.0.0}"
+BIND_ADDR="${NAT_CONSOLE_BIND:-}"
 USER_CERT_FILE=""
 USER_KEY_FILE=""
 
@@ -466,6 +542,7 @@ else
     fi
 fi
 
+prepare_bind_addr
 prepare_credentials
 write_env_file
 
@@ -476,9 +553,9 @@ echo "  WebUI 端口: $PORT"
 echo "  WebUI 绑定地址: $BIND_ADDR"
 echo "  登录用户名: $USERNAME"
 if [ "$BIND_ADDR" = "0.0.0.0" ]; then
-    log_warn "WebUI 将对所有网卡监听，请确保防火墙和密码强度足够"
+    log_warn "WebUI will listen on all interfaces. Please use a strong password and firewall rules to restrict access."
 else
-    log_info "NAT_CONSOLE_BIND 当前用于安装提示；nat-console 运行时监听行为取决于程序默认绑定"
+    log_info "WebUI 将监听 $BIND_ADDR"
 fi
 echo "========================================="
 echo ""
@@ -494,7 +571,7 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
-ExecStart=$INSTALL_PATH --port \${NAT_CONSOLE_PORT} --cert \${NAT_CONSOLE_CERT} --key \${NAT_CONSOLE_KEY}
+ExecStart=$INSTALL_PATH
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -540,7 +617,15 @@ echo "  开机自启: systemctl enable nat-console"
 echo "  查看日志: journalctl -u nat-console -f"
 echo ""
 echo "WebUI 配置:"
-echo "  访问地址: https://localhost:$PORT"
+if [ "$BIND_ADDR" = "127.0.0.1" ] || [ "$BIND_ADDR" = "localhost" ]; then
+    echo "  访问地址: https://127.0.0.1:$PORT"
+    echo "  SSH 隧道示例: ssh -p <SSH_PORT> -L $PORT:127.0.0.1:$PORT root@VPS_IP"
+elif [ "$BIND_ADDR" = "0.0.0.0" ]; then
+    echo "  访问地址: https://服务器IP:$PORT"
+    echo "  提示: 请务必使用防火墙或安全组限制访问来源。"
+else
+    echo "  访问地址: https://$BIND_ADDR:$PORT"
+fi
 echo "  用户名: $USERNAME"
 case "$PASSWORD_SOURCE" in
     generated)

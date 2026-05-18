@@ -81,7 +81,8 @@ dry_run_console_install() {
     log_dry_run "would not put --password or --jwt-secret in ExecStart"
     log_dry_run "would use NAT_CONSOLE_USERNAME or default admin"
     log_dry_run "would use NAT_CONSOLE_PORT or default 5533"
-    log_dry_run "would use NAT_CONSOLE_BIND or default 0.0.0.0 and warn about exposure"
+    log_dry_run "would use NAT_CONSOLE_BIND or ask user to choose WebUI bind address"
+    log_dry_run "would default to 127.0.0.1 for SSH tunnel access"
     if [ -n "${NAT_CONSOLE_PASSWORD:-}" ]; then
         log_dry_run "would use password from NAT_CONSOLE_PASSWORD"
     else
@@ -93,6 +94,7 @@ dry_run_console_install() {
         log_dry_run "would generate random JWT secret"
     fi
     log_dry_run "would create /opt/nat-console/env with mode 600"
+    log_dry_run "would write NAT_CONSOLE_BIND to /opt/nat-console/env"
     log_dry_run "would not print JWT secret"
     log_dry_run "would enable nat-console.service"
     log_dry_run "would preserve existing /etc/ssl/nat-webui.crt if present"

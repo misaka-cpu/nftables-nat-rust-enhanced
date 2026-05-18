@@ -229,7 +229,7 @@ impl<'de> Deserialize<'de> for Protocol {
 }
 
 // TOML配置结构定义
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TomlConfig {
     #[serde(default)]
     pub rules: Vec<NftCell>,

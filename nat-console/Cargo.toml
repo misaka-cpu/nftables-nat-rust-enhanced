@@ -25,7 +25,10 @@ nat-common = { path = "../nat-common" }
 axum.workspace = true
 axum-bootstrap.workspace = true
 axum-extra.workspace = true
+hyper = { version = "1", features = ["server"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
 tokio.workspace = true
+tokio-rustls = "0.26"
 tower.workspace = true
 tower-http.workspace = true
 
@@ -35,6 +38,7 @@ bcrypt.workspace = true
 
 # TLS/加密
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
+rustls-pki-types = "1"
 
 # 其他
 anyhow = "1.0"

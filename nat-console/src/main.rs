@@ -15,6 +15,10 @@ struct Args {
     #[arg(short, long, default_value = "8080")]
     port: u16,
 
+    /// 监听地址
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+
     /// 用户名
     #[arg(short, long, default_value = "admin")]
     username: String,
@@ -54,11 +58,29 @@ async fn main() -> Result<(), DynError> {
     {
         args.username = username;
     }
+    if let Ok(bind) = env::var("NAT_CONSOLE_BIND")
+        && args.bind == "127.0.0.1"
+    {
+        args.bind = bind;
+    }
+    if let Ok(port) = env::var("NAT_CONSOLE_PORT")
+        && args.port == 8080
+    {
+        args.port = port
+            .parse()
+            .map_err(|_| "NAT_CONSOLE_PORT must be a valid u16 port")?;
+    }
     if args.password.is_empty() {
         args.password = env::var("NAT_CONSOLE_PASSWORD").unwrap_or_default();
     }
     if args.jwt_secret.is_empty() {
         args.jwt_secret = env::var("NAT_CONSOLE_JWT_SECRET").unwrap_or_default();
+    }
+    if args.cert.is_none() {
+        args.cert = env::var("NAT_CONSOLE_CERT").ok();
+    }
+    if args.key.is_none() {
+        args.key = env::var("NAT_CONSOLE_KEY").ok();
     }
     if args.password.is_empty() {
         error!("NAT_CONSOLE_PASSWORD or --password is required");
@@ -69,7 +91,7 @@ async fn main() -> Result<(), DynError> {
         return Err("NAT_CONSOLE_JWT_SECRET or --jwt-secret is required".into());
     }
 
-    info!("Starting WebUI server on port {}", args.port);
+    info!("Starting WebUI server on {}:{}", args.bind, args.port);
     info!("Username: {}", args.username);
 
     server::run_server(args).await?;

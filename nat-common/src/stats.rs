@@ -1,4 +1,4 @@
-use crate::{StatsConfig, TelegramConfig};
+use crate::{NftCell, StatsConfig, TelegramConfig, TomlConfig};
 use chrono::{Local, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -135,10 +135,9 @@ pub fn parse_nft_counters(json: &str) -> Result<Vec<RuleCounter>, String> {
         let Some((id, counter_id)) = traffic_rule_ids(&comment) else {
             continue;
         };
-        let label = friendly_rule_label(&id);
         counters.push(RuleCounter {
+            label: id.clone(),
             id,
-            label,
             counter_id: counter_id
                 .unwrap_or_else(|| format!("{family}/{table}/{chain}/handle/{handle}")),
             packets: counter.packets,
@@ -153,22 +152,15 @@ fn traffic_rule_ids(comment: &str) -> Option<(String, Option<String>)> {
     let payload = comment.strip_prefix("nat-traffic:")?;
     let fields = parse_nat_rule_comment(payload);
     let direction = fields
-        .get("direction")
+        .get("dir")
+        .or_else(|| fields.get("direction"))
         .map(String::as_str)
         .unwrap_or("unknown");
-    let mut rule_payload = Vec::new();
-    for key in [
-        "index", "type", "sport", "target", "dport", "proto", "comment",
-    ] {
-        if let Some(value) = fields.get(key) {
-            rule_payload.push(format!("{key}={value}"));
-        }
-    }
-    if rule_payload.is_empty() {
-        return None;
-    }
-    let id = format!("nat-rule:{}", rule_payload.join(","));
-    let counter_id = format!("{id},direction={direction}");
+    let id = fields
+        .get("id")
+        .cloned()
+        .or_else(|| fields.get("index").map(|index| format!("r{index}")))?;
+    let counter_id = format!("{id}:{direction}");
     Some((id, Some(counter_id)))
 }
 
@@ -210,9 +202,7 @@ fn find_counter_and_comment(
                 map.get("comment")
                     .and_then(|value| value.get("comment"))
                     .and_then(Value::as_str)
-            }) && (comment.is_none()
-                || comment_value.starts_with("nat-traffic:")
-                || comment_value.starts_with("nat-rule:"))
+            }) && (comment.is_none() || comment_value.starts_with("nat-traffic:"))
             {
                 *comment = Some(comment_value.to_string());
             }
@@ -224,22 +214,6 @@ fn find_counter_and_comment(
     }
 }
 
-fn friendly_rule_label(comment: &str) -> String {
-    let Some(payload) = comment.strip_prefix("nat-rule:") else {
-        return comment.to_string();
-    };
-    let fields = parse_nat_rule_comment(payload);
-    let sport = fields.get("sport").map(String::as_str).unwrap_or("?");
-    let target = fields.get("target").map(String::as_str).unwrap_or("?");
-    let dport = fields.get("dport").map(String::as_str).unwrap_or("?");
-    let proto = fields.get("proto").map(String::as_str).unwrap_or("all");
-    let route = format!("{sport} -> {target}:{dport}/{proto}");
-    match fields.get("comment").filter(|value| !value.is_empty()) {
-        Some(comment) => format!("{comment}: {route}"),
-        None => route,
-    }
-}
-
 fn parse_nat_rule_comment(payload: &str) -> HashMap<String, String> {
     payload
         .split(',')
@@ -248,6 +222,66 @@ fn parse_nat_rule_comment(payload: &str) -> HashMap<String, String> {
             Some((key.to_string(), value.to_string()))
         })
         .collect()
+}
+
+pub fn rule_labels_from_config(config: &TomlConfig) -> HashMap<String, String> {
+    config
+        .rules
+        .iter()
+        .enumerate()
+        .filter_map(|(index, rule)| rule_to_label(rule).map(|label| (format!("r{index}"), label)))
+        .collect()
+}
+
+fn rule_to_label(rule: &NftCell) -> Option<String> {
+    match rule {
+        NftCell::Single {
+            sport,
+            dport,
+            domain,
+            protocol,
+            comment,
+            ..
+        } => Some(label_with_comment(
+            comment,
+            &format!("{sport} -> {domain}:{dport}/{protocol}"),
+        )),
+        NftCell::Range {
+            port_start,
+            port_end,
+            domain,
+            protocol,
+            comment,
+            ..
+        } => Some(label_with_comment(
+            comment,
+            &format!("{port_start}-{port_end} -> {domain}:{port_start}-{port_end}/{protocol}"),
+        )),
+        NftCell::Redirect {
+            src_port,
+            src_port_end,
+            dst_port,
+            protocol,
+            comment,
+            ..
+        } => {
+            let sport = src_port_end
+                .map(|end| format!("{src_port}-{end}"))
+                .unwrap_or_else(|| src_port.to_string());
+            Some(label_with_comment(
+                comment,
+                &format!("{sport} -> localhost:{dst_port}/{protocol}"),
+            ))
+        }
+        NftCell::Drop { .. } => None,
+    }
+}
+
+fn label_with_comment(comment: &Option<String>, route: &str) -> String {
+    match comment.as_ref().filter(|comment| !comment.is_empty()) {
+        Some(comment) => format!("{comment}: {route}"),
+        None => route.to_string(),
+    }
 }
 
 pub fn load_state(path: &str) -> StatsState {
@@ -287,6 +321,7 @@ pub fn ensure_state_file(path: &str) -> Result<StatsState, io::Error> {
 pub fn apply_counter_snapshot(
     state: &mut StatsState,
     counters: &[RuleCounter],
+    labels: &HashMap<String, String>,
     now: NaiveDateTime,
 ) {
     let day = now.format("%Y-%m-%d").to_string();
@@ -303,15 +338,18 @@ pub fn apply_counter_snapshot(
     }
 
     for rule in counters {
-        let previous = state
-            .last_counters
-            .get(&rule.counter_id)
-            .cloned()
-            .unwrap_or_default();
-        let delta = if rule.bytes >= previous.bytes {
-            rule.bytes - previous.bytes
-        } else {
-            rule.bytes
+        let delta = match state.last_counters.get(&rule.counter_id).cloned() {
+            Some(previous) if rule.bytes >= previous.bytes => rule.bytes - previous.bytes,
+            Some(previous) => {
+                log::warn!(
+                    "counter reset detected for {}: previous={} current={}",
+                    rule.counter_id,
+                    previous.bytes,
+                    rule.bytes
+                );
+                0
+            }
+            None => 0,
         };
         state.daily_total_bytes = state.daily_total_bytes.saturating_add(delta);
         state.monthly_total_bytes = state.monthly_total_bytes.saturating_add(delta);
@@ -323,9 +361,13 @@ pub fn apply_counter_snapshot(
             .per_rule_monthly_bytes
             .entry(rule.id.clone())
             .or_default() += delta;
-        state
-            .rule_labels
-            .insert(rule.id.clone(), rule.label.clone());
+        state.rule_labels.insert(
+            rule.id.clone(),
+            labels
+                .get(&rule.id)
+                .cloned()
+                .unwrap_or_else(|| rule.label.clone()),
+        );
         state.last_counters.insert(
             rule.counter_id.clone(),
             Counter {
@@ -343,9 +385,18 @@ pub fn collect_from_nft_json(
     json: &str,
     now: NaiveDateTime,
 ) -> Result<StatsState, String> {
+    collect_from_nft_json_with_labels(path, json, &HashMap::new(), now)
+}
+
+pub fn collect_from_nft_json_with_labels(
+    path: &str,
+    json: &str,
+    labels: &HashMap<String, String>,
+    now: NaiveDateTime,
+) -> Result<StatsState, String> {
     let counters = parse_nft_counters(json)?;
     let mut state = load_state(path);
-    apply_counter_snapshot(&mut state, &counters, now);
+    apply_counter_snapshot(&mut state, &counters, labels, now);
     save_state(path, &state).map_err(|e| format!("保存统计状态失败: {e}"))?;
     Ok(state)
 }
@@ -545,7 +596,7 @@ mod tests {
             r#"{{
   "nftables": [
     {{"rule": {{"family":"ip","table":"self-filter","chain":"FORWARD","handle":10,
-      "expr":[{{"counter":{{"packets":2,"bytes":{bytes}}}}},{{"comment":"nat-traffic:direction=out,index=0,type=single,sport=30001,target=example.com,dport=443,proto=tcp,comment=stats-test-http"}}]}}}},
+      "expr":[{{"counter":{{"packets":2,"bytes":{bytes}}}}},{{"comment":"nat-traffic:id=r0,dir=out"}}]}}}},
     {{"rule": {{"family":"ip","table":"other","chain":"X","handle":1,
       "expr":[{{"counter":{{"packets":1,"bytes":999}}}}]}}}}
   ]
@@ -558,18 +609,9 @@ mod tests {
         let counters = parse_nft_counters(&sample_json(1234)).unwrap();
         assert_eq!(counters.len(), 1);
         assert_eq!(counters[0].bytes, 1234);
-        assert_eq!(
-            counters[0].id,
-            "nat-rule:index=0,type=single,sport=30001,target=example.com,dport=443,proto=tcp,comment=stats-test-http"
-        );
-        assert_eq!(
-            counters[0].label,
-            "stats-test-http: 30001 -> example.com:443/tcp"
-        );
-        assert_eq!(
-            counters[0].counter_id,
-            "nat-rule:index=0,type=single,sport=30001,target=example.com,dport=443,proto=tcp,comment=stats-test-http,direction=out"
-        );
+        assert_eq!(counters[0].id, "r0");
+        assert_eq!(counters[0].label, "r0");
+        assert_eq!(counters[0].counter_id, "r0:out");
     }
 
     #[test]
@@ -580,11 +622,11 @@ mod tests {
         let counters2 = parse_nft_counters(&sample_json(1500)).unwrap();
         let counters3 = parse_nft_counters(&sample_json(200)).unwrap();
         let mut state = StatsState::default();
-        apply_counter_snapshot(&mut state, &counters1, now);
-        apply_counter_snapshot(&mut state, &counters2, now);
-        apply_counter_snapshot(&mut state, &counters3, now);
-        assert_eq!(state.daily_total_bytes, 1700);
-        assert_eq!(state.monthly_total_bytes, 1700);
+        apply_counter_snapshot(&mut state, &counters1, &HashMap::new(), now);
+        apply_counter_snapshot(&mut state, &counters2, &HashMap::new(), now);
+        apply_counter_snapshot(&mut state, &counters3, &HashMap::new(), now);
+        assert_eq!(state.daily_total_bytes, 500);
+        assert_eq!(state.monthly_total_bytes, 500);
     }
 
     #[test]
@@ -597,10 +639,10 @@ mod tests {
             NaiveDateTime::parse_from_str("2026-06-01 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
         let counters = parse_nft_counters(&sample_json(100)).unwrap();
         let mut state = StatsState::default();
-        apply_counter_snapshot(&mut state, &counters, day1);
-        apply_counter_snapshot(&mut state, &counters, day2);
+        apply_counter_snapshot(&mut state, &counters, &HashMap::new(), day1);
+        apply_counter_snapshot(&mut state, &counters, &HashMap::new(), day2);
         assert_eq!(state.daily_total_bytes, 0);
-        apply_counter_snapshot(&mut state, &counters, month2);
+        apply_counter_snapshot(&mut state, &counters, &HashMap::new(), month2);
         assert_eq!(state.monthly_total_bytes, 0);
     }
 
@@ -629,6 +671,28 @@ mod tests {
         assert!(msg.contains("NAT 流量统计"));
         assert!(msg.contains("1.00 MB"));
         assert!(msg.contains("30001 -> example.com:443"));
+    }
+
+    #[test]
+    fn builds_friendly_labels_from_toml_config() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+[[rules]]
+type = "single"
+sport = 34120
+dport = 44336
+domain = "example.com"
+protocol = "all"
+ip_version = "ipv4"
+comment = "https"
+"#,
+        )
+        .unwrap();
+        let labels = rule_labels_from_config(&config);
+        assert_eq!(
+            labels.get("r0").map(String::as_str),
+            Some("https: 34120 -> example.com:44336/all")
+        );
     }
 
     #[test]
@@ -680,14 +744,18 @@ dport = 3128
         let json = r#"{
   "nftables": [
     {"rule": {"family":"ip","table":"self-nat","chain":"PREROUTING","handle":3,
-      "expr":[{"counter":{"packets":1,"bytes":52}},{"dnat":{"addr":"1.2.3.4","port":80}},{"comment":"nat-rule:index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp,comment=stats-test-http"}]}}
+      "expr":[{"counter":{"packets":1,"bytes":52}},{"dnat":{"addr":"1.2.3.4","port":80}},{"comment":"r0"}]}}
   ]
 }"#;
         let now =
             NaiveDateTime::parse_from_str("2026-05-17 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
         let mut state = StatsState::default();
         let counters = parse_nft_counters(json).unwrap();
-        apply_counter_snapshot(&mut state, &counters, now);
+        let labels = HashMap::from([(
+            "r0".to_string(),
+            "stats-test-http: 30080 -> example.com:80/tcp".to_string(),
+        )]);
+        apply_counter_snapshot(&mut state, &counters, &labels, now);
 
         assert!(counters.is_empty());
         assert_eq!(state.daily_total_bytes, 0);
@@ -699,28 +767,92 @@ dport = 3128
         let json = r#"{
   "nftables": [
     {"rule": {"family":"ip","table":"self-filter","chain":"FORWARD","handle":10,
-      "expr":[{"counter":{"packets":10,"bytes":1000}},{"comment":"nat-traffic:direction=out,index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp,comment=stats-test-http"}]}},
+      "expr":[{"counter":{"packets":10,"bytes":1000}},{"comment":"nat-traffic:id=r0,dir=out"}]}},
     {"rule": {"family":"ip","table":"self-filter","chain":"FORWARD","handle":11,
-      "expr":[{"counter":{"packets":50,"bytes":5000}},{"comment":"nat-traffic:direction=in,index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp,comment=stats-test-http"}]}}
+      "expr":[{"counter":{"packets":50,"bytes":5000}},{"comment":"nat-traffic:id=r0,dir=in"}]}}
   ]
 }"#;
         let now =
             NaiveDateTime::parse_from_str("2026-05-17 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
         let mut state = StatsState::default();
         let counters = parse_nft_counters(json).unwrap();
-        apply_counter_snapshot(&mut state, &counters, now);
+        let labels = HashMap::from([(
+            "r0".to_string(),
+            "stats-test-http: 30080 -> example.com:80/tcp".to_string(),
+        )]);
+        apply_counter_snapshot(&mut state, &counters, &labels, now);
 
         assert_eq!(counters.len(), 2);
-        assert_eq!(state.daily_total_bytes, 6000);
-        assert_eq!(state.monthly_total_bytes, 6000);
-        assert_eq!(state.rules[0].daily_bytes, 6000);
-        assert_eq!(
-            state.rules[0].id,
-            "nat-rule:index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp,comment=stats-test-http"
-        );
+        assert_eq!(state.daily_total_bytes, 0);
+        assert_eq!(state.monthly_total_bytes, 0);
+        assert_eq!(state.rules[0].daily_bytes, 0);
+        assert_eq!(state.rules[0].id, "r0");
         assert_eq!(
             state.rules[0].label,
             "stats-test-http: 30080 -> example.com:80/tcp"
+        );
+    }
+
+    #[test]
+    fn traffic_counter_delta_uses_previous_baseline() {
+        let json = r#"{
+  "nftables": [
+    {"rule": {"family":"ip","table":"self-filter","chain":"FORWARD","handle":10,
+      "expr":[{"counter":{"packets":10,"bytes":823}},{"comment":"nat-traffic:id=r0,dir=out"}]}},
+    {"rule": {"family":"ip","table":"self-filter","chain":"FORWARD","handle":11,
+      "expr":[{"counter":{"packets":50,"bytes":476}},{"comment":"nat-traffic:id=r0,dir=in"}]}}
+  ]
+}"#;
+        let now =
+            NaiveDateTime::parse_from_str("2026-05-17 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let counters = parse_nft_counters(json).unwrap();
+        let mut state = StatsState::default();
+        state.last_counters.insert(
+            "r0:out".to_string(),
+            Counter {
+                packets: 1,
+                bytes: 288,
+            },
+        );
+        state.last_counters.insert(
+            "r0:in".to_string(),
+            Counter {
+                packets: 1,
+                bytes: 132,
+            },
+        );
+
+        apply_counter_snapshot(&mut state, &counters, &HashMap::new(), now);
+
+        assert_eq!(state.daily_total_bytes, 879);
+        assert_eq!(state.monthly_total_bytes, 879);
+        assert_eq!(state.per_rule_daily_bytes.get("r0"), Some(&879));
+    }
+
+    #[test]
+    fn counter_reset_does_not_add_current_value() {
+        let json = r#"{"nftables":[
+  {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":7,
+  "expr":[{"counter":{"packets":1,"bytes":100}},{"comment":"nat-traffic:id=r0,dir=out"}]}}
+]}"#;
+        let now =
+            NaiveDateTime::parse_from_str("2026-05-17 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let counters = parse_nft_counters(json).unwrap();
+        let mut state = StatsState::default();
+        state.last_counters.insert(
+            "r0:out".to_string(),
+            Counter {
+                packets: 10,
+                bytes: 1000,
+            },
+        );
+
+        apply_counter_snapshot(&mut state, &counters, &HashMap::new(), now);
+
+        assert_eq!(state.daily_total_bytes, 0);
+        assert_eq!(
+            state.last_counters.get("r0:out").map(|c| c.bytes),
+            Some(100)
         );
     }
 
@@ -729,22 +861,22 @@ dport = 3128
         let json = r#"{
   "nftables": [
     {"rule": {"family":"ip","table":"self-nat","chain":"PREROUTING","handle":3,
-      "expr":[{"counter":{"packets":1,"bytes":52}},{"dnat":{"addr":"1.2.3.4","port":80}},{"comment":"nat-rule:index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp,comment=stats-test-http"}]}},
+      "expr":[{"counter":{"packets":1,"bytes":52}},{"dnat":{"addr":"1.2.3.4","port":80}},{"comment":"r0"}]}},
     {"rule": {"family":"ip","table":"self-nat","chain":"POSTROUTING","handle":4,
       "expr":[{"counter":{"packets":1,"bytes":52}},{"masquerade":null},{"comment":"SINGLE,30080,80,example.com,tcp,ipv4"}]}},
     {"rule": {"family":"ip","table":"self-filter","chain":"FORWARD","handle":10,
-      "expr":[{"counter":{"packets":10,"bytes":1000}},{"comment":"nat-traffic:direction=out,index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp,comment=stats-test-http"}]}},
+      "expr":[{"counter":{"packets":10,"bytes":1000}},{"comment":"nat-traffic:id=r0,dir=out"}]}},
     {"rule": {"family":"ip","table":"self-filter","chain":"FORWARD","handle":11,
-      "expr":[{"counter":{"packets":50,"bytes":5000}},{"comment":"nat-traffic:direction=in,index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp,comment=stats-test-http"}]}}
+      "expr":[{"counter":{"packets":50,"bytes":5000}},{"comment":"nat-traffic:id=r0,dir=in"}]}}
   ]
 }"#;
         let now =
             NaiveDateTime::parse_from_str("2026-05-17 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
         let mut state = StatsState::default();
         let counters = parse_nft_counters(json).unwrap();
-        apply_counter_snapshot(&mut state, &counters, now);
+        apply_counter_snapshot(&mut state, &counters, &HashMap::new(), now);
 
-        assert_eq!(state.daily_total_bytes, 6000);
+        assert_eq!(state.daily_total_bytes, 0);
         assert_ne!(state.daily_total_bytes, 52);
         assert_ne!(state.daily_total_bytes, 104);
         assert_ne!(state.daily_total_bytes, 6104);
@@ -755,21 +887,15 @@ dport = 3128
         let json = r#"{
   "nftables": [
     {"rule": {"family":"ip","table":"self-filter","chain":"FORWARD","handle":3,
-      "comment":"nat-traffic:direction=out,index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp,comment=stats-test-http",
+      "comment":"nat-traffic:id=r0,dir=out",
       "expr":[{"counter":{"packets":2,"bytes":260}}]}}
   ]
 }"#;
         let counters = parse_nft_counters(json).unwrap();
 
         assert_eq!(counters.len(), 1);
-        assert_eq!(
-            counters[0].id,
-            "nat-rule:index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp,comment=stats-test-http"
-        );
-        assert_eq!(
-            counters[0].label,
-            "stats-test-http: 30080 -> example.com:80/tcp"
-        );
+        assert_eq!(counters[0].id, "r0");
+        assert_eq!(counters[0].label, "r0");
     }
 
     #[test]
@@ -777,28 +903,25 @@ dport = 3128
         let json = r#"{
   "nftables": [
     {"rule": {"family":"ip","table":"self-filter","chain":"FORWARD","handle":3,
-      "expr":[{"counter":{"packets":2,"bytes":260}},{"comment":"nat-traffic:direction=in,index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp"}]}}
+      "expr":[{"counter":{"packets":2,"bytes":260}},{"comment":"nat-traffic:id=r0,dir=in"}]}}
   ]
 }"#;
         let counters = parse_nft_counters(json).unwrap();
 
         assert_eq!(counters.len(), 1);
-        assert_eq!(
-            counters[0].id,
-            "nat-rule:index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp"
-        );
-        assert_eq!(counters[0].label, "30080 -> example.com:80/tcp");
+        assert_eq!(counters[0].id, "r0");
+        assert_eq!(counters[0].label, "r0");
     }
 
     #[test]
     fn comment_id_survives_handle_changes() {
         let json1 = r#"{"nftables":[
   {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":3,
-  "expr":[{"counter":{"packets":1,"bytes":100}},{"comment":"nat-traffic:direction=out,index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp"}]}}
+  "expr":[{"counter":{"packets":1,"bytes":100}},{"comment":"nat-traffic:id=r0,dir=out"}]}}
 ]}"#;
         let json2 = r#"{"nftables":[
   {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":9,
-  "expr":[{"counter":{"packets":2,"bytes":150}},{"comment":"nat-traffic:direction=out,index=0,type=single,sport=30080,target=example.com,dport=80,proto=tcp"}]}}
+  "expr":[{"counter":{"packets":2,"bytes":150}},{"comment":"nat-traffic:id=r0,dir=out"}]}}
 ]}"#;
         let now =
             NaiveDateTime::parse_from_str("2026-05-17 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
@@ -807,11 +930,11 @@ dport = 3128
         let counters2 = parse_nft_counters(json2).unwrap();
         assert_eq!(counters1[0].id, counters2[0].id);
 
-        apply_counter_snapshot(&mut state, &counters1, now);
-        apply_counter_snapshot(&mut state, &counters2, now);
+        apply_counter_snapshot(&mut state, &counters1, &HashMap::new(), now);
+        apply_counter_snapshot(&mut state, &counters2, &HashMap::new(), now);
 
         assert_eq!(state.last_counters.len(), 1);
-        assert_eq!(state.daily_total_bytes, 150);
+        assert_eq!(state.daily_total_bytes, 50);
     }
 
     #[test]
@@ -829,15 +952,15 @@ dport = 3128
     fn parses_udp_and_ipv6_traffic_counters() {
         let json = r#"{"nftables":[
   {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":7,
-  "expr":[{"counter":{"packets":1,"bytes":42}},{"comment":"nat-traffic:direction=out,index=1,type=single,sport=30053,target=1.2.3.4,dport=53,proto=udp"}]}},
+  "expr":[{"counter":{"packets":1,"bytes":42}},{"comment":"nat-traffic:id=r1,dir=out"}]}},
   {"rule":{"family":"ip6","table":"self-filter","chain":"FORWARD","handle":8,
-  "expr":[{"counter":{"packets":2,"bytes":84}},{"comment":"nat-traffic:direction=out,index=2,type=single,sport=30443,target=2001:db8::1,dport=443,proto=tcp"}]}}
+  "expr":[{"counter":{"packets":2,"bytes":84}},{"comment":"nat-traffic:id=r2,dir=out"}]}}
 ]}"#;
         let counters = parse_nft_counters(json).unwrap();
 
         assert_eq!(counters.len(), 2);
-        assert_eq!(counters[0].label, "30053 -> 1.2.3.4:53/udp");
-        assert_eq!(counters[1].label, "30443 -> 2001:db8::1:443/tcp");
+        assert_eq!(counters[0].label, "r1");
+        assert_eq!(counters[1].label, "r2");
     }
 
     #[test]

@@ -550,31 +550,14 @@ fn build_redirect_rule(
 
 fn nat_rule_comment(
     rule_index: Option<usize>,
-    rule_type: &str,
-    sport: &str,
-    target: &str,
-    dport: &str,
-    protocol: &Protocol,
-    user_comment: Option<&str>,
+    _rule_type: &str,
+    _sport: &str,
+    _target: &str,
+    _dport: &str,
+    _protocol: &Protocol,
+    _user_comment: Option<&str>,
 ) -> String {
-    let mut comment = format!(
-        "nat-rule:index={},type={},sport={},target={},dport={},proto={}",
-        rule_index
-            .map(|index| index.to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
-        sanitize_comment_value(rule_type),
-        sanitize_comment_value(sport),
-        sanitize_comment_value(target),
-        sanitize_comment_value(dport),
-        sanitize_comment_value(&protocol.to_string())
-    );
-    if let Some(user_comment) = user_comment
-        && !user_comment.is_empty()
-    {
-        comment.push_str(",comment=");
-        comment.push_str(&sanitize_comment_value(user_comment));
-    }
-    comment
+    format!("nat-rule:id={}", short_rule_id(rule_index))
 }
 
 fn build_traffic_counter_rules(
@@ -594,10 +577,10 @@ fn build_traffic_counter_rules(
 }
 
 fn nat_traffic_comment(nat_rule_comment: &str, direction: &str) -> String {
-    let payload = nat_rule_comment
-        .strip_prefix("nat-rule:")
-        .unwrap_or(nat_rule_comment);
-    format!("nat-traffic:direction={direction},{payload}")
+    let id = nat_rule_comment
+        .strip_prefix("nat-rule:id=")
+        .unwrap_or("unknown");
+    format!("nat-traffic:id={id},dir={direction}")
 }
 
 fn access_condition(family: &str, config: &AccessControlConfig) -> Option<String> {
@@ -647,19 +630,13 @@ fn access_entry_is_ipv6(entry: &str) -> bool {
 }
 
 fn nat_access_comment(mode: &str, rule_index: Option<usize>) -> String {
-    format!(
-        "nat-access:mode={mode},rule={}",
-        rule_index
-            .map(|index| index.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    )
+    format!("nat-access:id={},mode={mode}", short_rule_id(rule_index))
 }
 
-fn sanitize_comment_value(value: &str) -> String {
-    value
-        .replace('\\', "/")
-        .replace('"', "'")
-        .replace([',', '\n'], " ")
+fn short_rule_id(rule_index: Option<usize>) -> String {
+    rule_index
+        .map(|index| format!("r{index}"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// 解析一行legacy配置，返回RuntimeCell或错误
@@ -922,6 +899,90 @@ mod redirect_parse_tests {
 #[cfg(test)]
 mod redirect_build_tests {
     use super::*;
+
+    fn nft_comment_values(script: &str) -> Vec<&str> {
+        script
+            .split("comment \"")
+            .skip(1)
+            .filter_map(|part| part.split('"').next())
+            .collect()
+    }
+
+    #[test]
+    fn generated_nft_comments_are_short_stable_ids() {
+        let long_comment = "x".repeat(300);
+        let cell = NftCell::Single {
+            sport: 34120,
+            dport: 44336,
+            domain: "93.184.216.34".to_string(),
+            protocol: Protocol::All,
+            ip_version: IpVersion::V4,
+            comment: Some(long_comment.clone()),
+        };
+        let access = AccessControlConfig {
+            mode: AccessControlMode::Blacklist,
+            entries: vec!["1.2.3.4".to_string()],
+        };
+
+        let result = cell
+            .build_with_rule_index(Some(0), &DnsConfig::default(), &access)
+            .unwrap();
+        let comments = nft_comment_values(&result);
+
+        assert!(comments.iter().all(|comment| comment.len() <= 120));
+        assert!(comments.contains(&"nat-rule:id=r0"));
+        assert!(comments.contains(&"nat-traffic:id=r0,dir=out"));
+        assert!(comments.contains(&"nat-traffic:id=r0,dir=in"));
+        assert!(comments.contains(&"nat-access:id=r0,mode=blacklist"));
+        assert!(!result.contains(&long_comment));
+    }
+
+    #[test]
+    fn chinese_user_comment_is_not_written_to_nft_comment() {
+        let long_chinese_comment = "这是一个很长的中文备注".repeat(30);
+        let cell = NftCell::Redirect {
+            src_port: 8000,
+            src_port_end: None,
+            dst_port: 3128,
+            protocol: Protocol::Tcp,
+            ip_version: IpVersion::V4,
+            comment: Some(long_chinese_comment.clone()),
+        };
+
+        let result = cell
+            .build_with_rule_index(Some(7), &DnsConfig::default(), &Default::default())
+            .unwrap();
+        let comments = nft_comment_values(&result);
+
+        assert!(comments.iter().all(|comment| comment.len() <= 120));
+        assert!(comments.contains(&"nat-rule:id=r7"));
+        assert!(!result.contains(&long_chinese_comment));
+    }
+
+    #[test]
+    fn long_target_and_protocol_all_do_not_make_nft_comments_long() {
+        let long_domain = format!("{}.example.com", "very-long-label".repeat(20));
+        let rule_comment = nat_rule_comment(
+            Some(99),
+            "single",
+            "34120",
+            &long_domain,
+            "44336",
+            &Protocol::All,
+            Some("user comment that should stay outside nft comments"),
+        );
+        let out_comment = nat_traffic_comment(&rule_comment, "out");
+        let in_comment = nat_traffic_comment(&rule_comment, "in");
+        let access_comment = nat_access_comment("blacklist", Some(99));
+
+        assert_eq!(rule_comment, "nat-rule:id=r99");
+        assert_eq!(out_comment, "nat-traffic:id=r99,dir=out");
+        assert_eq!(in_comment, "nat-traffic:id=r99,dir=in");
+        assert_eq!(access_comment, "nat-access:id=r99,mode=blacklist");
+        for comment in [rule_comment, out_comment, in_comment, access_comment] {
+            assert!(comment.len() <= 120);
+        }
+    }
 
     #[test]
     fn test_build_redirect_single_ipv4() {

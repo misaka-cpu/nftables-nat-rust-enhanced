@@ -13,6 +13,7 @@ use nat_common::{
     Args, DdnsConfig, DnsConfig, StatsConfig, TelegramConfig, TomlConfig, logger,
     stats::{self as traffic_stats, StatsState},
 };
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ const MANAGED_TABLES: [(&str, &str); 4] = [
 const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const IPV6_FORWARD: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 const CARGO_CRATE_NAME: &str = env!("CARGO_CRATE_NAME");
+const MAIN_LOOP_MAX_SLEEP_SECS: u64 = 5;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     logger::init(CARGO_CRATE_NAME);
@@ -117,13 +119,16 @@ fn global_prepare() -> Result<(), io::Error> {
 fn handle_loop(args: &Args) -> Result<(), io::Error> {
     let mut latest_script = String::new();
     let mut last_stats_collect = None;
+    let mut last_ddns_refresh = None;
     let mut last_short_ddns_warn: Option<u64> = None;
     loop {
+        let loop_now = Local::now();
         let runtime_config = load_runtime_config(args);
         let refresh_interval = ddns_refresh_interval(&runtime_config.ddns)?;
         warn_short_ddns_interval_once(refresh_interval, &mut last_short_ddns_warn);
         let dns_config = runtime_config.dns;
         let access_config = runtime_config.access_control;
+        let rule_labels = runtime_config.rule_labels;
         let stats_config = runtime_config.stats;
         let telegram_config = runtime_config.telegram;
         if stats_config.enabled
@@ -131,59 +136,85 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
         {
             warn!("初始化统计数据文件失败，nat 主循环继续运行: {e:?}");
         }
-        if should_collect_stats(&stats_config, last_stats_collect)
-            && collect_and_maybe_notify(&stats_config, &telegram_config).is_some()
+        if should_collect_stats_at(&stats_config, last_stats_collect, loop_now)
+            && collect_and_maybe_notify(&stats_config, &telegram_config, &rule_labels).is_some()
         {
-            last_stats_collect = Some(Local::now());
+            last_stats_collect = Some(loop_now);
         }
 
-        let nat_cells = match parse_conf(args) {
-            Ok(cells) => cells,
-            Err(e) => {
-                error!("解析配置文件失败: {e:?}");
-                sleep(Duration::from_secs(refresh_interval));
-                continue;
-            }
-        };
-        let script = match build_new_script(&nat_cells, &dns_config, &access_config) {
-            Ok(script) => script,
-            Err(e) => {
-                error!(
-                    "解析域名或生成 nftables 脚本失败，保持上一版已应用规则并等待下一次解析: {e}"
-                );
-                sleep(Duration::from_secs(refresh_interval));
-                continue;
-            }
-        };
-        prepare::check_and_prepare()?;
-        if script != latest_script {
-            if stats_config.enabled {
-                let _ = collect_and_maybe_notify(&stats_config, &telegram_config);
-                last_stats_collect = Some(Local::now());
-            }
-            info!("当前配置: ");
-            for ele in &nat_cells {
-                info!("{ele:?}");
-            }
-            info!("nftables脚本如下：\n{script}");
-            let f = File::create(FILE_NAME_SCRIPT);
-            if let Ok(mut file) = f {
-                file.write_all(script.as_bytes())?;
-            }
+        if should_refresh_ddns_at(last_ddns_refresh, refresh_interval, loop_now) {
+            let nat_cells = match parse_conf(args) {
+                Ok(cells) => cells,
+                Err(e) => {
+                    error!("解析配置文件失败: {e:?}");
+                    sleep(next_loop_sleep(
+                        refresh_interval,
+                        &stats_config,
+                        last_ddns_refresh,
+                        last_stats_collect,
+                        Local::now(),
+                    ));
+                    continue;
+                }
+            };
+            let script = match build_new_script(&nat_cells, &dns_config, &access_config) {
+                Ok(script) => script,
+                Err(e) => {
+                    error!(
+                        "解析域名或生成 nftables 脚本失败，保持上一版已应用规则并等待下一次解析: {e}"
+                    );
+                    sleep(next_loop_sleep(
+                        refresh_interval,
+                        &stats_config,
+                        last_ddns_refresh,
+                        last_stats_collect,
+                        Local::now(),
+                    ));
+                    continue;
+                }
+            };
+            last_ddns_refresh = Some(loop_now);
+            prepare::check_and_prepare()?;
+            if script != latest_script {
+                if stats_config.enabled {
+                    let collect_now = Local::now();
+                    let _ = collect_and_maybe_notify(&stats_config, &telegram_config, &rule_labels);
+                    last_stats_collect = Some(collect_now);
+                }
+                info!("当前配置: ");
+                for ele in &nat_cells {
+                    info!("{ele:?}");
+                }
+                info!("nftables脚本如下：\n{script}");
+                let f = File::create(FILE_NAME_SCRIPT);
+                if let Ok(mut file) = f {
+                    file.write_all(script.as_bytes())?;
+                }
 
-            apply_nft_script(FILE_NAME_SCRIPT)?;
-            latest_script.clone_from(&script);
-            info!("WAIT:等待配置或目标IP发生改变....\n");
+                apply_nft_script(FILE_NAME_SCRIPT)?;
+                latest_script.clone_from(&script);
+                info!("WAIT:等待配置或目标IP发生改变....\n");
+            }
         }
 
-        sleep(Duration::from_secs(refresh_interval));
+        sleep(next_loop_sleep(
+            refresh_interval,
+            &stats_config,
+            last_ddns_refresh,
+            last_stats_collect,
+            Local::now(),
+        ));
     }
 }
 
 pub(crate) fn refresh_once(args: &Args) -> Result<(), io::Error> {
     let runtime_config = load_runtime_config(args);
     if runtime_config.stats.enabled {
-        let _ = collect_and_maybe_notify(&runtime_config.stats, &runtime_config.telegram);
+        let _ = collect_and_maybe_notify(
+            &runtime_config.stats,
+            &runtime_config.telegram,
+            &runtime_config.rule_labels,
+        );
     }
     let nat_cells = parse_conf(args).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let script = build_new_script(
@@ -203,6 +234,7 @@ struct RuntimeConfig {
     access_control: nat_common::AccessControlConfig,
     stats: StatsConfig,
     telegram: TelegramConfig,
+    rule_labels: HashMap<String, String>,
 }
 
 fn load_runtime_config(args: &Args) -> RuntimeConfig {
@@ -213,6 +245,7 @@ fn load_runtime_config(args: &Args) -> RuntimeConfig {
             access_control: Default::default(),
             stats: StatsConfig::default(),
             telegram: TelegramConfig::default(),
+            rule_labels: HashMap::new(),
         };
     };
     let content = match fs::read_to_string(toml_path) {
@@ -225,17 +258,22 @@ fn load_runtime_config(args: &Args) -> RuntimeConfig {
                 access_control: Default::default(),
                 stats: StatsConfig::default(),
                 telegram: TelegramConfig::default(),
+                rule_labels: HashMap::new(),
             };
         }
     };
     match TomlConfig::from_toml_str(&content) {
-        Ok(config) => RuntimeConfig {
-            dns: config.dns,
-            ddns: config.ddns,
-            access_control: config.access_control,
-            stats: config.stats,
-            telegram: config.telegram,
-        },
+        Ok(config) => {
+            let rule_labels = traffic_stats::rule_labels_from_config(&config);
+            RuntimeConfig {
+                dns: config.dns,
+                ddns: config.ddns,
+                access_control: config.access_control,
+                stats: config.stats,
+                telegram: config.telegram,
+                rule_labels,
+            }
+        }
         Err(e) => {
             warn!("解析 TOML 运行配置失败，使用默认 DDNS/统计/Telegram 配置: {e}");
             RuntimeConfig {
@@ -244,6 +282,7 @@ fn load_runtime_config(args: &Args) -> RuntimeConfig {
                 access_control: Default::default(),
                 stats: StatsConfig::default(),
                 telegram: TelegramConfig::default(),
+                rule_labels: HashMap::new(),
             }
         }
     }
@@ -269,9 +308,10 @@ fn warn_short_ddns_interval_once(interval: u64, last_warned: &mut Option<u64>) {
     }
 }
 
-fn should_collect_stats(
+fn should_collect_stats_at(
     stats_config: &StatsConfig,
     last_collect: Option<chrono::DateTime<Local>>,
+    now: chrono::DateTime<Local>,
 ) -> bool {
     if !stats_config.enabled {
         return false;
@@ -279,13 +319,60 @@ fn should_collect_stats(
     let Some(last_collect) = last_collect else {
         return true;
     };
-    let elapsed = Local::now().signed_duration_since(last_collect);
+    let elapsed = now.signed_duration_since(last_collect);
     elapsed.num_seconds() >= stats_config.collect_interval_seconds as i64
+}
+
+fn should_refresh_ddns_at(
+    last_refresh: Option<chrono::DateTime<Local>>,
+    refresh_interval_seconds: u64,
+    now: chrono::DateTime<Local>,
+) -> bool {
+    let Some(last_refresh) = last_refresh else {
+        return true;
+    };
+    now.signed_duration_since(last_refresh).num_seconds() >= refresh_interval_seconds as i64
+}
+
+fn next_loop_sleep(
+    ddns_interval_seconds: u64,
+    stats_config: &StatsConfig,
+    last_ddns_refresh: Option<chrono::DateTime<Local>>,
+    last_stats_collect: Option<chrono::DateTime<Local>>,
+    now: chrono::DateTime<Local>,
+) -> Duration {
+    let ddns_remaining = remaining_seconds(last_ddns_refresh, ddns_interval_seconds, now);
+    let stats_remaining = if stats_config.enabled {
+        remaining_seconds(
+            last_stats_collect,
+            stats_config.collect_interval_seconds,
+            now,
+        )
+    } else {
+        ddns_remaining
+    };
+    let sleep_secs = ddns_remaining
+        .min(stats_remaining)
+        .clamp(1, MAIN_LOOP_MAX_SLEEP_SECS);
+    Duration::from_secs(sleep_secs)
+}
+
+fn remaining_seconds(
+    last_run: Option<chrono::DateTime<Local>>,
+    interval_seconds: u64,
+    now: chrono::DateTime<Local>,
+) -> u64 {
+    let Some(last_run) = last_run else {
+        return 0;
+    };
+    let elapsed = now.signed_duration_since(last_run).num_seconds().max(0) as u64;
+    interval_seconds.saturating_sub(elapsed)
 }
 
 fn collect_and_maybe_notify(
     stats_config: &StatsConfig,
     telegram_config: &TelegramConfig,
+    rule_labels: &HashMap<String, String>,
 ) -> Option<StatsState> {
     let now = Local::now().naive_local();
     let output = match Command::new("/usr/sbin/nft")
@@ -309,8 +396,12 @@ fn collect_and_maybe_notify(
     }
 
     let json = String::from_utf8_lossy(&output.stdout);
-    let mut state = match traffic_stats::collect_from_nft_json(&stats_config.data_file, &json, now)
-    {
+    let mut state = match traffic_stats::collect_from_nft_json_with_labels(
+        &stats_config.data_file,
+        &json,
+        rule_labels,
+        now,
+    ) {
         Ok(state) => state,
         Err(e) => {
             warn!("采集 nft counter 失败，nat 主循环继续运行: {e}");
@@ -853,6 +944,69 @@ exit 1
     }
 
     #[test]
+    fn stats_interval_is_independent_from_ddns_interval() {
+        let start = Local::now();
+        let stats_config = StatsConfig {
+            enabled: true,
+            collect_interval_seconds: 10,
+            ..Default::default()
+        };
+
+        assert!(should_collect_stats_at(
+            &stats_config,
+            Some(start),
+            start + chrono::Duration::seconds(10)
+        ));
+        assert!(!should_refresh_ddns_at(
+            Some(start),
+            300,
+            start + chrono::Duration::seconds(10)
+        ));
+        assert!(should_refresh_ddns_at(
+            Some(start),
+            300,
+            start + chrono::Duration::seconds(300)
+        ));
+    }
+
+    #[test]
+    fn main_loop_sleep_uses_next_due_task_and_is_capped() {
+        let start = Local::now();
+        let stats_config = StatsConfig {
+            enabled: true,
+            collect_interval_seconds: 10,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            next_loop_sleep(300, &stats_config, Some(start), Some(start), start).as_secs(),
+            MAIN_LOOP_MAX_SLEEP_SECS
+        );
+        assert_eq!(
+            next_loop_sleep(
+                300,
+                &stats_config,
+                Some(start),
+                Some(start),
+                start + chrono::Duration::seconds(9)
+            )
+            .as_secs(),
+            1
+        );
+        assert_eq!(
+            next_loop_sleep(
+                300,
+                &stats_config,
+                Some(start),
+                Some(start),
+                start + chrono::Duration::seconds(10)
+            )
+            .as_secs(),
+            1
+        );
+    }
+
+    #[test]
     fn detects_missing_managed_table_errors() {
         assert!(is_missing_nft_table_error(
             "Error: No such file or directory"
@@ -948,7 +1102,7 @@ refresh_interval_seconds = 123
             entries: vec!["8.8.8.8".to_string(), "9.9.9.0/24".to_string()],
         };
         let script = build_new_script(&cells, &DnsConfig::default(), &access).unwrap();
-        assert!(script.contains("ip saddr { 8.8.8.8, 9.9.9.0/24 } tcp dport 30080 counter drop comment \"nat-access:mode=blacklist,rule=0\""));
+        assert!(script.contains("ip saddr { 8.8.8.8, 9.9.9.0/24 } tcp dport 30080 counter drop comment \"nat-access:id=r0,mode=blacklist\""));
         assert!(script.contains("tcp dport 30080 counter dnat"));
     }
 
