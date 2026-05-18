@@ -178,7 +178,7 @@
             border-radius: 6px;
             flex: 1;
             overflow-x: auto;
-            overflow-y: auto;
+            overflow-y: visible;
             min-height: 100px;
         }
 
@@ -223,17 +223,25 @@
         }
 
         .rules-code {
-            min-height: 520px;
-            max-height: calc(100vh - 300px);
-            overflow: auto;
-            background: #111827;
-            color: #e5e7eb;
+            min-height: 320px;
+            overflow-x: auto;
+            overflow-y: visible;
+            background: #f8fafc;
+            color: #1f2937;
+            border: 1px solid #e5e7eb;
             border-radius: 6px;
             padding: 16px;
             font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', 'Monaco', 'SF Mono', 'Courier New', monospace;
             font-size: 13px;
             line-height: 1.55;
             white-space: pre;
+        }
+
+        .rules-empty {
+            white-space: normal;
+            font-family: inherit;
+            color: #555;
+            background: #f8fafc;
         }
 
         .test-result-grid {
@@ -339,6 +347,7 @@
         }
 
         .modal-content {
+            position: relative;
             background: white;
             border-radius: 12px;
             padding: 24px;
@@ -362,12 +371,40 @@
         }
 
         .modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
             font-size: 20px;
             font-weight: bold;
             margin-bottom: 20px;
             color: #333;
             padding-bottom: 12px;
             border-bottom: 2px solid #f0f0f0;
+        }
+
+        .modal-header h2 {
+            margin: 0;
+            font-size: 20px;
+        }
+
+        .modal-close {
+            position: absolute;
+            top: 14px;
+            right: 14px;
+            width: 34px;
+            height: 34px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            background: #fff;
+            color: #374151;
+            cursor: pointer;
+            font-size: 20px;
+            line-height: 1;
+        }
+
+        .modal-close:hover {
+            background: #f3f4f6;
         }
 
         .modal-section {
@@ -812,6 +849,7 @@
             <div class="user-info">
                 <span class="backend-info">🌐 <span id="headerBackendUrl">-</span></span>
                 <span class="username">👤 <span id="currentUsername">-</span></span>
+                <button class="btn btn-secondary" onclick="openUpdateModal()">一键更新</button>
                 <button class="btn btn-secondary" onclick="openBackendModal()">⚙️ 切换后端</button>
                 <button class="btn btn-secondary" onclick="logout()">退出登录</button>
             </div>
@@ -899,6 +937,7 @@
             <div class="actions" style="margin-bottom: 20px;">
                 <button class="btn btn-primary" onclick="loadBbrStatus()">🔄 刷新状态</button>
                 <button class="btn btn-secondary" onclick="enableBbr()">开启 BBR</button>
+                <button class="btn btn-secondary" onclick="disableBbr()">关闭 BBR</button>
             </div>
 
             <div id="bbrContent" class="loading">
@@ -965,6 +1004,39 @@
 
     </div>
 
+    <div id="updateModal" class="modal-overlay">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>一键更新</h2>
+                <button class="modal-close" onclick="closeUpdateModal()">×</button>
+            </div>
+            <div class="telegram-hint" style="margin-bottom: 12px;">
+                更新默认保留 /etc/nat.toml、stats、backups 和 WebUI env。更新 WebUI 时页面可能短暂断开，请等待 5-10 秒后刷新。
+            </div>
+            <div id="updateStatus" class="loading">点击“检查更新”查看组件状态。</div>
+            <div class="telegram-field">
+                <label for="updateTarget">更新目标</label>
+                <select class="telegram-input" id="updateTarget">
+                    <option value="installed">当前已安装组件</option>
+                    <option value="core">仅核心</option>
+                    <option value="console">仅 WebUI</option>
+                    <option value="all">全部</option>
+                </select>
+            </div>
+            <div class="telegram-field">
+                <label for="updateVersion">版本</label>
+                <select class="telegram-input" id="updateVersion">
+                    <option value="latest">Latest</option>
+                </select>
+                <div id="updateReleaseWarning" class="telegram-hint"></div>
+            </div>
+            <div class="actions">
+                <button class="btn btn-secondary" onclick="loadUpdateStatus()">检查更新</button>
+                <button class="btn btn-primary" id="startUpdateButton" onclick="startUpdate()">开始更新</button>
+            </div>
+        </div>
+    </div>
+
     <!-- 后端设置模态框 -->
     <div id="backendModal" class="modal-overlay">
         <div class="modal-content" onclick="event.stopPropagation()">
@@ -1027,6 +1099,7 @@
         let currentConfig = null;
         let currentFormat = null;
         let currentTelegram = null;
+        let lastUpdateStatus = null;
 
         // 统一的 API 请求函数
         async function apiRequest(endpoint, options = {}) {
@@ -1142,10 +1215,13 @@
                 }
 
                 const data = await response.json();
-                rulesContent.className = 'rules-code';
-                rulesContent.textContent = data.rules && data.rules.trim()
-                    ? data.rules
-                    : '当前没有已应用的 nft 规则，请检查 nat.service 或配置规则。';
+                if (data.rules && data.rules.trim()) {
+                    rulesContent.className = 'rules-code';
+                    rulesContent.textContent = data.rules;
+                } else {
+                    rulesContent.className = 'rules-code rules-empty';
+                    rulesContent.textContent = '当前没有已应用的 nft 规则，请检查 nat.service 是否运行，或确认 /etc/nat.toml 中已有转发规则。';
+                }
             } catch (error) {
                 rulesContent.className = 'rules-code';
                 rulesContent.textContent = '加载失败: ' + error.message;
@@ -1305,11 +1381,14 @@ ${escapeHtml((examples.https_sni || '').replaceAll('SERVER_IP', '<服务器IP>')
 
                 const data = await response.json();
                 bbrContent.className = 'rules-display';
-                bbrContent.innerHTML = `<pre>状态: ${data.enabled ? '已开启' : '未开启'}
+                bbrContent.innerHTML = `<pre>状态: ${escapeHtml(data.status_text || (data.enabled ? '运行中：已开启' : '已关闭'))}
+运行中: ${data.runtime_enabled ? '已开启' : '未开启'}
+开机配置: ${data.boot_config_enabled ? '已启用' : '未启用'}
 TCP 拥塞控制: ${data.tcp_congestion_control}
 可用拥塞控制: ${data.available_congestion_control}
 默认队列算法: ${data.default_qdisc}
-配置文件: ${data.config_file}</pre>`;
+配置文件: ${data.config_file}
+${data.warning ? `提示: ${escapeHtml(data.warning)}` : ''}</pre>`;
             } catch (error) {
                 bbrContent.className = 'loading';
                 bbrContent.textContent = '加载失败: ' + error.message;
@@ -1338,6 +1417,158 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
                 bbrContent.className = 'loading';
                 bbrContent.textContent = '开启失败: ' + error.message;
                 showAlert('开启 BBR 失败: ' + error.message, true);
+            }
+        }
+
+        async function disableBbr() {
+            if (!confirm('关闭 BBR 会调整内核 TCP 拥塞控制参数，可能影响网络性能。只会处理本项目创建的 BBR 配置，不会删除用户其他 sysctl 配置。继续？')) {
+                return;
+            }
+            const bbrContent = document.getElementById('bbrContent');
+            bbrContent.className = 'loading';
+            bbrContent.textContent = '正在关闭 BBR...';
+            try {
+                const response = await apiRequest('/api/bbr/disable', { method: 'POST' });
+                if (!response.ok) {
+                    const text = await response.text();
+                    throw new Error(text);
+                }
+                const data = await response.json();
+                const control = data.status && data.status.tcp_congestion_control ? data.status.tcp_congestion_control : 'unknown';
+                showAlert(data.success ? `BBR 已关闭，当前拥塞控制：${control}` : data.message, !data.success);
+                await loadBbrStatus();
+            } catch (error) {
+                bbrContent.className = 'loading';
+                bbrContent.textContent = '关闭失败: ' + error.message;
+                showAlert('关闭 BBR 失败: ' + error.message, true);
+            }
+        }
+
+        function openUpdateModal() {
+            document.getElementById('updateModal').classList.add('active');
+            loadUpdateReleases();
+            loadUpdateStatus();
+        }
+
+        function closeUpdateModal() {
+            document.getElementById('updateModal').classList.remove('active');
+        }
+
+        async function loadUpdateStatus() {
+            const content = document.getElementById('updateStatus');
+            content.className = 'loading';
+            content.textContent = '检查中...';
+            try {
+                const response = await apiRequest('/api/update/status');
+                if (!response.ok) throw new Error(await response.text());
+                const data = await response.json();
+                lastUpdateStatus = data;
+                content.className = 'rules-display';
+                content.innerHTML = `<pre>nat: ${data.nat_installed ? 'installed' : 'missing'}
+nat-console: ${data.console_installed ? 'installed' : 'missing'}
+当前版本: ${data.current_version || 'unknown'}
+最新 release: ${data.latest_version || 'unknown'}
+可更新: ${data.update_available ? 'yes' : 'no'}
+
+查看更新日志:
+  /var/log/nftables-nat-rust-update.log</pre>`;
+            } catch (error) {
+                content.className = 'loading';
+                content.textContent = '检查失败: ' + error.message;
+            }
+        }
+
+        async function loadUpdateReleases() {
+            const select = document.getElementById('updateVersion');
+            const warning = document.getElementById('updateReleaseWarning');
+            select.innerHTML = '<option value="latest">Latest</option>';
+            warning.textContent = '';
+            try {
+                const response = await apiRequest('/api/update/releases');
+                if (!response.ok) throw new Error(await response.text());
+                const data = await response.json();
+                const releases = data.releases || [];
+                select.innerHTML = releases.map(item =>
+                    `<option value="${escapeHtml(item.tag)}">${escapeHtml(item.name || item.tag)}</option>`
+                ).join('') || '<option value="latest">Latest</option>';
+                if (data.warning) {
+                    warning.textContent = data.warning;
+                }
+            } catch (error) {
+                warning.textContent = '无法获取 release 列表，已保留 latest 选项。';
+            }
+        }
+
+        async function startUpdate() {
+            const version = document.getElementById('updateVersion').value || 'latest';
+            const target = document.getElementById('updateTarget').value;
+            if (!confirm('确认开始更新？更新 WebUI 时页面可能短暂断开，请等待 5-10 秒后刷新。')) return;
+            const content = document.getElementById('updateStatus');
+            const button = document.getElementById('startUpdateButton');
+            button.disabled = true;
+            button.textContent = '更新中...';
+            content.className = 'loading';
+            content.textContent = '更新已开始。若更新 WebUI，页面可能短暂断开，请等待 5-10 秒。';
+            try {
+                const response = await apiRequest('/api/update', {
+                    method: 'POST',
+                    body: JSON.stringify({ target, version, use_release: true, confirm: true })
+                });
+                if (!response.ok) throw new Error(await response.text());
+                const data = await response.json();
+                showAlert(data.message || '更新已开始', !data.ok);
+                content.className = 'rules-display';
+                content.innerHTML = `<pre>${(data.actions || []).join('\n')}
+
+日志:
+  /var/log/nftables-nat-rust-update.log
+  journalctl -u nat-console -f
+  journalctl -u nat -f</pre>`;
+                if (updateTouchesConsole(target)) {
+                    content.innerHTML += '<div class="loading">WebUI 正在重启，等待恢复...</div>';
+                    pollWebUiRecovery();
+                } else {
+                    button.disabled = false;
+                    button.textContent = '开始更新';
+                    setTimeout(loadUpdateStatus, 3000);
+                }
+            } catch (error) {
+                content.className = 'loading';
+                content.textContent = '更新失败: ' + error.message;
+                showAlert('更新失败: ' + error.message, true);
+                button.disabled = false;
+                button.textContent = '开始更新';
+            }
+        }
+
+        function updateTouchesConsole(target) {
+            if (target === 'console' || target === 'all') return true;
+            if (target === 'installed') return !!(lastUpdateStatus && lastUpdateStatus.console_installed);
+            return false;
+        }
+
+        async function pollWebUiRecovery() {
+            const apiBaseUrl = localStorage.getItem('apiBaseUrl') || '';
+            for (let attempt = 0; attempt < 30; attempt++) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                try {
+                    const response = await fetch(`${apiBaseUrl}/health`, { cache: 'no-store' });
+                    if (response.ok) {
+                        window.location.reload();
+                        return;
+                    }
+                } catch (error) {
+                    const content = document.getElementById('updateStatus');
+                    if (content) {
+                        content.className = 'loading';
+                        content.textContent = 'WebUI 正在重启，等待恢复...';
+                    }
+                }
+            }
+            const content = document.getElementById('updateStatus');
+            if (content) {
+                content.className = 'loading';
+                content.textContent = 'WebUI 恢复等待超时，请手动刷新页面或查看 /var/log/nftables-nat-rust-update.log。';
             }
         }
 
@@ -2035,6 +2266,19 @@ ${(data.warnings || []).map(item => '  - ' + item).join('\n') || '  - none'}</pr
                     }
                 });
             }
+            const updateModal = document.getElementById('updateModal');
+            if (updateModal) {
+                updateModal.addEventListener('click', function(e) {
+                    if (e.target === updateModal) {
+                        closeUpdateModal();
+                    }
+                });
+            }
+            document.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape') {
+                    closeUpdateModal();
+                }
+            });
         });
 
         function updateHeaderBackend() {

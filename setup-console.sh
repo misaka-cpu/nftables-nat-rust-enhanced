@@ -31,6 +31,41 @@ log_err() {
     echo "[ERR] $1"
 }
 
+interactive_input_error() {
+    log_err "当前环境不支持交互输入。"
+    echo "请使用以下方式之一："
+    echo "1) 先下载脚本再执行："
+    echo '   tmp="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh -o "$tmp" && bash "$tmp" --with-console --use-release'
+    echo "2) 使用非交互参数指定配置。"
+    exit 1
+}
+
+prompt_read() {
+    local prompt="$1"
+    local var_name="$2"
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        read -r -p "$prompt" "$var_name" < /dev/tty
+    elif [ -t 0 ]; then
+        read -r -p "$prompt" "$var_name"
+    else
+        interactive_input_error
+    fi
+}
+
+prompt_read_secret() {
+    local prompt="$1"
+    local var_name="$2"
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        read -r -s -p "$prompt" "$var_name" < /dev/tty
+        echo > /dev/tty
+    elif [ -t 0 ]; then
+        read -r -s -p "$prompt" "$var_name"
+        echo
+    else
+        interactive_input_error
+    fi
+}
+
 check_binary_glibc_compat() {
     local binary="$1"
     local name="$2"
@@ -242,21 +277,20 @@ usage() {
 read_hidden_password() {
     local prompt="$1"
     local password
-    read -r -s -p "$prompt" password
-    echo >&2
+    prompt_read_secret "$prompt" password
     printf '%s' "$password"
 }
 
 prompt_username() {
     local username
-    read -r -p "请输入 WebUI 用户名 [admin]: " username
+    prompt_read "请输入 WebUI 用户名 [admin]: " username
     printf '%s' "${username:-admin}"
 }
 
 confirm_short_password() {
     local answer
     log_warn "密码长度少于 12 位，存在安全风险。"
-    read -r -p "仍然继续使用该密码? [y/N]: " answer
+    prompt_read "仍然继续使用该密码? [y/N]: " answer
     [[ "$answer" =~ ^[Yy]$ ]]
 }
 
@@ -294,12 +328,17 @@ prepare_credentials() {
         PASSWORD="$NAT_CONSOLE_PASSWORD"
         PASSWORD_SOURCE="environment"
         log_info "using WebUI password from environment variable"
+    elif [ "${NAT_CONSOLE_AUTO_PASSWORD:-0}" = "1" ]; then
+        USERNAME="${NAT_CONSOLE_USERNAME:-admin}"
+        PASSWORD="$(generate_password)"
+        PASSWORD_SOURCE="generated"
+        log_ok "generated random WebUI password"
     elif [ -f "$ENV_FILE" ] && [ "$NAT_NONINTERACTIVE" = "1" ]; then
         log_info "non-interactive mode: preserving existing $ENV_FILE"
     elif [ -f "$ENV_FILE" ]; then
         local update_choice
         log_warn "$ENV_FILE already exists"
-        read -r -p "是否更新 WebUI 凭据? [y/N]: " update_choice
+        prompt_read "是否更新 WebUI 凭据? [y/N]: " update_choice
         if [[ "$update_choice" =~ ^[Yy]$ ]]; then
             choose_credentials_interactively
         else
@@ -317,6 +356,10 @@ prepare_credentials() {
         JWT_SECRET="$NAT_CONSOLE_JWT_SECRET"
         JWT_SOURCE="environment"
         log_info "using JWT secret from environment variable"
+    elif [ "${NAT_CONSOLE_RANDOM_SECRET:-0}" = "1" ]; then
+        JWT_SECRET="$(generate_jwt_secret)"
+        JWT_SOURCE="generated"
+        log_ok "generated random JWT secret"
     elif [ -f "$ENV_FILE" ] && [ "$PASSWORD_SOURCE" = "existing" ]; then
         JWT_SECRET=""
         JWT_SOURCE="existing"
@@ -333,7 +376,7 @@ choose_credentials_interactively() {
         echo "请选择 WebUI 密码设置方式："
         echo "1) 自定义用户名和密码"
         echo "2) 自动生成强密码"
-        read -r -p "请输入选择 [1/2]: " choice
+        prompt_read "请输入选择 [1/2]: " choice
         case "$choice" in
             1)
                 prompt_custom_credentials
@@ -357,7 +400,7 @@ prompt_bind_addr() {
         echo "1) 仅本机访问 127.0.0.1，推荐，需 SSH 隧道访问"
         echo "2) 所有网卡访问 0.0.0.0，适合局域网或已限制防火墙"
         echo "3) 自定义绑定地址"
-        read -r -p "请输入选择 [1/2/3]: " choice
+        prompt_read "请输入选择 [1/2/3]: " choice
         case "${choice:-1}" in
             1)
                 BIND_ADDR="127.0.0.1"
@@ -369,7 +412,7 @@ prompt_bind_addr() {
                 return 0
                 ;;
             3)
-                read -r -p "请输入 WebUI 绑定地址: " custom_bind
+                prompt_read "请输入 WebUI 绑定地址: " custom_bind
                 if [ -z "$custom_bind" ]; then
                     log_warn "绑定地址不能为空"
                     continue

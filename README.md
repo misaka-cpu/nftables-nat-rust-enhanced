@@ -96,6 +96,7 @@
 
 - WebUI/API 查看 BBR 状态
 - 可写入本项目 sysctl 配置并加载
+- WebUI/API 可关闭 BBR；关闭时只禁用本项目创建的 `/etc/sysctl.d/99-nat-bbr.conf`
 - 不使用 `sysctl --system`
 
 ## 系统要求
@@ -156,6 +157,18 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --with-console --use-release --enter-menu
+```
+
+如果需要交互选择 WebUI 监听地址，推荐先下载脚本再执行，避免 `curl | bash` 的标准输入被管道占用：
+
+```bash
+tmp="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh -o "$tmp" && bash "$tmp" --with-console --use-release
+```
+
+也可以使用非交互参数完成 WebUI 配置：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --with-console --use-release --webui-bind 127.0.0.1 --webui-port 5533 --webui-username admin --webui-auto-password
 ```
 
 只装核心：
@@ -271,6 +284,19 @@ bash install.sh
 --repo <owner/repo>
                  指定 release 仓库；默认 misaka-cpu/nftables-nat-rust-enhanced
 --enter-menu     安装完成后自动进入 CLI 管理菜单
+--update         更新已安装组件；未指定目标时自动检测 core/WebUI
+--webui-bind <addr>
+                 设置 WebUI 监听地址，避免交互选择
+--webui-port <port>
+                 设置 WebUI 端口
+--webui-username <name>
+                 设置 WebUI 用户名
+--webui-password <password>
+                 设置 WebUI 密码
+--webui-auto-password
+                 自动生成 WebUI 密码
+--webui-random-secret
+                 自动生成新的 WebUI JWT secret
 --uninstall      卸载服务文件和二进制，保留用户配置
 --help           显示帮助
 ```
@@ -284,8 +310,11 @@ bash install.sh --core-only --use-release
 bash install.sh --with-console --use-release
 bash install.sh --core-only --use-release --enter-menu
 bash install.sh --with-console --use-release --enter-menu
+bash install.sh --with-console --use-release --webui-bind 127.0.0.1 --webui-port 5533 --webui-username admin --webui-auto-password
 bash install.sh --console-only --use-release
 bash install.sh --assets-only
+bash install.sh --dry-run --update --with-console --use-release
+bash install.sh --update --use-release
 bash install.sh --with-console --version v0.1.0 --repo misaka-cpu/nftables-nat-rust-enhanced
 bash install.sh --with-console --build-from-source
 ```
@@ -301,6 +330,38 @@ bash install.sh --with-console --build-from-source
 - `--enter-menu` 会在安装完成后自动执行 `/usr/local/bin/nat --menu`；`--console-only` 默认不进入菜单，除非显式传入 `--enter-menu` 且已安装核心 nat。
 
 核心 nat 安装不依赖 nodejs/npm；使用 release payload 更新 WebUI assets 时也不需要 nodejs/npm。
+
+## 更新
+
+轻量 release 更新：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --use-release
+```
+
+仅更新核心：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release
+```
+
+仅更新 WebUI：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --console-only --use-release
+```
+
+指定版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --with-console --use-release --version v0.1.2
+```
+
+CLI 更新：执行 `nat --menu`，选择 `一键更新本项目`。
+
+WebUI 更新：登录后点击右上角 `一键更新`。版本可选择 `latest` 或指定 release tag；更新 WebUI 时页面可能短暂断开，恢复后会自动刷新页面。
+
+更新默认保留 `/etc/nat.toml`、`/etc/nat.conf`、`/var/lib/nftables-nat-rust/stats.json`、`/etc/nftables-nat/backups/`、`/opt/nat-console/env`。更新前会把旧二进制和 service 文件备份到 `/etc/nftables-nat/backups/update-YYYYmmdd-HHMMSS/`；如果更新或健康检查失败，安装脚本会尝试回滚旧二进制和 service 文件。
 
 ## WebUI 安全访问
 
@@ -614,6 +675,8 @@ nftables-nat-rust-enhanced 管理菜单
 12) 最近来源 IP 观察
 13) WebUI / BBR / Telegram 状态
 14) 测试转发规则连通性
+15) 卸载 / 清理本项目
+16) 一键更新本项目
 0) 退出
 ```
 
@@ -633,6 +696,7 @@ GET  /api/rules
 
 GET  /api/bbr/status
 POST /api/bbr/enable
+POST /api/bbr/disable
 
 GET  /api/stats
 POST /api/stats/config
@@ -651,6 +715,10 @@ POST /api/forward-test/observe
 
 GET  /api/uninstall/status
 POST /api/uninstall
+
+GET  /api/update/status
+GET  /api/update/releases
+POST /api/update
 ```
 
 WebUI 的“规则查看”页内分为两个子页：
@@ -669,6 +737,12 @@ curl -vk --connect-to 目标域名:目标端口:服务器IP:监听端口 https:/
 `POST /api/stats/collect-now` 只执行只读 `nft -j list ruleset` 并更新 `stats.json`，不会执行 `nft -f`、不会重启服务、不会改规则、不会发送 Telegram。
 
 `POST /api/telegram/test` 会真实发送 Telegram 测试消息。只有在 Telegram 已启用，并且 `bot_token` / `chat_id` 配置完整时才会发送。
+
+WebUI 可启用/关闭 BBR。关闭 BBR 只会移除或禁用本项目创建的 `/etc/sysctl.d/99-nat-bbr.conf`，不会删除用户其他 sysctl 配置；如用户手动配置过 BBR，请自行检查 `/etc/sysctl.d/`。
+
+关闭 BBR 后会重新读取状态并返回最新运行时状态；如果系统支持 `cubic`，会尝试切换运行时拥塞控制为 `cubic`，否则尝试 `reno`。如果配置文件已移除但运行时仍是 `bbr`，WebUI 会提示“运行时仍为 bbr，但开机配置已移除”，可再次关闭或重启后确认。
+
+WebUI 一键更新接口需要登录态，版本参数只接受 `latest` 或 `v` 开头的 semver tag。右上角“一键更新”弹窗会从 `/api/update/releases` 加载 release 下拉选项；如果 GitHub release 列表获取失败，会保留 `latest`。更新默认调用 `install.sh --update --use-release`，保留用户配置和数据，并将输出写入 `/var/log/nftables-nat-rust-update.log`。更新 WebUI 时页面可能短暂断开，前端会轮询健康检查并在服务恢复后自动刷新页面。
 
 ## 卸载
 

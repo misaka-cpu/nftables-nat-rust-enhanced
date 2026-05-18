@@ -23,7 +23,7 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
@@ -34,6 +34,8 @@ const TCP_AVAILABLE_CONGESTION_CONTROL: &str =
 const DEFAULT_QDISC: &str = "/proc/sys/net/core/default_qdisc";
 const BBR_SYSCTL_CONF: &str = "/etc/sysctl.d/99-nat-bbr.conf";
 const CONFIG_BACKUP_DIR: &str = "/etc/nftables-nat/backups/config";
+const UPDATE_LOG_PATH: &str = "/var/log/nftables-nat-rust-update.log";
+const UPDATE_REPO: &str = "misaka-cpu/nftables-nat-rust-enhanced";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -503,27 +505,20 @@ async fn async_tcp_connect_target(rule: &forward_test::TestableRule) -> Option<b
 #[derive(Serialize)]
 pub struct BbrStatusResponse {
     enabled: bool,
+    runtime_enabled: bool,
+    boot_config_enabled: bool,
     tcp_congestion_control: String,
     available_congestion_control: String,
     default_qdisc: String,
     config_file: String,
+    status_text: String,
+    warning: Option<String>,
 }
 
 pub async fn get_bbr_status(
     _user: Claims,
 ) -> Result<Json<BbrStatusResponse>, (StatusCode, String)> {
-    let tcp_congestion_control = read_sysctl_value(TCP_CONGESTION_CONTROL);
-    let available_congestion_control = read_sysctl_value(TCP_AVAILABLE_CONGESTION_CONTROL);
-    let default_qdisc = read_sysctl_value(DEFAULT_QDISC);
-    let enabled = tcp_congestion_control == "bbr" && default_qdisc == "fq";
-
-    Ok(Json(BbrStatusResponse {
-        enabled,
-        tcp_congestion_control,
-        available_congestion_control,
-        default_qdisc,
-        config_file: BBR_SYSCTL_CONF.to_string(),
-    }))
+    Ok(Json(current_bbr_status()))
 }
 
 #[derive(Serialize)]
@@ -547,14 +542,7 @@ pub async fn enable_bbr(_user: Claims) -> Result<Json<BbrEnableResponse>, (Statu
     run_sysctl_command(&["-w", "net.ipv4.tcp_congestion_control=bbr"])?;
     run_sysctl_command(&["-p", BBR_SYSCTL_CONF])?;
 
-    let status = BbrStatusResponse {
-        tcp_congestion_control: read_sysctl_value(TCP_CONGESTION_CONTROL),
-        available_congestion_control: read_sysctl_value(TCP_AVAILABLE_CONGESTION_CONTROL),
-        default_qdisc: read_sysctl_value(DEFAULT_QDISC),
-        config_file: BBR_SYSCTL_CONF.to_string(),
-        enabled: read_sysctl_value(TCP_CONGESTION_CONTROL) == "bbr"
-            && read_sysctl_value(DEFAULT_QDISC) == "fq",
-    };
+    let status = current_bbr_status();
 
     Ok(Json(BbrEnableResponse {
         success: status.enabled,
@@ -565,6 +553,195 @@ pub async fn enable_bbr(_user: Claims) -> Result<Json<BbrEnableResponse>, (Statu
         },
         status,
     }))
+}
+
+pub async fn disable_bbr(_user: Claims) -> Result<Json<BbrEnableResponse>, (StatusCode, String)> {
+    let mut messages = Vec::new();
+    let disabled_config = format!("{BBR_SYSCTL_CONF}.disabled");
+    let mut project_config_found = false;
+
+    if Path::new(BBR_SYSCTL_CONF).exists() {
+        project_config_found = true;
+        fs::rename(BBR_SYSCTL_CONF, &disabled_config).map_err(|e| {
+            error!("Failed to disable BBR sysctl config: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("禁用本项目 BBR 配置失败: {}", e),
+            )
+        })?;
+        messages.push(format!("已禁用本项目 BBR 配置: {disabled_config}"));
+    } else {
+        messages.push("未发现本项目 BBR 配置文件，未修改用户其他 sysctl 配置".to_string());
+    }
+
+    let runtime_congestion = read_sysctl_value(TCP_CONGESTION_CONTROL);
+    if project_config_found || runtime_congestion == "bbr" {
+        let available = read_sysctl_value(TCP_AVAILABLE_CONGESTION_CONTROL);
+        if let Some(fallback) = choose_fallback_congestion_control(&available) {
+            let sysctl_arg = format!("net.ipv4.tcp_congestion_control={fallback}");
+            run_sysctl_command(&["-w", &sysctl_arg])?;
+            messages.push(format!("已切换 TCP 拥塞控制为 {fallback}"));
+        } else {
+            messages.push("系统未报告支持 cubic 或 reno，未强制切换拥塞控制算法".to_string());
+        }
+    }
+
+    if project_config_found {
+        let current_qdisc = read_sysctl_value(DEFAULT_QDISC);
+        if current_qdisc == "fq" {
+            match try_sysctl_command(&["-w", "net.core.default_qdisc=fq_codel"]) {
+                Ok(()) => messages.push("已尝试恢复默认队列算法为 fq_codel".to_string()),
+                Err(e) => messages.push(format!("未强制修改 qdisc: {e}")),
+            }
+        } else {
+            messages.push("当前默认队列算法不是 fq，未修改 qdisc".to_string());
+        }
+    }
+
+    let status = current_bbr_status();
+    let success = !status.runtime_enabled && !status.boot_config_enabled;
+    Ok(Json(BbrEnableResponse {
+        success,
+        message: if success {
+            format!(
+                "BBR 已关闭，当前拥塞控制：{}",
+                status.tcp_congestion_control
+            )
+        } else {
+            messages.join("；")
+        },
+        status,
+    }))
+}
+
+#[derive(Serialize)]
+pub struct UpdateStatusResponse {
+    nat_installed: bool,
+    console_installed: bool,
+    current_version: String,
+    latest_version: String,
+    update_available: bool,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateRequest {
+    target: String,
+    version: String,
+    #[serde(default = "default_true")]
+    use_release: bool,
+    confirm: bool,
+}
+
+#[derive(Serialize)]
+pub struct UpdateResponse {
+    ok: bool,
+    message: String,
+    actions: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct UpdateReleaseItem {
+    tag: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+pub struct UpdateReleasesResponse {
+    releases: Vec<UpdateReleaseItem>,
+    warning: Option<String>,
+}
+
+pub async fn get_update_status(
+    _user: Claims,
+) -> Result<Json<UpdateStatusResponse>, (StatusCode, String)> {
+    let nat_installed = Path::new("/usr/local/bin/nat").exists()
+        || Path::new("/lib/systemd/system/nat.service").exists()
+        || Path::new("/etc/systemd/system/nat.service").exists();
+    let console_installed = Path::new("/usr/local/bin/nat-console").exists()
+        || Path::new("/lib/systemd/system/nat-console.service").exists()
+        || Path::new("/etc/systemd/system/nat-console.service").exists();
+
+    Ok(Json(UpdateStatusResponse {
+        nat_installed,
+        console_installed,
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        latest_version: "latest".to_string(),
+        update_available: true,
+    }))
+}
+
+pub async fn update_handler(
+    _user: Claims,
+    Json(req): Json<UpdateRequest>,
+) -> Result<Json<UpdateResponse>, (StatusCode, String)> {
+    if !req.confirm {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "更新前必须确认 confirm=true".to_string(),
+        ));
+    }
+    let target_arg = match req.target.as_str() {
+        "installed" => None,
+        "core" => Some("--core-only"),
+        "console" => Some("--console-only"),
+        "all" => Some("--with-console"),
+        _ => return Err((StatusCode::BAD_REQUEST, "无效更新目标".to_string())),
+    };
+    let version = req.version.trim();
+    if !valid_update_version(version) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "无效版本，只允许 latest 或 v 开头的 semver tag，例如 v0.1.2".to_string(),
+        ));
+    }
+
+    let mut args = vec!["--update".to_string()];
+    if let Some(target) = target_arg {
+        args.push(target.to_string());
+    }
+    if req.use_release {
+        args.push("--use-release".to_string());
+    }
+    if version != "latest" {
+        args.push("--version".to_string());
+        args.push(version.to_string());
+    }
+    args.push("--repo".to_string());
+    args.push(UPDATE_REPO.to_string());
+
+    spawn_update_process(&args)?;
+    let command_line = format!("install.sh {}", args.join(" "));
+
+    let actions = vec![
+        format!("更新命令已启动: {command_line}"),
+        "默认保留 /etc/nat.toml、/etc/nat.conf、stats、backups、/opt/nat-console/env".to_string(),
+        format!("更新日志: {UPDATE_LOG_PATH}"),
+        "更新 WebUI 时页面可能短暂断开，请等待 5-10 秒后刷新".to_string(),
+    ];
+    Ok(Json(UpdateResponse {
+        ok: true,
+        message: "更新已开始".to_string(),
+        actions,
+    }))
+}
+
+pub async fn get_update_releases(
+    _user: Claims,
+) -> Result<Json<UpdateReleasesResponse>, (StatusCode, String)> {
+    let (tags, warning) = fetch_release_tags();
+    let mut releases = vec![UpdateReleaseItem {
+        tag: "latest".to_string(),
+        name: "Latest".to_string(),
+    }];
+    for tag in tags {
+        if valid_update_version(&tag) {
+            releases.push(UpdateReleaseItem {
+                name: tag.clone(),
+                tag,
+            });
+        }
+    }
+    Ok(Json(UpdateReleasesResponse { releases, warning }))
 }
 
 #[derive(Serialize)]
@@ -1486,6 +1663,52 @@ fn read_sysctl_value(path: &str) -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+fn current_bbr_status() -> BbrStatusResponse {
+    let tcp_congestion_control = read_sysctl_value(TCP_CONGESTION_CONTROL);
+    let available_congestion_control = read_sysctl_value(TCP_AVAILABLE_CONGESTION_CONTROL);
+    let default_qdisc = read_sysctl_value(DEFAULT_QDISC);
+    let boot_config_enabled = Path::new(BBR_SYSCTL_CONF).exists();
+    let runtime_enabled = tcp_congestion_control == "bbr";
+    let (status_text, warning) = bbr_status_text(runtime_enabled, boot_config_enabled);
+    BbrStatusResponse {
+        enabled: runtime_enabled,
+        runtime_enabled,
+        boot_config_enabled,
+        tcp_congestion_control,
+        available_congestion_control,
+        default_qdisc,
+        config_file: BBR_SYSCTL_CONF.to_string(),
+        status_text,
+        warning,
+    }
+}
+
+fn bbr_status_text(runtime_enabled: bool, boot_config_enabled: bool) -> (String, Option<String>) {
+    match (runtime_enabled, boot_config_enabled) {
+        (true, true) => ("运行中：已开启；开机配置：已启用".to_string(), None),
+        (true, false) => (
+            "运行时仍为 bbr，但开机配置已移除。可重启或再次关闭以切换运行时。".to_string(),
+            Some("运行时仍为 bbr，但开机配置已移除。可重启或再次关闭以切换运行时。".to_string()),
+        ),
+        (false, true) => (
+            "运行中：未开启；开机配置：已启用".to_string(),
+            Some("开机配置仍存在，重启后可能再次启用 BBR。".to_string()),
+        ),
+        (false, false) => ("已关闭".to_string(), None),
+    }
+}
+
+fn choose_fallback_congestion_control(available: &str) -> Option<&'static str> {
+    let values: Vec<&str> = available.split_whitespace().collect();
+    if values.contains(&"cubic") {
+        Some("cubic")
+    } else if values.contains(&"reno") {
+        Some("reno")
+    } else {
+        None
+    }
+}
+
 fn run_sysctl_command(args: &[&str]) -> Result<(), (StatusCode, String)> {
     let output = Command::new("/usr/sbin/sysctl")
         .args(args)
@@ -1509,6 +1732,122 @@ fn run_sysctl_command(args: &[&str]) -> Result<(), (StatusCode, String)> {
             format!("应用 sysctl 配置失败: {}", stderr),
         ))
     }
+}
+
+fn try_sysctl_command(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("/usr/sbin/sysctl")
+        .args(args)
+        .output()
+        .or_else(|_| Command::new("sysctl").args(args).output())
+        .map_err(|e| format!("执行 sysctl 失败: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn valid_update_version(version: &str) -> bool {
+    if version == "latest" {
+        return true;
+    }
+    if !version.starts_with('v') || version.len() <= 1 {
+        return false;
+    }
+    if !version
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return false;
+    }
+    let mut parts = version[1..].splitn(2, '-');
+    let core = parts.next().unwrap_or_default();
+    let nums: Vec<&str> = core.split('.').collect();
+    nums.len() == 3
+        && nums
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn fetch_release_tags() -> (Vec<String>, Option<String>) {
+    let output = Command::new("curl")
+        .arg("-fsSL")
+        .arg(format!(
+            "https://api.github.com/repos/{UPDATE_REPO}/releases?per_page=20"
+        ))
+        .output();
+    let Ok(output) = output else {
+        return (
+            Vec::new(),
+            Some("无法获取 GitHub release 列表，已保留 latest 选项".to_string()),
+        );
+    };
+    if !output.status.success() {
+        return (
+            Vec::new(),
+            Some("GitHub release 列表请求失败，已保留 latest 选项".to_string()),
+        );
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return (
+            Vec::new(),
+            Some("GitHub release 列表解析失败，已保留 latest 选项".to_string()),
+        );
+    };
+    let tags = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|release| release.get("tag_name").and_then(|tag| tag.as_str()))
+        .map(str::to_string)
+        .collect();
+    (tags, None)
+}
+
+fn spawn_update_process(args: &[String]) -> Result<(), (StatusCode, String)> {
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(UPDATE_LOG_PATH)
+        .map_err(|e| {
+            error!("Failed to open update log: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("打开更新日志失败: {}", e),
+            )
+        })?;
+    let stderr_file = log_file.try_clone().map_err(|e| {
+        error!("Failed to clone update log: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("打开更新日志失败: {}", e),
+        )
+    })?;
+
+    Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "curl -fsSL https://raw.githubusercontent.com/{UPDATE_REPO}/main/install.sh | bash -s -- \"$@\""
+        ))
+        .arg("nat-console-update")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| {
+            error!("Failed to start update process: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("启动更新失败: {}", e),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -1603,6 +1942,40 @@ notify_monthly = true
         let status = telegram_status_response(&config);
         assert_eq!(status.bot_token_masked, "1234****abcd");
         assert!(!status.bot_token_masked.contains("secret"));
+    }
+
+    #[test]
+    fn validates_update_version_tags() {
+        assert!(valid_update_version("latest"));
+        assert!(valid_update_version("v0.1.2"));
+        assert!(valid_update_version("v1.2.3-rc.1"));
+        assert!(!valid_update_version("0.1.2"));
+        assert!(!valid_update_version("v1.2"));
+        assert!(!valid_update_version("v1.2.x"));
+        assert!(!valid_update_version("v0.1.2;reboot"));
+        assert!(!valid_update_version("v0.1.2$(id)"));
+    }
+
+    #[test]
+    fn chooses_safe_bbr_fallback_congestion_control() {
+        assert_eq!(
+            choose_fallback_congestion_control("reno cubic bbr"),
+            Some("cubic")
+        );
+        assert_eq!(choose_fallback_congestion_control("reno bbr"), Some("reno"));
+        assert_eq!(choose_fallback_congestion_control("bbr"), None);
+    }
+
+    #[test]
+    fn bbr_status_text_distinguishes_runtime_and_boot_config() {
+        let (text, warning) = bbr_status_text(true, false);
+        assert!(text.contains("运行时仍为 bbr"));
+        assert!(text.contains("开机配置已移除"));
+        assert!(warning.is_some());
+
+        let (text, warning) = bbr_status_text(false, false);
+        assert_eq!(text, "已关闭");
+        assert!(warning.is_none());
     }
 
     #[test]

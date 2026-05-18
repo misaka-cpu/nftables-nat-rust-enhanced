@@ -54,6 +54,7 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
             }
             "14" => test_forward_interactive(config_path).map_err(Into::into),
             "15" => uninstall_menu().map_err(Into::into),
+            "16" => update_menu().map_err(Into::into),
             _ => {
                 println!("未知选项: {}", choice.trim());
                 Ok(())
@@ -103,6 +104,7 @@ nftables-nat-rust-enhanced 管理菜单
 13) WebUI / BBR / Telegram 状态
 14) 测试转发规则连通性
 15) 卸载 / 清理本项目
+16) 一键更新本项目
 0) 退出
 ===================================="#
     );
@@ -795,6 +797,99 @@ fn print_uninstall_report(report: &UninstallReport) {
     println!("后续如需重新安装，请参考 README 的一键安装命令。");
 }
 
+fn update_menu() -> Result<(), io::Error> {
+    println!(
+        r#"====================================
+一键更新 nftables-nat-rust-enhanced
+====================================
+1) 更新当前已安装组件，推荐
+2) 仅更新核心转发 nat
+3) 仅更新 WebUI nat-console
+4) 更新全部 core + WebUI
+0) 返回"#
+    );
+    let choice = prompt("请选择 [0/1/2/3/4]: ")?;
+    if choice.trim() == "0" {
+        return Ok(());
+    }
+    let target_arg = match choice.trim() {
+        "1" => None,
+        "2" => Some("--core-only"),
+        "3" => Some("--console-only"),
+        "4" => Some("--with-console"),
+        _ => {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "未知更新目标"));
+        }
+    };
+
+    println!(
+        r#"版本选择：
+1) 最新 release
+2) 指定版本 tag"#
+    );
+    let version_choice = prompt("请选择 [1/2]: ")?;
+    let version = if version_choice.trim() == "2" {
+        let tag = prompt("请输入版本 tag，例如 v0.1.2: ")?;
+        if !valid_update_version(&tag) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "无效版本，只允许 latest 或 v 开头的 tag，例如 v0.1.2",
+            ));
+        }
+        tag
+    } else {
+        "latest".to_string()
+    };
+
+    println!("更新摘要：");
+    println!(
+        "  将更新: {}",
+        target_arg.unwrap_or("当前已安装组件（由 install.sh 自动检测）")
+    );
+    println!("  版本: {version}");
+    println!("  下载方式: GitHub Release 预编译包优先");
+    println!("  备份: /etc/nftables-nat/backups/update-YYYYmmdd-HHMMSS/");
+    println!("  保留: /etc/nat.toml、/etc/nat.conf、stats、backups、/opt/nat-console/env");
+    println!("  重启: 按已安装组件重启 nat.service / nat-console.service");
+    let confirm = prompt("继续更新？[y/N]: ")?;
+    if !matches!(confirm.as_str(), "y" | "Y" | "yes" | "YES") {
+        println!("已取消更新");
+        return Ok(());
+    }
+
+    let mut args = vec!["--update", "--use-release"];
+    if let Some(target) = target_arg {
+        args.push(target);
+    }
+    if version != "latest" {
+        args.push("--version");
+        args.push(&version);
+    }
+    let command_line = format!(
+        "curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- {}",
+        args.join(" ")
+    );
+    println!("开始更新，install.sh 会负责备份、重启和失败回滚。");
+    let status = Command::new("sh").arg("-c").arg(command_line).status()?;
+    if status.success() {
+        println!("更新命令执行完成。");
+        Ok(())
+    } else {
+        Err(io::Error::other("更新命令执行失败，请查看输出和服务日志"))
+    }
+}
+
+fn valid_update_version(version: &str) -> bool {
+    if version == "latest" {
+        return true;
+    }
+    version.starts_with('v')
+        && version.len() > 1
+        && version
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
 fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
     let config = load_toml_config(path)?;
     let rules = forward_test::list_testable_rules(&config);
@@ -1251,6 +1346,15 @@ domain = "example.com"
         assert!(validate_access_entry("192.0.2.1").is_ok());
         assert!(validate_access_entry("2001:db8::/64").is_ok());
         assert!(validate_access_entry("example.com").is_err());
+    }
+
+    #[test]
+    fn validates_update_version_tags() {
+        assert!(valid_update_version("latest"));
+        assert!(valid_update_version("v0.1.2"));
+        assert!(valid_update_version("v1.2.3-rc.1"));
+        assert!(!valid_update_version("main"));
+        assert!(!valid_update_version("v0.1.2;systemctl"));
     }
 
     #[test]

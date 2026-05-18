@@ -15,6 +15,8 @@ USE_RELEASE_SEEN=0
 BUILD_SOURCE_SEEN=0
 ENTER_MENU=0
 NAT_MENU_BIN="${NAT_MENU_BIN:-/usr/local/bin/nat}"
+UPDATE_MODE=0
+UPDATE_TARGET_AUTO=0
 
 log_info() {
     echo "[INFO] $1"
@@ -36,6 +38,27 @@ log_dry_run() {
     echo "[DRY-RUN] $1"
 }
 
+interactive_input_error() {
+    log_err "当前环境不支持交互输入。"
+    echo "请使用以下方式之一："
+    echo "1) 先下载脚本再执行："
+    echo '   tmp="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh -o "$tmp" && bash "$tmp" --with-console --use-release'
+    echo "2) 使用非交互参数指定配置。"
+    exit 1
+}
+
+prompt_read() {
+    local prompt="$1"
+    local var_name="$2"
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        read -r -p "$prompt" "$var_name" < /dev/tty
+    elif [ -t 0 ]; then
+        read -r -p "$prompt" "$var_name"
+    else
+        interactive_input_error
+    fi
+}
+
 usage() {
     cat <<EOF
 用法: $0 [选项]
@@ -53,6 +76,19 @@ usage() {
   --repo OWNER/REPO
                    指定 GitHub 仓库，默认 $RELEASE_REPO
   --enter-menu     安装完成后自动进入 CLI 管理菜单
+  --update         更新已安装组件，默认自动检测目标
+  --webui-bind ADDR
+                   设置 WebUI 监听地址，避免交互选择
+  --webui-port PORT
+                   设置 WebUI 端口
+  --webui-username NAME
+                   设置 WebUI 用户名
+  --webui-password PASSWORD
+                   设置 WebUI 密码
+  --webui-auto-password
+                   自动生成 WebUI 密码，避免交互输入密码
+  --webui-random-secret
+                   自动生成新的 WebUI JWT secret
   --uninstall      交互卸载/清理本项目
   --core           与 --uninstall 组合，仅卸载核心 nat
   --console        与 --uninstall 组合，仅卸载 WebUI nat-console
@@ -282,19 +318,27 @@ dry_run_console_install() {
     log_dry_run "would update nat-console.service to use EnvironmentFile"
     log_dry_run "would not put --password or --jwt-secret in ExecStart"
     log_dry_run "would set nat-console.service LimitNOFILE=65535"
-    log_dry_run "would use NAT_CONSOLE_USERNAME or default admin"
-    log_dry_run "would use NAT_CONSOLE_PORT or default 5533"
-    log_dry_run "would use NAT_CONSOLE_BIND or ask user to choose WebUI bind address"
+    log_dry_run "would use WebUI username from NAT_CONSOLE_USERNAME/--webui-username or default admin"
+    log_dry_run "would use WebUI port from NAT_CONSOLE_PORT/--webui-port or default 5533"
+    if [ -n "${NAT_CONSOLE_BIND:-}" ]; then
+        log_dry_run "would use WebUI bind from --webui-bind/NAT_CONSOLE_BIND: $NAT_CONSOLE_BIND"
+    else
+        log_dry_run "would use existing/default WebUI bind or ask user to choose via /dev/tty"
+    fi
     log_dry_run "would default to 127.0.0.1 for SSH tunnel access"
     if [ -n "${NAT_CONSOLE_PASSWORD:-}" ]; then
-        log_dry_run "would use password from NAT_CONSOLE_PASSWORD"
+        log_dry_run "would use password from --webui-password/NAT_CONSOLE_PASSWORD"
+    elif [ "${NAT_CONSOLE_AUTO_PASSWORD:-0}" = "1" ]; then
+        log_dry_run "would generate WebUI password because --webui-auto-password was provided"
     else
-        log_dry_run "would ask user to choose custom password or generated password"
+        log_dry_run "would use existing password, generate in noninteractive mode, or ask via /dev/tty"
     fi
     if [ -n "${NAT_CONSOLE_JWT_SECRET:-}" ]; then
         log_dry_run "would use JWT secret from NAT_CONSOLE_JWT_SECRET"
+    elif [ "${NAT_CONSOLE_RANDOM_SECRET:-0}" = "1" ]; then
+        log_dry_run "would generate new JWT secret because --webui-random-secret was provided"
     else
-        log_dry_run "would generate random JWT secret"
+        log_dry_run "would preserve existing JWT secret or generate random JWT secret"
     fi
     log_dry_run "would create /opt/nat-console/env with mode 600"
     log_dry_run "would write NAT_CONSOLE_BIND to /opt/nat-console/env"
@@ -320,6 +364,131 @@ dry_run_assets_install() {
     log_dry_run "would not add NodeSource or other third-party apt sources"
     log_dry_run "would install/update /usr/local/bin/nat-console via setup-console-assets.sh"
     log_dry_run "would update nat-console.service compatibility flags if the service exists"
+}
+
+detect_update_action() {
+    if [ -n "$ACTION" ]; then
+        return 0
+    fi
+    UPDATE_TARGET_AUTO=1
+    local has_core=0 has_console=0
+    if [ -x /usr/local/bin/nat ] || [ -f /lib/systemd/system/nat.service ] || [ -f /etc/systemd/system/nat.service ]; then
+        has_core=1
+    fi
+    if [ -x /usr/local/bin/nat-console ] || [ -f /lib/systemd/system/nat-console.service ] || [ -f /etc/systemd/system/nat-console.service ]; then
+        has_console=1
+    fi
+    if [ "$has_core" -eq 1 ] && [ "$has_console" -eq 1 ]; then
+        ACTION="--with-console"
+    elif [ "$has_core" -eq 1 ]; then
+        ACTION="--core-only"
+    elif [ "$has_console" -eq 1 ]; then
+        ACTION="--console-only"
+    else
+        ACTION="--with-console"
+        log_warn "未检测到已安装组件，--update 将按 core + WebUI 计划执行"
+    fi
+}
+
+backup_update_files() {
+    local backup_dir="$1"
+    mkdir -p "$backup_dir"
+    for path in \
+        /usr/local/bin/nat \
+        /usr/local/bin/nat-console \
+        /lib/systemd/system/nat.service \
+        /lib/systemd/system/nat-console.service \
+        /etc/systemd/system/nat.service \
+        /etc/systemd/system/nat-console.service; do
+        if [ -e "$path" ]; then
+            mkdir -p "$backup_dir$(dirname "$path")"
+            cp -a "$path" "$backup_dir$path"
+        fi
+    done
+}
+
+rollback_update_files() {
+    local backup_dir="$1"
+    local path
+    for path in \
+        /usr/local/bin/nat \
+        /usr/local/bin/nat-console \
+        /lib/systemd/system/nat.service \
+        /lib/systemd/system/nat-console.service \
+        /etc/systemd/system/nat.service \
+        /etc/systemd/system/nat-console.service; do
+        if [ -e "$backup_dir$path" ]; then
+            cp -a "$backup_dir$path" "$path"
+        fi
+    done
+    systemctl daemon-reload || true
+}
+
+dry_run_update() {
+    local action="$1"
+    if [ "$UPDATE_TARGET_AUTO" -eq 1 ]; then
+        log_dry_run "would auto-detect installed components: /usr/local/bin/nat /usr/local/bin/nat-console nat.service nat-console.service"
+    fi
+    if [ "$INSTALL_MODE" = "release" ]; then
+        prepare_release_payload || true
+    fi
+    log_dry_run "would update target: $action"
+    log_dry_run "would preserve user data: /etc/nat.toml /etc/nat.conf /var/lib/nftables-nat-rust/stats.json /etc/nftables-nat/backups /opt/nat-console/env"
+    log_dry_run "would create backup directory: /etc/nftables-nat/backups/update-YYYYmmdd-HHMMSS"
+    log_dry_run "would backup old binaries and service files before replacing"
+    case "$action" in
+        --core-only)
+            log_dry_run "would update only nat binary and nat.service"
+            dry_run_core_install "${NAT_CONFIG_TYPE:-toml}"
+            ;;
+        --console-only)
+            log_dry_run "would update only nat-console, WebUI static assets, and nat-console.service"
+            dry_run_console_install
+            ;;
+        --with-console)
+            log_dry_run "would update nat + nat-console + WebUI static assets"
+            dry_run_core_install "${NAT_CONFIG_TYPE:-toml}"
+            dry_run_console_install
+            ;;
+    esac
+    log_dry_run "would rollback old binaries/service files if update or health check fails"
+}
+
+run_update() {
+    local action="$1"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        dry_run_update "$action"
+        return 0
+    fi
+    local backup_dir="/etc/nftables-nat/backups/update-$(date +%Y%m%d-%H%M%S)"
+    log_info "creating update backup: $backup_dir"
+    backup_update_files "$backup_dir"
+    if ! prepare_install_payload "$action"; then
+        log_err "更新 payload 准备失败，保留旧版本"
+        return 1
+    fi
+    if ! case "$action" in
+        --core-only)
+            NAT_NONINTERACTIVE=1 NAT_START_SERVICE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}"
+            ;;
+        --console-only)
+            NAT_NONINTERACTIVE=1 NAT_SKIP_SERVICE_PROMPT=1 run_console_install
+            ;;
+        --with-console)
+            NAT_NONINTERACTIVE=1 NAT_START_SERVICE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}" &&
+            NAT_NONINTERACTIVE=1 NAT_SKIP_SERVICE_PROMPT=1 run_console_install
+            ;;
+        *)
+            log_err "invalid update target: $action"
+            false
+            ;;
+    esac; then
+        log_err "更新失败，尝试回滚旧二进制和 service 文件"
+        rollback_update_files "$backup_dir"
+        log_warn "回滚已执行，请检查服务状态和日志"
+        return 1
+    fi
+    log_ok "更新完成，备份目录: $backup_dir"
 }
 
 dry_run_uninstall() {
@@ -379,7 +548,7 @@ maybe_enter_cli_menu() {
             fi
             if is_interactive_terminal; then
                 local answer
-                read -r -p "是否立即进入 CLI 管理菜单？[y/N]: " answer
+                prompt_read "是否立即进入 CLI 管理菜单？[y/N]: " answer
                 case "${answer:-}" in
                     y|Y|yes|YES)
                         run_cli_menu
@@ -459,7 +628,7 @@ run_uninstall() {
             echo "3) 卸载全部"
             echo "4) 仅清理本项目 nft 表"
             echo "0) 取消 / 退出卸载"
-            read -r -p "请选择 [0/1/2/3/4]: " target_choice
+            prompt_read "请选择 [0/1/2/3/4]: " target_choice
             case "${target_choice:-0}" in
                 1) target="core"; break ;;
                 2) target="console"; break ;;
@@ -480,7 +649,7 @@ run_uninstall() {
         echo "1) 保留配置、统计、备份，推荐"
         echo "2) 删除程序和服务，保留 /etc/nat.toml 和 backups"
         echo "3) 完全删除本项目配置、统计、备份、WebUI env/cert/key，危险"
-        read -r -p "请选择 [1/2/3，默认 1]: " data_choice
+        prompt_read "请选择 [1/2/3，默认 1]: " data_choice
         case "${data_choice:-1}" in
             1) data_mode="keep" ;;
             2) data_mode="keep-config" ;;
@@ -489,7 +658,7 @@ run_uninstall() {
         esac
     fi
     if [ "$data_mode" = "purge" ]; then
-        read -r -p "危险操作：请输入 DELETE 确认完全删除: " confirm_delete
+        prompt_read "危险操作：请输入 DELETE 确认完全删除: " confirm_delete
         if [ "$confirm_delete" != "DELETE" ]; then
             log_err "确认文本不匹配，取消卸载"
             exit 1
@@ -562,7 +731,7 @@ cleanup_data_by_mode() {
 
 ask_config_type() {
     local config_type
-    read -r -p "请选择配置格式 [toml/legacy，默认 toml]: " config_type
+    prompt_read "请选择配置格式 [toml/legacy，默认 toml]: " config_type
     config_type="${config_type:-toml}"
     if [ "$config_type" != "legacy" ] && [ "$config_type" != "toml" ]; then
         log_err "invalid config type: $config_type"
@@ -589,7 +758,7 @@ EOF
 run_menu() {
     local choice config_type
     show_menu
-    read -r -p "请选择操作: " choice
+    prompt_read "请选择操作: " choice
     case "$choice" in
         1)
             config_type="$(ask_config_type)"
@@ -637,6 +806,9 @@ while [ "$#" -gt 0 ]; do
         --dry-run)
             DRY_RUN=1
             ;;
+        --update)
+            UPDATE_MODE=1
+            ;;
         --use-release)
             INSTALL_MODE="release"
             USE_RELEASE_SEEN=1
@@ -647,6 +819,44 @@ while [ "$#" -gt 0 ]; do
             ;;
         --enter-menu)
             ENTER_MENU=1
+            ;;
+        --webui-bind)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                log_err "--webui-bind requires an address"
+                exit 1
+            fi
+            export NAT_CONSOLE_BIND="$2"
+            shift
+            ;;
+        --webui-port)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                log_err "--webui-port requires a port"
+                exit 1
+            fi
+            export NAT_CONSOLE_PORT="$2"
+            shift
+            ;;
+        --webui-username)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                log_err "--webui-username requires a username"
+                exit 1
+            fi
+            export NAT_CONSOLE_USERNAME="$2"
+            shift
+            ;;
+        --webui-password)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                log_err "--webui-password requires a password"
+                exit 1
+            fi
+            export NAT_CONSOLE_PASSWORD="$2"
+            shift
+            ;;
+        --webui-auto-password)
+            export NAT_CONSOLE_AUTO_PASSWORD=1
+            ;;
+        --webui-random-secret)
+            export NAT_CONSOLE_RANDOM_SECRET=1
             ;;
         --version)
             if [ "$#" -lt 2 ] || [ -z "$2" ]; then
@@ -702,6 +912,10 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
+if [ "$UPDATE_MODE" -eq 1 ]; then
+    detect_update_action
+fi
+
 if [ -z "$ACTION" ]; then
     if [ "$DRY_RUN" -eq 1 ]; then
         log_err "--dry-run 需要和安装动作参数组合使用"
@@ -725,6 +939,19 @@ fi
 if [ "$UNINSTALL_DATA_MODE" = "purge" ] && [ "$ACTION" != "--uninstall" ]; then
     log_err "--purge 只能和 --uninstall 组合使用"
     exit 1
+fi
+
+if [ "$UPDATE_MODE" -eq 1 ]; then
+    case "$ACTION" in
+        --core-only|--console-only|--with-console)
+            run_update "$ACTION"
+            exit $?
+            ;;
+        *)
+            log_err "--update 只能与 --core-only/--console-only/--with-console 或自动检测目标组合"
+            exit 1
+            ;;
+    esac
 fi
 
 prepare_install_payload "$ACTION"

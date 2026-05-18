@@ -1,10 +1,12 @@
 use crate::Args;
 use crate::handlers::{
-    AppState, check_forward_test, collect_stats_now, enable_bbr, get_access_control_status,
-    get_bbr_status, get_config, get_current_user, get_forward_test_rules, get_rules,
-    get_rules_json, get_stats, get_telegram_status, get_uninstall_status, hybrid_auth_middleware,
+    AppState, check_forward_test, collect_stats_now, disable_bbr, enable_bbr,
+    get_access_control_status, get_bbr_status, get_config, get_current_user,
+    get_forward_test_rules, get_rules, get_rules_json, get_stats, get_telegram_status,
+    get_uninstall_status, get_update_releases, get_update_status, hybrid_auth_middleware,
     login_handler, logout_handler, observe_forward_test, reset_stats_daily, reset_stats_monthly,
     save_config, save_stats_config, save_telegram_config, test_telegram, uninstall_handler,
+    update_handler,
 };
 use axum::{
     Router,
@@ -68,6 +70,7 @@ pub async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error + Se
         .route("/api/rules", get(get_rules_json))
         .route("/api/bbr/status", get(get_bbr_status))
         .route("/api/bbr/enable", post(enable_bbr))
+        .route("/api/bbr/disable", post(disable_bbr))
         .route("/api/stats", get(get_stats))
         .route("/api/stats/config", post(save_stats_config))
         .route("/api/stats/collect-now", post(collect_stats_now))
@@ -82,6 +85,9 @@ pub async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error + Se
         .route("/api/forward-test/observe", post(observe_forward_test))
         .route("/api/uninstall/status", get(get_uninstall_status))
         .route("/api/uninstall", post(uninstall_handler))
+        .route("/api/update/status", get(get_update_status))
+        .route("/api/update/releases", get(get_update_releases))
+        .route("/api/update", post(update_handler))
         .route("/rules", get(get_rules))
         .layer(middleware::from_fn_with_state(
             Arc::new(jwt_config.clone()),
