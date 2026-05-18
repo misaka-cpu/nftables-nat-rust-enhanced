@@ -491,6 +491,8 @@ fn default_true() -> bool {
 pub enum NftCell {
     #[serde(rename = "single")]
     Single {
+        #[serde(default = "default_true")]
+        enabled: bool,
         #[serde(rename = "sport")]
         sport: u16,
         #[serde(rename = "dport")]
@@ -506,6 +508,8 @@ pub enum NftCell {
     },
     #[serde(rename = "range")]
     Range {
+        #[serde(default = "default_true")]
+        enabled: bool,
         #[serde(rename = "port_start")]
         port_start: u16,
         #[serde(rename = "port_end")]
@@ -521,6 +525,8 @@ pub enum NftCell {
     },
     #[serde(rename = "redirect")]
     Redirect {
+        #[serde(default = "default_true")]
+        enabled: bool,
         #[serde(rename = "sport")]
         src_port: u16,
         #[serde(rename = "sport_end", skip_serializing_if = "Option::is_none")]
@@ -633,6 +639,26 @@ impl Display for NftCell {
 
                 write!(f, "{}", parts.join(","))
             }
+        }
+    }
+}
+
+impl NftCell {
+    pub fn enabled(&self) -> bool {
+        match self {
+            NftCell::Single { enabled, .. }
+            | NftCell::Range { enabled, .. }
+            | NftCell::Redirect { enabled, .. } => *enabled,
+            NftCell::Drop { .. } => true,
+        }
+    }
+
+    pub fn set_enabled(&mut self, value: bool) {
+        match self {
+            NftCell::Single { enabled, .. }
+            | NftCell::Range { enabled, .. }
+            | NftCell::Redirect { enabled, .. } => *enabled = value,
+            NftCell::Drop { .. } => {}
         }
     }
 }
@@ -842,6 +868,7 @@ impl TryFrom<&str> for NftCell {
                 let port_end = cells[2].trim().parse::<u16>()?;
 
                 Ok(NftCell::Range {
+                    enabled: true,
                     port_start,
                     port_end,
                     domain: cells[3].trim().to_string(),
@@ -855,6 +882,7 @@ impl TryFrom<&str> for NftCell {
                 let dport = cells[2].trim().parse::<u16>()?;
 
                 Ok(NftCell::Single {
+                    enabled: true,
                     sport,
                     dport,
                     domain: cells[3].trim().to_string(),
@@ -882,6 +910,7 @@ impl TryFrom<&str> for NftCell {
                 let dst_port = cells[2].trim().parse::<u16>()?;
 
                 Ok(NftCell::Redirect {
+                    enabled: true,
                     src_port,
                     src_port_end,
                     dst_port,
@@ -1047,6 +1076,7 @@ mod tests {
     #[test]
     fn test_validate_single_rule() {
         let rule = NftCell::Single {
+            enabled: true,
             sport: 10000,
             dport: 443,
             domain: "example.com".to_string(),
@@ -1060,6 +1090,7 @@ mod tests {
     #[test]
     fn test_validate_empty_domain() {
         let rule = NftCell::Single {
+            enabled: true,
             sport: 10000,
             dport: 443,
             domain: "".to_string(),
@@ -1073,6 +1104,7 @@ mod tests {
     #[test]
     fn test_validate_range_rule() {
         let rule = NftCell::Range {
+            enabled: true,
             port_start: 1000,
             port_end: 2000,
             domain: "example.com".to_string(),
@@ -1086,6 +1118,7 @@ mod tests {
     #[test]
     fn test_validate_invalid_range() {
         let rule = NftCell::Range {
+            enabled: true,
             port_start: 2000,
             port_end: 1000,
             domain: "example.com".to_string(),
@@ -1226,6 +1259,7 @@ entries = ["example.com"]
     #[test]
     fn test_nft_cell_display() {
         let cell = NftCell::Single {
+            enabled: true,
             sport: 10000,
             dport: 443,
             domain: "example.com".to_string(),
@@ -1236,6 +1270,7 @@ entries = ["example.com"]
         assert_eq!(cell.to_string(), "SINGLE,10000,443,example.com,tcp,ipv4");
 
         let cell = NftCell::Redirect {
+            enabled: true,
             src_port: 8000,
             src_port_end: Some(9000),
             dst_port: 3128,

@@ -1055,6 +1055,7 @@ refresh_interval_seconds = 123
     #[test]
     fn fake_ip_is_not_written_to_generated_nft_script() {
         let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
             sport: 30080,
             dport: 80,
             domain: "198.19.184.4".to_string(),
@@ -1076,6 +1077,7 @@ refresh_interval_seconds = 123
     #[test]
     fn whitelist_ipv4_single_rule_adds_source_match() {
         let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
             sport: 30080,
             dport: 80,
             domain: "93.184.216.34".to_string(),
@@ -1095,6 +1097,7 @@ refresh_interval_seconds = 123
     #[test]
     fn blacklist_ipv4_single_rule_adds_port_scoped_drop() {
         let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
             sport: 30080,
             dport: 80,
             domain: "93.184.216.34".to_string(),
@@ -1114,6 +1117,7 @@ refresh_interval_seconds = 123
     #[test]
     fn access_control_supports_ranges_ipv6_and_all_protocol() {
         let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Range {
+            enabled: true,
             port_start: 30000,
             port_end: 30010,
             domain: "2001:db8::1".to_string(),

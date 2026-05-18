@@ -56,6 +56,7 @@ pub fn list_testable_rules(config: &crate::TomlConfig) -> Vec<TestableRule> {
         .rules
         .iter()
         .enumerate()
+        .filter(|(_, rule)| rule.enabled())
         .filter_map(|(index, rule)| rule_to_testable_rule(index, rule))
         .collect()
 }
@@ -70,6 +71,7 @@ pub fn rule_to_testable_rule(index: usize, rule: &NftCell) -> Option<TestableRul
             protocol,
             ip_version,
             comment,
+            ..
         } => Some(TestableRule {
             index,
             id,
@@ -89,6 +91,7 @@ pub fn rule_to_testable_rule(index: usize, rule: &NftCell) -> Option<TestableRul
             protocol,
             ip_version,
             comment,
+            ..
         } => Some(TestableRule {
             index,
             id,
@@ -365,6 +368,7 @@ mod tests {
     fn lists_testable_rules() {
         let config = TomlConfig {
             rules: vec![crate::NftCell::Single {
+                enabled: true,
                 sport: 30080,
                 dport: 80,
                 domain: "93.184.216.34".to_string(),
@@ -378,6 +382,38 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].id, "r0");
         assert_eq!(rules[0].label, "test: 30080 -> 93.184.216.34:80/tcp");
+    }
+
+    #[test]
+    fn old_rules_without_enabled_default_to_testable() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+[[rules]]
+type = "single"
+sport = 30080
+dport = 80
+domain = "93.184.216.34"
+"#,
+        )
+        .unwrap();
+        assert!(config.rules[0].enabled());
+        assert_eq!(list_testable_rules(&config).len(), 1);
+    }
+
+    #[test]
+    fn disabled_rules_are_not_testable_by_default() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+[[rules]]
+type = "single"
+enabled = false
+sport = 30080
+dport = 80
+domain = "93.184.216.34"
+"#,
+        )
+        .unwrap();
+        assert!(list_testable_rules(&config).is_empty());
     }
 
     #[test]

@@ -708,7 +708,7 @@ pub fn read_toml_config(toml_path: &str) -> Result<Vec<RuntimeCell>, io::Error> 
     let mut cells = Vec::new();
 
     // 处理所有规则（包括NAT和Filter）
-    for rule in config.rules {
+    for rule in config.rules.into_iter().filter(NftCell::enabled) {
         // 如果有注释，先添加注释
         let comment = match &rule {
             NftCell::Single { comment, .. } => comment.clone(),
@@ -732,6 +732,7 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
     let example_config = TomlConfig {
         rules: vec![
             NftCell::Single {
+                enabled: true,
                 sport: 10000,
                 dport: 443,
                 domain: "baidu.com".to_string(),
@@ -740,6 +741,7 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
                 comment: Some("百度HTTPS服务转发示例".to_string()),
             },
             NftCell::Range {
+                enabled: true,
                 port_start: 1000,
                 port_end: 2000,
                 domain: "baidu.com".to_string(),
@@ -748,6 +750,7 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
                 comment: Some("端口范围转发示例".to_string()),
             },
             NftCell::Redirect {
+                enabled: true,
                 src_port: 8000,
                 src_port_end: None,
                 dst_port: 3128,
@@ -756,6 +759,7 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
                 comment: Some("单端口重定向到本机示例".to_string()),
             },
             NftCell::Redirect {
+                enabled: true,
                 src_port: 30001,
                 src_port_end: Some(39999),
                 dst_port: 45678,
@@ -912,6 +916,7 @@ mod redirect_build_tests {
     fn generated_nft_comments_are_short_stable_ids() {
         let long_comment = "x".repeat(300);
         let cell = NftCell::Single {
+            enabled: true,
             sport: 34120,
             dport: 44336,
             domain: "93.184.216.34".to_string(),
@@ -941,6 +946,7 @@ mod redirect_build_tests {
     fn chinese_user_comment_is_not_written_to_nft_comment() {
         let long_chinese_comment = "这是一个很长的中文备注".repeat(30);
         let cell = NftCell::Redirect {
+            enabled: true,
             src_port: 8000,
             src_port_end: None,
             dst_port: 3128,
@@ -987,6 +993,7 @@ mod redirect_build_tests {
     #[test]
     fn test_build_redirect_single_ipv4() {
         let cell = NftCell::Redirect {
+            enabled: true,
             src_port: 8000,
             src_port_end: None,
             dst_port: 3128,
@@ -1006,6 +1013,7 @@ mod redirect_build_tests {
     #[test]
     fn test_build_redirect_range_ipv4() {
         let cell = NftCell::Redirect {
+            enabled: true,
             src_port: 30001,
             src_port_end: Some(39999),
             dst_port: 45678,
@@ -1028,6 +1036,7 @@ mod redirect_build_tests {
     #[test]
     fn test_build_redirect_both_ipv() {
         let cell = NftCell::Redirect {
+            enabled: true,
             src_port: 5000,
             src_port_end: None,
             dst_port: 4000,
@@ -1044,5 +1053,31 @@ mod redirect_build_tests {
         assert!(
             result.contains("add rule ip6 self-nat PREROUTING ct state new meta l4proto { tcp, udp } th dport 5000 counter redirect to :4000")
         );
+    }
+
+    #[test]
+    fn disabled_rules_are_not_loaded_into_runtime_cells() {
+        let path = std::env::temp_dir().join(format!(
+            "nat-disabled-rule-{}-{}.toml",
+            std::process::id(),
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        fs::write(
+            &path,
+            r#"
+[[rules]]
+type = "single"
+enabled = false
+sport = 30080
+dport = 80
+domain = "example.com"
+"#,
+        )
+        .unwrap();
+        let cells = read_toml_config(path.to_str().unwrap()).unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(cells.is_empty());
     }
 }

@@ -60,9 +60,10 @@
 
 ### Telegram 通知
 
-- 通过 `/etc/nat.toml` 配置 Bot Token / Chat ID
-- CLI 可配置 bot_token / chat_id
-- CLI 可发送测试通知
+- 通过 `/etc/nat.toml` 配置 Telegram token / chat_id
+- CLI 可配置 token 和 chat_id
+- CLI 可发送测试通知，测试通知不会自动启用 Telegram 通知
+- CLI 可设置通知间隔，单位分钟
 - 支持定时通知
 - 支持 daily / monthly 流量通知
 - token 在状态输出中脱敏
@@ -183,6 +184,12 @@ nat --menu
 systemctl restart nat
 ```
 
+`启用 / 禁用规则` 会列出所有规则，选择某一条后再启用或禁用。旧配置缺少 `enabled` 字段时默认视为 `true`；`enabled = false` 的规则会保留在 `/etc/nat.toml`，但不会生成到 nft 规则，也不会进入默认连通性测试列表。
+
+`最近来源 IP 观察` 用于观察访问转发端口的来源 IP，不等同于白名单 / 黑名单，不会自动放行或封禁来源 IP，也不会修改访问控制配置。
+
+`BBR / Telegram 状态` 子菜单可查看、开启、关闭 BBR；也可查看 Telegram 配置状态、配置 token 和 chat_id、发送测试通知、启用 / 禁用通知、设置通知间隔。
+
 ## 配置文件
 
 默认配置文件：
@@ -202,6 +209,7 @@ domain = "example.com"
 protocol = "tcp"
 ip_version = "ipv4"
 comment = "example-http"
+enabled = true
 
 [access_control]
 mode = "off"
@@ -274,6 +282,8 @@ nat --menu
 ```text
 /etc/nftables-nat/backups/update-YYYYmmdd-HHMMSS/
 ```
+
+如果旧版本的 CLI 一键更新没有可靠生效，可直接使用上面的 release 更新命令。新版 CLI 可通过 `nat --menu` -> `一键更新本项目` 更新核心 `nat`。
 
 失败时会尝试回滚。
 

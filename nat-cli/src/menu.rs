@@ -33,7 +33,7 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
             "2" => add_single_interactive(config_path).map_err(Into::into),
             "3" => add_range_interactive(config_path).map_err(Into::into),
             "4" => delete_rule_interactive(config_path).map_err(Into::into),
-            "5" => show_apply_hint(config_path).map_err(Into::into),
+            "5" => toggle_rule_interactive(config_path).map_err(Into::into),
             "6" => show_nft_rules().map_err(Into::into),
             "7" => stats_menu(config_path).map_err(Into::into),
             "8" => {
@@ -74,6 +74,12 @@ fn clear_screen() {
 
 fn wait_enter_to_continue() -> Result<(), io::Error> {
     let _ = prompt("按 Enter 返回主菜单...")?;
+    Ok(())
+}
+
+fn wait_enter_to_return() -> Result<(), io::Error> {
+    let _ = prompt("按 Enter 返回...")?;
+    clear_screen();
     Ok(())
 }
 
@@ -180,7 +186,7 @@ fn show_rules(path: &str) -> Result<(), io::Error> {
         return Ok(());
     }
     for (index, rule) in config.rules.iter().enumerate() {
-        println!("{index}) {}", format_rule(rule));
+        println!("{index}) [{}] {}", rule_status(rule), format_rule(rule));
     }
     Ok(())
 }
@@ -277,12 +283,6 @@ fn print_config_saved_hint(path: &str) {
     println!("  journalctl -u nat -n 120 --no-pager");
     println!("如果未自动生效，可手动执行：");
     println!("  systemctl restart nat");
-}
-
-fn show_apply_hint(path: &str) -> Result<(), io::Error> {
-    println!("当前规则模型没有 enabled 字段，暂不提供逐条启用 / 禁用。");
-    print_config_saved_hint(path);
-    Ok(())
 }
 
 fn refresh_ddns_interactive(
@@ -390,13 +390,28 @@ Stats 流量统计
         );
         let choice = prompt("请选择操作: ")?;
         match choice.trim() {
-            "1" | "" => continue,
-            "2" => switch_traffic_mode(config_path)?,
-            "3" => reset_stats(config_path, true, false)?,
-            "4" => reset_stats(config_path, false, true)?,
+            "1" | "" => {
+                wait_enter_to_return()?;
+                continue;
+            }
+            "2" => {
+                switch_traffic_mode(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "3" => {
+                reset_stats(config_path, true, false)?;
+                wait_enter_to_return()?;
+            }
+            "4" => {
+                reset_stats(config_path, false, true)?;
+                wait_enter_to_return()?;
+            }
             "0" | "q" | "quit" | "exit" => break,
             value if is_menu_refresh_command(value) => break,
-            _ => println!("未知选项: {}", choice.trim()),
+            _ => {
+                println!("未知选项: {}", choice.trim());
+                wait_enter_to_return()?;
+            }
         }
     }
     Ok(())
@@ -593,8 +608,15 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
         );
         let choice = prompt("请选择操作: ")?;
         match choice.trim() {
-            "1" => print_access_entries(&config),
-            "2" => config.access_control.mode = AccessControlMode::Off,
+            "1" => {
+                print_access_entries(&config);
+                wait_enter_to_return()?;
+            }
+            "2" => {
+                config.access_control.mode = AccessControlMode::Off;
+                println!("访问控制模式已设为 off。");
+                wait_enter_to_return()?;
+            }
             "3" => {
                 println!(
                     "白名单只影响本项目转发端口，不影响 SSH；请确认需要访问转发端口的来源 IP 已加入白名单。"
@@ -602,23 +624,31 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
                 if confirm("确认切换到 whitelist? [y/N]: ")? {
                     config.access_control.mode = AccessControlMode::Whitelist;
                 }
+                wait_enter_to_return()?;
             }
             "4" => {
                 println!("黑名单只阻断本项目转发端口，不影响 SSH。");
                 if confirm("确认切换到 blacklist? [y/N]: ")? {
                     config.access_control.mode = AccessControlMode::Blacklist;
                 }
+                wait_enter_to_return()?;
             }
             "5" => {
                 let entry = prompt("请输入 IP/CIDR: ")?;
                 validate_access_entry(&entry)?;
                 add_access_entry(&mut config, entry);
+                println!("entry 已加入待保存配置。");
+                wait_enter_to_return()?;
             }
-            "6" => delete_access_entry_interactive(&mut config)?,
+            "6" => {
+                delete_access_entry_interactive(&mut config)?;
+                wait_enter_to_return()?;
+            }
             "7" => {
                 if confirm("确认清空 entries? [y/N]: ")? {
                     clear_access_entries(&mut config);
                 }
+                wait_enter_to_return()?;
             }
             "8" => {
                 config
@@ -629,9 +659,15 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
                 save_toml_config(path, &config)?;
                 println!("访问控制配置已保存。");
                 print_config_saved_hint(path);
+                wait_enter_to_return()?;
             }
             "0" => break,
-            _ => println!("未知选项: {}", choice.trim()),
+            value if is_menu_refresh_command(value) => break,
+            "" => continue,
+            _ => {
+                println!("未知选项: {}", choice.trim());
+                wait_enter_to_return()?;
+            }
         }
     }
     Ok(())
@@ -689,8 +725,10 @@ pub(crate) fn clear_access_entries(config: &mut TomlConfig) {
 }
 
 fn show_recent_source_design() {
-    println!("Phase 4A 设计：最近来源 IP 观察只展示命中，不自动封禁。");
-    println!("后续可由用户手动选择加入 blacklist，避免误封。");
+    println!("最近来源 IP 观察用于查看访问转发端口的来源 IP。");
+    println!("它不等同于白名单 / 黑名单管理，不会自动放行或封禁来源 IP。");
+    println!("当前 CLI 不要求启用白名单或黑名单，也不会修改 access_control 配置。");
+    println!("暂无来源 IP 记录。请从外部客户端访问转发端口后刷新。");
 }
 
 fn bbr_telegram_menu(config_path: &str) -> Result<(), io::Error> {
@@ -703,25 +741,54 @@ BBR / Telegram 状态
 2) 开启 BBR
 3) 关闭 BBR
 4) 查看 Telegram 配置状态
-5) 配置 Telegram bot_token 和 chat_id
+5) 配置 Telegram token 和 chat_id
 6) 测试 Telegram 通知
 7) 启用 / 禁用 Telegram 通知
+8) 设置 Telegram 通知间隔
 0) 返回主菜单
 ===================================="#
         );
         let choice = prompt("请选择操作: ")?;
         match choice.trim() {
-            "1" => show_bbr_status(),
-            "2" => enable_bbr_interactive()?,
-            "3" => disable_bbr_interactive()?,
-            "4" => show_telegram_status(config_path)?,
-            "5" => configure_telegram(config_path)?,
-            "6" => test_telegram_notification(config_path)?,
-            "7" => toggle_telegram(config_path)?,
+            "1" => {
+                show_bbr_status();
+                wait_enter_to_return()?;
+            }
+            "2" => {
+                enable_bbr_interactive()?;
+                wait_enter_to_return()?;
+            }
+            "3" => {
+                disable_bbr_interactive()?;
+                wait_enter_to_return()?;
+            }
+            "4" => {
+                show_telegram_status(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "5" => {
+                configure_telegram(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "6" => {
+                test_telegram_notification(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "7" => {
+                toggle_telegram(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "8" => {
+                set_telegram_interval(config_path)?;
+                wait_enter_to_return()?;
+            }
             "0" | "q" | "quit" | "exit" => break,
             value if is_menu_refresh_command(value) => break,
             "" => continue,
-            _ => println!("未知选项: {}", choice.trim()),
+            _ => {
+                println!("未知选项: {}", choice.trim());
+                wait_enter_to_return()?;
+            }
         }
     }
     Ok(())
@@ -822,14 +889,15 @@ fn show_telegram_status(config_path: &str) -> Result<(), io::Error> {
     let config = load_toml_config(config_path)?;
     let telegram = config.telegram;
     println!("enabled: {}", telegram.enabled);
-    println!(
-        "bot_token: {}",
-        if telegram.bot_token.is_empty() {
-            "(未配置)".to_string()
-        } else {
+    let token_status = if telegram.bot_token.is_empty() {
+        "未配置".to_string()
+    } else {
+        format!(
+            "已配置 ({})",
             traffic_stats::mask_bot_token(&telegram.bot_token)
-        }
-    );
+        )
+    };
+    println!("token: {token_status}");
     println!(
         "chat_id: {}",
         if telegram.chat_id.is_empty() {
@@ -849,18 +917,21 @@ fn show_telegram_status(config_path: &str) -> Result<(), io::Error> {
 
 fn configure_telegram(config_path: &str) -> Result<(), io::Error> {
     let mut config = load_toml_config(config_path)?;
-    let bot_token = prompt_secret("请输入 Telegram bot_token: ")?;
+    let bot_token = prompt_secret("请输入 Telegram token: ")?;
     let chat_id = prompt("请输入 Telegram chat_id: ")?;
     if bot_token.trim().is_empty() || chat_id.trim().is_empty() {
-        println!("bot_token/chat_id 不能为空。");
+        println!("token/chat_id 不能为空。");
         return Ok(());
     }
-    config.telegram.enabled = true;
     config.telegram.bot_token = bot_token;
     config.telegram.chat_id = chat_id;
+    let enable = prompt("是否启用 Telegram 通知？[y/N]: ")?;
+    if matches!(enable.as_str(), "y" | "Y" | "yes" | "YES") {
+        config.telegram.enabled = true;
+    }
     backup_config(config_path)?;
     save_toml_config(config_path, &config)?;
-    println!("Telegram 配置已保存，bot_token 不会明文显示。");
+    println!("Telegram 配置已保存，token 不会明文显示。");
     print_config_saved_hint(config_path);
     Ok(())
 }
@@ -868,7 +939,7 @@ fn configure_telegram(config_path: &str) -> Result<(), io::Error> {
 fn test_telegram_notification(config_path: &str) -> Result<(), io::Error> {
     let config = load_toml_config(config_path)?;
     if config.telegram.bot_token.is_empty() || config.telegram.chat_id.is_empty() {
-        println!("请先配置 Telegram bot_token 和 chat_id。");
+        println!("请先配置 Telegram token 和 chat_id。");
         return Ok(());
     }
     let result = traffic_stats::send_telegram_with(
@@ -911,7 +982,27 @@ fn send_telegram_http_for_cli(url: &str, params: &[(&str, &str)]) -> Result<(), 
 
 fn toggle_telegram(config_path: &str) -> Result<(), io::Error> {
     let mut config = load_toml_config(config_path)?;
-    config.telegram.enabled = !config.telegram.enabled;
+    println!(
+        "当前 Telegram 通知状态: {}",
+        if config.telegram.enabled {
+            "启用"
+        } else {
+            "禁用"
+        }
+    );
+    println!("1) 启用 Telegram 通知");
+    println!("2) 禁用 Telegram 通知");
+    println!("0) 返回");
+    let choice = prompt("请选择操作: ")?;
+    match choice.trim() {
+        "1" => config.telegram.enabled = true,
+        "2" => config.telegram.enabled = false,
+        "0" => return Ok(()),
+        _ => {
+            println!("未知选项: {}", choice.trim());
+            return Ok(());
+        }
+    }
     backup_config(config_path)?;
     save_toml_config(config_path, &config)?;
     println!(
@@ -922,6 +1013,31 @@ fn toggle_telegram(config_path: &str) -> Result<(), io::Error> {
             "禁用"
         }
     );
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn set_telegram_interval(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    println!(
+        "当前 Telegram 通知间隔: {} 分钟",
+        config.telegram.notify_interval_minutes
+    );
+    let value = prompt("请输入新的通知间隔，单位分钟，最小 1，默认建议 60: ")?;
+    let minutes = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "通知间隔必须是分钟数"))?;
+    if minutes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "通知间隔最小为 1 分钟",
+        ));
+    }
+    config.telegram.notify_interval_minutes = minutes;
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    println!("Telegram 通知间隔已保存为 {minutes} 分钟。");
     print_config_saved_hint(config_path);
     Ok(())
 }
@@ -1159,8 +1275,9 @@ fn update_menu() -> Result<(), io::Error> {
     };
 
     println!("更新摘要：");
-    println!("  将更新: 核心转发 nat 和 nat.service");
-    println!("  版本: {version}");
+    println!("  当前版本: {}", env!("CARGO_PKG_VERSION"));
+    println!("  目标版本: {version}");
+    println!("  将更新: /usr/local/bin/nat 和 nat.service");
     println!("  下载方式: GitHub Release 预编译包优先");
     println!("  备份: /etc/nftables-nat/backups/update-YYYYmmdd-HHMMSS/");
     println!("  保留: /etc/nat.toml、/etc/nat.conf、stats、backups");
@@ -1183,10 +1300,13 @@ fn update_menu() -> Result<(), io::Error> {
     println!("开始更新，install.sh 会负责备份、重启和失败回滚。");
     let status = Command::new("sh").arg("-c").arg(command_line).status()?;
     if status.success() {
-        println!("更新命令执行完成。");
+        println!("更新完成，请重新进入菜单：");
+        println!("  nat --menu");
         Ok(())
     } else {
-        Err(io::Error::other("更新命令执行失败，请查看输出和服务日志"))
+        Err(io::Error::other(
+            "更新命令执行失败。install.sh 会保留旧二进制并在可能时回滚，请查看输出和服务日志",
+        ))
     }
 }
 
@@ -1205,7 +1325,12 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
     let config = load_toml_config(path)?;
     let rules = forward_test::list_testable_rules(&config);
     if rules.is_empty() {
-        println!("当前没有可测试的转发规则");
+        if config.rules.iter().any(|rule| !rule.enabled()) {
+            println!("当前没有启用的可测试转发规则。");
+            println!("禁用规则不会应用到 nft，也不会出现在默认连通性测试列表。");
+        } else {
+            println!("当前没有可测试的转发规则");
+        }
         return Ok(());
     }
     for rule in &rules {
@@ -1339,6 +1464,7 @@ pub(crate) fn add_single_rule(
     comment: Option<String>,
 ) -> Result<(), String> {
     let rule = NftCell::Single {
+        enabled: true,
         sport,
         dport,
         domain,
@@ -1361,6 +1487,7 @@ pub(crate) fn add_range_rule(
     comment: Option<String>,
 ) -> Result<(), String> {
     let rule = NftCell::Range {
+        enabled: true,
         port_start,
         port_end,
         domain,
@@ -1378,6 +1505,68 @@ pub(crate) fn delete_rule(config: &mut TomlConfig, index: usize) -> Result<NftCe
         return Err("规则 index 超出范围".to_string());
     }
     Ok(config.rules.remove(index))
+}
+
+fn toggle_rule_interactive(path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(path)?;
+    if config.rules.is_empty() {
+        println!("当前没有转发规则。");
+        return Ok(());
+    }
+
+    println!("当前规则：");
+    for (index, rule) in config.rules.iter().enumerate() {
+        println!(
+            "{}) [{}] {}",
+            index + 1,
+            rule_status(rule),
+            format_rule(rule)
+        );
+    }
+    println!("0) 返回");
+
+    let index = parse_index(&prompt("请选择规则编号: ")?)?;
+    if index == 0 {
+        return Ok(());
+    }
+    let rule_index = index - 1;
+    let Some(rule) = config.rules.get(rule_index) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "规则编号超出范围",
+        ));
+    };
+
+    println!("当前规则：");
+    println!("{}", format_rule_details(rule));
+    println!("当前状态：{}", rule_status(rule));
+    println!("请选择操作：");
+    println!("1) 启用此规则");
+    println!("2) 禁用此规则");
+    println!("0) 返回");
+    let action = prompt("请选择操作: ")?;
+    match action.trim() {
+        "1" => config.rules[rule_index].set_enabled(true),
+        "2" => config.rules[rule_index].set_enabled(false),
+        "0" => return Ok(()),
+        _ => {
+            println!("未知选项: {}", action.trim());
+            return Ok(());
+        }
+    }
+
+    backup_config(path)?;
+    save_toml_config(path, &config)?;
+    println!(
+        "规则已{}。",
+        if config.rules[rule_index].enabled() {
+            "启用"
+        } else {
+            "禁用"
+        }
+    );
+    print_config_saved_hint(path);
+    Ok(())
 }
 
 pub(crate) fn parse_port(value: &str) -> Result<u16, io::Error> {
@@ -1498,6 +1687,60 @@ pub(crate) fn format_rule(rule: &NftCell) -> String {
         NftCell::Drop { comment, .. } => {
             format!("DROP {}", format_comment(comment))
         }
+    }
+}
+
+fn rule_status(rule: &NftCell) -> &'static str {
+    if rule.enabled() { "启用" } else { "禁用" }
+}
+
+fn format_rule_details(rule: &NftCell) -> String {
+    match rule {
+        NftCell::Single {
+            sport,
+            dport,
+            domain,
+            protocol,
+            ip_version,
+            comment,
+            ..
+        } => format!(
+            "comment: {}\nsport: {sport}\ntarget: {domain}\ndport: {dport}\nprotocol: {protocol}\nip_version: {ip_version}",
+            comment.as_deref().unwrap_or("(无)")
+        ),
+        NftCell::Range {
+            port_start,
+            port_end,
+            domain,
+            protocol,
+            ip_version,
+            comment,
+            ..
+        } => format!(
+            "comment: {}\nsport: {port_start}-{port_end}\ntarget: {domain}\ndport: {port_start}-{port_end}\nprotocol: {protocol}\nip_version: {ip_version}",
+            comment.as_deref().unwrap_or("(无)")
+        ),
+        NftCell::Redirect {
+            src_port,
+            src_port_end,
+            dst_port,
+            protocol,
+            ip_version,
+            comment,
+            ..
+        } => {
+            let sport = src_port_end
+                .map(|end| format!("{src_port}-{end}"))
+                .unwrap_or_else(|| src_port.to_string());
+            format!(
+                "comment: {}\nsport: {sport}\ntarget: localhost\ndport: {dst_port}\nprotocol: {protocol}\nip_version: {ip_version}",
+                comment.as_deref().unwrap_or("(无)")
+            )
+        }
+        NftCell::Drop { comment, .. } => format!(
+            "comment: {}\ntype: drop",
+            comment.as_deref().unwrap_or("(无)")
+        ),
     }
 }
 

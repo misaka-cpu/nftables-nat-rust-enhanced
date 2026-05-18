@@ -231,6 +231,7 @@ pub fn rule_labels_from_config(config: &TomlConfig) -> HashMap<String, String> {
         .rules
         .iter()
         .enumerate()
+        .filter(|(_, rule)| rule.enabled())
         .filter_map(|(index, rule)| rule_to_label(rule).map(|label| (format!("r{index}"), label)))
         .collect()
 }
@@ -750,6 +751,22 @@ comment = "https"
             labels.get("r0").map(String::as_str),
             Some("https: 34120 -> example.com:44336/all")
         );
+    }
+
+    #[test]
+    fn disabled_rules_do_not_build_stats_labels() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+[[rules]]
+type = "single"
+enabled = false
+sport = 34120
+dport = 44336
+domain = "example.com"
+"#,
+        )
+        .unwrap();
+        assert!(rule_labels_from_config(&config).is_empty());
     }
 
     #[test]
