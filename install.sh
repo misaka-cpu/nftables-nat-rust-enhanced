@@ -79,6 +79,7 @@ dry_run_console_install() {
     log_dry_run "would create/update /lib/systemd/system/nat-console.service"
     log_dry_run "would update nat-console.service to use EnvironmentFile"
     log_dry_run "would not put --password or --jwt-secret in ExecStart"
+    log_dry_run "would set nat-console.service LimitNOFILE=65535"
     log_dry_run "would use NAT_CONSOLE_USERNAME or default admin"
     log_dry_run "would use NAT_CONSOLE_PORT or default 5533"
     log_dry_run "would use NAT_CONSOLE_BIND or ask user to choose WebUI bind address"

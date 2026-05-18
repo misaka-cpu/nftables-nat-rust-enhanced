@@ -206,6 +206,11 @@ if [ -f "$SERVICE_FILE" ]; then
     # 移除 --compatible-config 和 --toml-config 参数
     sed -i 's/ --compatible-config [^ ]*//g' "$SERVICE_FILE"
     sed -i 's/ --toml-config [^ ]*//g' "$SERVICE_FILE"
+    if grep -q '^LimitNOFILE=' "$SERVICE_FILE"; then
+        sed -i 's/^LimitNOFILE=.*/LimitNOFILE=65535/' "$SERVICE_FILE"
+    else
+        sed -i '/^RestartSec=/a LimitNOFILE=65535' "$SERVICE_FILE"
+    fi
     systemctl daemon-reload
     echo "systemd service 配置已更新，配置格式将自动从 NAT 服务检测"
 fi

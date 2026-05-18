@@ -574,6 +574,7 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$INSTALL_PATH
 Restart=on-failure
 RestartSec=5
+LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal
 
