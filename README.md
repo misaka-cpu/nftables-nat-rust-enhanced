@@ -140,6 +140,8 @@ SHA256SUMS
 
 每个 tar.gz 包含 `nat`、`nat-console`、`static/`、`install.sh`、`setup.sh`、`setup-console.sh`、`setup-console-assets.sh`、`README.md`、`LICENSE`、`NOTICE`。下载后如果 `SHA256SUMS` 可用，安装脚本会校验 SHA256；校验失败或资产不匹配会停止，不会静默执行错误版本。
 
+Release 预编译包以 Debian 12 / Bookworm 为构建基线，目标兼容 Debian 12 / Ubuntu 22.04+。如果遇到 `/lib/.../libc.so.6: version 'GLIBC_x.xx' not found`，说明下载了不兼容的旧 release 包；请升级到修复后的 release，或使用 `--build-from-source` 在本机编译。
+
 当前 release workflow 第一版构建并发布 `linux-amd64`。`linux-arm64` 是安装脚本支持的资产命名；如果 Release 暂未提供 arm64 包，脚本会提示没有匹配预编译包并 fallback 到源码编译，或可显式使用 `--build-from-source`。
 
 正式 VPS 的 WebUI 建议绑定 `127.0.0.1`，并通过 SSH 隧道访问；`0.0.0.0` 只建议局域网或已配置防火墙时使用。
@@ -150,10 +152,22 @@ SHA256SUMS
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --with-console --use-release
 ```
 
+安装完成后，交互式终端会询问是否立即进入 CLI 管理菜单。如需安装后自动进入菜单：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --with-console --use-release --enter-menu
+```
+
 只装核心：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release
+```
+
+只装核心时也会在交互式终端询问是否立即进入 CLI 管理菜单。自动进入菜单：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --enter-menu
 ```
 
 只装 WebUI：
@@ -212,6 +226,7 @@ bash install.sh --with-console --build-from-source
 cargo build --release
 bash install.sh --dry-run --core-only
 bash install.sh --core-only
+bash install.sh --core-only --enter-menu
 ```
 
 ### 只安装 WebUI
@@ -253,6 +268,7 @@ bash install.sh
 --version <tag>  指定 release 版本，例如 v0.1.0；默认 latest
 --repo <owner/repo>
                  指定 release 仓库；默认 misaka-cpu/nftables-nat-rust-enhanced
+--enter-menu     安装完成后自动进入 CLI 管理菜单
 --uninstall      卸载服务文件和二进制，保留用户配置
 --help           显示帮助
 ```
@@ -264,6 +280,8 @@ bash install.sh --dry-run --core-only
 bash install.sh --dry-run --with-console --use-release
 bash install.sh --core-only --use-release
 bash install.sh --with-console --use-release
+bash install.sh --core-only --use-release --enter-menu
+bash install.sh --with-console --use-release --enter-menu
 bash install.sh --console-only --use-release
 bash install.sh --assets-only
 bash install.sh --with-console --version v0.1.0 --repo misaka-cpu/nftables-nat-rust-enhanced
@@ -277,6 +295,8 @@ bash install.sh --with-console --build-from-source
 - `--use-release` 会优先下载 release，即使本地存在构建产物。
 - release 下载失败、架构不匹配或校验失败时，会明确输出错误并 fallback 到源码编译；可用 `--build-from-source` 强制源码编译。
 - dry-run 模式只显示计划下载的 asset、校验和 fallback 流程，不会真实下载、安装、执行 systemctl、nft、apt-get。
+- `--core-only` 和 `--with-console` 安装成功后，交互式终端会询问是否立即进入 CLI 管理菜单；非 TTY 环境只输出 `nat --menu` 提示，不会卡住等待输入。
+- `--enter-menu` 会在安装完成后自动执行 `/usr/local/bin/nat --menu`；`--console-only` 默认不进入菜单，除非显式传入 `--enter-menu` 且已安装核心 nat。
 
 核心 nat 安装不依赖 nodejs/npm；使用 release payload 更新 WebUI assets 时也不需要 nodejs/npm。
 

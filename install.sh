@@ -13,6 +13,8 @@ RELEASE_PAYLOAD_DIR=""
 RELEASE_ASSET=""
 USE_RELEASE_SEEN=0
 BUILD_SOURCE_SEEN=0
+ENTER_MENU=0
+NAT_MENU_BIN="${NAT_MENU_BIN:-/usr/local/bin/nat}"
 
 log_info() {
     echo "[INFO] $1"
@@ -50,6 +52,7 @@ usage() {
   --version TAG    指定 GitHub Release 版本，默认 latest
   --repo OWNER/REPO
                    指定 GitHub 仓库，默认 $RELEASE_REPO
+  --enter-menu     安装完成后自动进入 CLI 管理菜单
   --uninstall      交互卸载/清理本项目
   --core           与 --uninstall 组合，仅卸载核心 nat
   --console        与 --uninstall 组合，仅卸载 WebUI nat-console
@@ -64,6 +67,7 @@ usage() {
 示例:
   $0 --dry-run --core-only
   $0 --core-only --use-release
+  $0 --core-only --use-release --enter-menu
   $0 --with-console --use-release
   $0 --console-only
   $0 --assets-only
@@ -331,6 +335,85 @@ dry_run_uninstall() {
     log_dry_run "default would preserve /etc/nat.conf /etc/nat.toml /var/lib/nftables-nat-rust/stats.json /etc/nftables-nat/backups /opt/nat-console/env /etc/ssl/nat-webui.crt /etc/ssl/nat-webui.key"
 }
 
+is_interactive_terminal() {
+    [ -t 0 ] && [ -t 1 ]
+}
+
+run_cli_menu() {
+    local err_file
+    if [ ! -x "$NAT_MENU_BIN" ]; then
+        log_warn "未检测到核心 nat，无法进入 CLI 管理菜单。请先安装核心服务。"
+        return 0
+    fi
+    log_info "entering CLI management menu: $NAT_MENU_BIN --menu"
+    err_file="$(mktemp)"
+    if "$NAT_MENU_BIN" --menu 2>"$err_file"; then
+        rm -f "$err_file"
+        return 0
+    fi
+    if grep -E "GLIBC_[0-9.]+.*not found|version .*GLIBC_[0-9.]+.*not found" "$err_file" >/dev/null 2>&1; then
+        log_err "当前 release 二进制与系统 glibc 不兼容。"
+        log_err "请使用更新后的 GitHub Release，或使用 --build-from-source 在本机编译。"
+        log_err "原始错误: $(tr '\n' ' ' < "$err_file")"
+        rm -f "$err_file"
+        return 1
+    fi
+    cat "$err_file" >&2
+    rm -f "$err_file"
+    return 1
+}
+
+maybe_enter_cli_menu() {
+    local action="$1"
+    case "$action" in
+        --core-only|--with-console)
+            if [ "$DRY_RUN" -eq 1 ]; then
+                if [ "$ENTER_MENU" -eq 1 ]; then
+                    log_dry_run "would automatically enter CLI management menu after install: $NAT_MENU_BIN --menu"
+                else
+                    log_dry_run "dry-run: 安装完成后可选择进入 CLI 管理菜单"
+                fi
+                return 0
+            fi
+            if [ "$ENTER_MENU" -eq 1 ]; then
+                run_cli_menu
+                return 0
+            fi
+            if is_interactive_terminal; then
+                local answer
+                read -r -p "是否立即进入 CLI 管理菜单？[y/N]: " answer
+                case "${answer:-}" in
+                    y|Y|yes|YES)
+                        run_cli_menu
+                        ;;
+                    *)
+                        log_info "后续可使用 nat --menu 进入 CLI 管理菜单。"
+                        ;;
+                esac
+            else
+                log_info "后续可使用 nat --menu 进入 CLI 管理菜单。"
+            fi
+            ;;
+        --console-only)
+            if [ "$DRY_RUN" -eq 1 ]; then
+                if [ "$ENTER_MENU" -eq 1 ]; then
+                    log_dry_run "would enter CLI management menu only if core nat is installed: $NAT_MENU_BIN --menu"
+                else
+                    log_dry_run "console-only does not enter CLI management menu by default"
+                fi
+                return 0
+            fi
+            if [ "$ENTER_MENU" -eq 1 ]; then
+                run_cli_menu
+            elif [ -x "$NAT_MENU_BIN" ]; then
+                log_info "已检测到核心 nat，可使用 nat --menu 管理转发规则。"
+            fi
+            ;;
+        *)
+            ;;
+    esac
+}
+
 run_core_install() {
     local config_type="${1:-${NAT_CONFIG_TYPE:-toml}}"
     if [ "$config_type" != "legacy" ] && [ "$config_type" != "toml" ]; then
@@ -514,16 +597,19 @@ run_menu() {
             config_type="$(ask_config_type)"
             prepare_install_payload "--core-only"
             run_core_install "$config_type"
+            maybe_enter_cli_menu "--core-only"
             ;;
         2)
             config_type="$(ask_config_type)"
             prepare_install_payload "--with-console"
             run_core_install "$config_type"
             run_console_install
+            maybe_enter_cli_menu "--with-console"
             ;;
         3)
             prepare_install_payload "--console-only"
             run_console_install
+            maybe_enter_cli_menu "--console-only"
             ;;
         4)
             prepare_install_payload "--assets-only"
@@ -560,6 +646,9 @@ while [ "$#" -gt 0 ]; do
         --build-from-source)
             INSTALL_MODE="source"
             BUILD_SOURCE_SEEN=1
+            ;;
+        --enter-menu)
+            ENTER_MENU=1
             ;;
         --version)
             if [ "$#" -lt 2 ] || [ -z "$2" ]; then
@@ -645,13 +734,16 @@ prepare_install_payload "$ACTION"
 case "$ACTION" in
     --core-only)
         NAT_NONINTERACTIVE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}"
+        maybe_enter_cli_menu "--core-only"
         ;;
     --with-console)
         NAT_NONINTERACTIVE=1 NAT_START_SERVICE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}"
         NAT_SKIP_SERVICE_PROMPT=1 run_console_install
+        maybe_enter_cli_menu "--with-console"
         ;;
     --console-only)
         NAT_SKIP_SERVICE_PROMPT=1 run_console_install
+        maybe_enter_cli_menu "--console-only"
         ;;
     --assets-only)
         NAT_NONINTERACTIVE=1 run_assets_install

@@ -29,6 +29,27 @@ log_err() {
     echo "[ERR] $1"
 }
 
+check_binary_glibc_compat() {
+    local binary="$1"
+    local name="$2"
+    local err_file
+    err_file="$(mktemp)"
+    if "$binary" --help >/dev/null 2>"$err_file"; then
+        rm -f "$err_file"
+        return 0
+    fi
+    if grep -E "GLIBC_[0-9.]+.*not found|version .*GLIBC_[0-9.]+.*not found" "$err_file" >/dev/null 2>&1; then
+        log_err "当前 release 二进制与系统 glibc 不兼容: $name"
+        log_err "请使用更新后的 GitHub Release，或使用 --build-from-source 在本机编译。"
+        log_err "原始错误: $(tr '\n' ' ' < "$err_file")"
+        rm -f "$err_file"
+        exit 1
+    fi
+    log_warn "$name binary smoke check failed; continuing because this is not a GLIBC compatibility error"
+    sed 's/^/[WARN] /' "$err_file" || true
+    rm -f "$err_file"
+}
+
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
         log_err "Please run as root"
@@ -172,6 +193,7 @@ LOCAL_NAT_BIN="${NAT_BINARY_DIR:-$SCRIPT_DIR/target/release}/nat"
 if [ -x "$LOCAL_NAT_BIN" ]; then
     log_info "using nat binary: $LOCAL_NAT_BIN"
     install -m 755 "$LOCAL_NAT_BIN" /usr/local/bin/nat
+    check_binary_glibc_compat /usr/local/bin/nat nat
 else
     log_err "nat binary not found: $LOCAL_NAT_BIN"
     log_err "run install.sh with --use-release or build first with: cargo build --release"

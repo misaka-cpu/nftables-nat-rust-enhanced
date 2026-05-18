@@ -12,17 +12,52 @@ env:
   CARGO_TERM_COLOR: always
   PROJECT_NAME: nftables-nat-rust-enhanced
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build-linux-amd64:
     name: build linux-amd64
     runs-on: ubuntu-latest
+    container: debian:12
     steps:
+      - name: Install Debian build dependencies
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y curl ca-certificates git build-essential pkg-config libssl-dev tar gzip
+
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
+          rustc --version
+          cargo --version
 
       - name: Build release binaries
-        run: cargo build --release --locked
+        run: |
+          set -euo pipefail
+          . "$HOME/.cargo/env"
+          cargo build --release --locked
+
+      - name: Check GLIBC compatibility
+        run: |
+          set -euo pipefail
+          check_glibc() {
+            binary="$1"
+            max_glibc="$(strings "$binary" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 | sed 's/^GLIBC_//' || true)"
+            echo "$binary max GLIBC_${max_glibc:-none}"
+            if [ -n "$max_glibc" ] && [ "$(printf '%s\n%s\n' "2.36" "$max_glibc" | sort -V | tail -1)" != "2.36" ]; then
+              echo "error: $binary requires GLIBC_$max_glibc; Debian 12 compatibility requires <= GLIBC_2.36" >&2
+              exit 1
+            fi
+          }
+          check_glibc target/release/nat
+          check_glibc target/release/nat-console
 
       - name: Package release asset
         run: |
