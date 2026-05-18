@@ -4,29 +4,18 @@ pub const CORE_SERVICE_PATHS: [&str; 2] = [
     "/lib/systemd/system/nat.service",
     "/etc/systemd/system/nat.service",
 ];
-pub const CONSOLE_SERVICE_PATHS: [&str; 2] = [
-    "/lib/systemd/system/nat-console.service",
-    "/etc/systemd/system/nat-console.service",
-];
 pub const NAT_BINARY: &str = "/usr/local/bin/nat";
-pub const NAT_CONSOLE_BINARY: &str = "/usr/local/bin/nat-console";
 pub const CONFIG_TOML: &str = "/etc/nat.toml";
 pub const CONFIG_LEGACY: &str = "/etc/nat.conf";
 pub const STATS_JSON: &str = "/var/lib/nftables-nat-rust/stats.json";
 pub const STATS_DIR: &str = "/var/lib/nftables-nat-rust";
 pub const BACKUPS_DIR: &str = "/etc/nftables-nat/backups";
 pub const BACKUPS_ROOT: &str = "/etc/nftables-nat";
-pub const CONSOLE_DIR: &str = "/opt/nat-console";
-pub const CONSOLE_ENV: &str = "/opt/nat-console/env";
-pub const CONSOLE_CERT: &str = "/etc/ssl/nat-webui.crt";
-pub const CONSOLE_KEY: &str = "/etc/ssl/nat-webui.key";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UninstallTarget {
     Core,
-    Console,
-    All,
     NftTables,
 }
 
@@ -62,7 +51,7 @@ pub fn validate_uninstall_request(
 
 pub fn plan_uninstall(target: UninstallTarget, data_mode: DataMode) -> UninstallPlan {
     let mut plan = UninstallPlan::default();
-    if matches!(target, UninstallTarget::Core | UninstallTarget::All) {
+    if matches!(target, UninstallTarget::Core) {
         plan.actions.extend([
             "stop nat.service".to_string(),
             "disable nat.service".to_string(),
@@ -70,23 +59,10 @@ pub fn plan_uninstall(target: UninstallTarget, data_mode: DataMode) -> Uninstall
             format!("remove {NAT_BINARY}"),
         ]);
     }
-    if matches!(
-        target,
-        UninstallTarget::Core | UninstallTarget::All | UninstallTarget::NftTables
-    ) {
+    if matches!(target, UninstallTarget::Core | UninstallTarget::NftTables) {
         plan.actions.extend(
             nft_table_names().map(|(family, table)| format!("delete nft table {family} {table}")),
         );
-    }
-    if matches!(target, UninstallTarget::Console | UninstallTarget::All) {
-        plan.actions.extend([
-            "stop nat-console.service".to_string(),
-            "disable nat-console.service".to_string(),
-            "remove nat-console.service".to_string(),
-            format!("remove {NAT_CONSOLE_BINARY}"),
-        ]);
-        plan.warnings
-            .push("WebUI will become unavailable".to_string());
     }
 
     match data_mode {
@@ -99,9 +75,6 @@ pub fn plan_uninstall(target: UninstallTarget, data_mode: DataMode) -> Uninstall
             plan.actions.extend([
                 format!("remove {CONFIG_LEGACY} if selected"),
                 format!("remove {STATS_JSON}"),
-                format!("remove {CONSOLE_ENV}"),
-                format!("remove {CONSOLE_CERT}"),
-                format!("remove {CONSOLE_KEY}"),
             ]);
         }
         DataMode::Purge => {
@@ -110,13 +83,9 @@ pub fn plan_uninstall(target: UninstallTarget, data_mode: DataMode) -> Uninstall
                 format!("remove {CONFIG_LEGACY}"),
                 format!("remove {STATS_DIR}"),
                 format!("remove {BACKUPS_ROOT}"),
-                format!("remove {CONSOLE_DIR}"),
-                format!("remove {CONSOLE_CERT}"),
-                format!("remove {CONSOLE_KEY}"),
             ]);
-            plan.warnings.push(
-                "purge deletes project config, stats, backups, WebUI env/cert/key".to_string(),
-            );
+            plan.warnings
+                .push("purge deletes project config, stats, and backups".to_string());
         }
     }
     plan
@@ -128,9 +97,6 @@ pub fn kept_data_paths() -> Vec<String> {
         CONFIG_LEGACY.to_string(),
         STATS_JSON.to_string(),
         BACKUPS_DIR.to_string(),
-        CONSOLE_ENV.to_string(),
-        CONSOLE_CERT.to_string(),
-        CONSOLE_KEY.to_string(),
     ]
 }
 
@@ -170,37 +136,6 @@ mod tests {
     }
 
     #[test]
-    fn plans_console_uninstall_without_core() {
-        let plan = plan_uninstall(UninstallTarget::Console, DataMode::Keep);
-        assert!(
-            plan.actions
-                .iter()
-                .any(|action| action == "stop nat-console.service")
-        );
-        assert!(
-            !plan
-                .actions
-                .iter()
-                .any(|action| action == "stop nat.service")
-        );
-    }
-
-    #[test]
-    fn plans_all_uninstall() {
-        let plan = plan_uninstall(UninstallTarget::All, DataMode::Keep);
-        assert!(
-            plan.actions
-                .iter()
-                .any(|action| action == "stop nat.service")
-        );
-        assert!(
-            plan.actions
-                .iter()
-                .any(|action| action == "stop nat-console.service")
-        );
-    }
-
-    #[test]
     fn nft_tables_target_only_deletes_self_tables() {
         let plan = plan_uninstall(UninstallTarget::NftTables, DataMode::Keep);
         assert_eq!(plan.actions.len(), 4);
@@ -209,9 +144,9 @@ mod tests {
 
     #[test]
     fn purge_requires_delete_confirmation() {
-        assert!(validate_uninstall_request(UninstallTarget::All, DataMode::Purge, None).is_err());
+        assert!(validate_uninstall_request(UninstallTarget::Core, DataMode::Purge, None).is_err());
         assert!(
-            validate_uninstall_request(UninstallTarget::All, DataMode::Purge, Some("DELETE"))
+            validate_uninstall_request(UninstallTarget::Core, DataMode::Purge, Some("DELETE"))
                 .is_ok()
         );
     }

@@ -57,7 +57,6 @@ jobs:
             fi
           }
           check_glibc target/release/nat
-          check_glibc target/release/nat-console
 
       - name: Package release asset
         run: |
@@ -66,12 +65,8 @@ jobs:
           staging="dist/${asset}"
           mkdir -p "$staging"
           install -m 755 target/release/nat "$staging/nat"
-          install -m 755 target/release/nat-console "$staging/nat-console"
-          cp -a static "$staging/static"
           install -m 755 install.sh "$staging/install.sh"
           install -m 755 setup.sh "$staging/setup.sh"
-          install -m 755 setup-console.sh "$staging/setup-console.sh"
-          install -m 755 setup-console-assets.sh "$staging/setup-console-assets.sh"
           install -m 644 README.md "$staging/README.md"
           install -m 644 LICENSE "$staging/LICENSE"
           install -m 644 NOTICE "$staging/NOTICE"

@@ -7,46 +7,6 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "nat-console",
-            "cargo": {
-                "args": [
-                    "build",
-                    "--package=nat-console",
-                    "--bin=nat-console"
-                ],
-                "problemMatcher": [
-                    "$rustc"
-                ],
-                "filter": {
-                    "name": "nat-console",
-                    "kind": "bin"
-                }
-            },
-            "args": [
-                "--port",
-                "8444",
-                "--username",
-                "admin",
-                "--password",
-                "your_strong_password_here",
-                "--jwt-secret",
-                "dev-secret-key-do-not-use-in-production",
-                "--toml-config=${workspaceFolder}/nat.toml",
-                // "--compatible-config=${workspaceFolder}/nat.conf",
-                "--cert",
-                "${workspaceFolder}/cert.pem",
-                "--key",
-                "${workspaceFolder}/privkey.pem"
-            ],
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "env": {
-                // "RUST_LOG": "debug,nat-console=trace"
-            }
-        },
-        {
-            "type": "lldb",
-            "request": "launch",
             "name": "nat-cli",
             "cargo": {
                 "args": [

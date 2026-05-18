@@ -53,8 +53,8 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
                 Ok(())
             }
             "14" => test_forward_interactive(config_path).map_err(Into::into),
-            "15" => uninstall_menu().map_err(Into::into),
-            "16" => update_menu().map_err(Into::into),
+            "15" => update_menu().map_err(Into::into),
+            "16" => uninstall_menu().map_err(Into::into),
             _ => {
                 println!("未知选项: {}", choice.trim());
                 Ok(())
@@ -101,10 +101,10 @@ nftables-nat-rust-enhanced 管理菜单
 10) 从备份恢复配置
 11) 白名单/黑名单管理
 12) 最近来源 IP 观察
-13) WebUI / BBR / Telegram 状态
+13) BBR / Telegram 状态
 14) 测试转发规则连通性
-15) 卸载 / 清理本项目
-16) 一键更新本项目
+15) 一键更新本项目
+16) 卸载 / 清理本项目
 0) 退出
 ===================================="#
     );
@@ -465,14 +465,14 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
             "2" => config.access_control.mode = AccessControlMode::Off,
             "3" => {
                 println!(
-                    "白名单只影响本项目转发端口，不影响 SSH/WebUI；请确认需要访问转发端口的来源 IP 已加入白名单。"
+                    "白名单只影响本项目转发端口，不影响 SSH；请确认需要访问转发端口的来源 IP 已加入白名单。"
                 );
                 if confirm("确认切换到 whitelist? [y/N]: ")? {
                     config.access_control.mode = AccessControlMode::Whitelist;
                 }
             }
             "4" => {
-                println!("黑名单只阻断本项目转发端口，不影响 SSH/WebUI。");
+                println!("黑名单只阻断本项目转发端口，不影响 SSH。");
                 if confirm("确认切换到 blacklist? [y/N]: ")? {
                     config.access_control.mode = AccessControlMode::Blacklist;
                 }
@@ -569,7 +569,8 @@ fn show_recent_source_design() {
 }
 
 fn show_status_design() {
-    println!("TODO: WebUI / BBR / Telegram 状态将在后续阶段整合。");
+    println!("BBR / Telegram 状态可通过配置文件、服务日志和 stats 输出检查。");
+    println!("Telegram 配置位于 /etc/nat.toml 的 [telegram] 段。");
 }
 
 fn uninstall_menu() -> Result<(), io::Error> {
@@ -578,28 +579,21 @@ fn uninstall_menu() -> Result<(), io::Error> {
 卸载 / 清理 nftables-nat-rust-enhanced
 ====================================
 1) 仅卸载核心转发服务 nat
-2) 仅卸载 WebUI nat-console
-3) 卸载全部
-4) 仅清理本项目 nft 表
+2) 仅清理本项目 nft 表
+3) 完全删除本项目配置/统计/备份，危险
 0) 返回
 ===================================="#
     );
     let choice = prompt("请选择操作: ")?;
-    let target = match choice.trim() {
-        "1" => UninstallTarget::Core,
-        "2" => UninstallTarget::Console,
-        "3" => UninstallTarget::All,
-        "4" => UninstallTarget::NftTables,
+    let (target, data_mode) = match choice.trim() {
+        "1" => (UninstallTarget::Core, ask_uninstall_data_mode()?),
+        "2" => (UninstallTarget::NftTables, DataMode::Keep),
+        "3" => (UninstallTarget::Core, DataMode::Purge),
         "0" => return Ok(()),
         _ => {
             println!("未知选项: {}", choice.trim());
             return Ok(());
         }
-    };
-    let data_mode = if target == UninstallTarget::NftTables {
-        DataMode::Keep
-    } else {
-        ask_uninstall_data_mode()?
     };
     if data_mode == DataMode::Purge {
         let confirm_text = prompt("危险操作：请输入 DELETE 确认完全删除: ")?;
@@ -623,7 +617,7 @@ fn ask_uninstall_data_mode() -> Result<DataMode, io::Error> {
         r#"是否保留配置和数据？
 1) 保留配置、统计、备份，推荐
 2) 删除程序和服务，保留 /etc/nat.toml 和 backups
-3) 完全删除本项目配置、统计、备份、WebUI env/cert/key，危险"#
+3) 完全删除本项目配置、统计、备份，危险"#
     );
     let choice = prompt("请选择 [1/2/3]: ")?;
     match choice.trim() {
@@ -651,23 +645,12 @@ fn execute_uninstall(target: UninstallTarget, data_mode: DataMode) -> UninstallR
         warnings: plan.warnings,
         ..Default::default()
     };
-    if matches!(target, UninstallTarget::Core | UninstallTarget::All) {
+    if matches!(target, UninstallTarget::Core) {
         stop_disable_remove_service("nat", &uninstall::CORE_SERVICE_PATHS, &mut report);
         remove_path(uninstall::NAT_BINARY, &mut report);
     }
-    if matches!(
-        target,
-        UninstallTarget::Core | UninstallTarget::All | UninstallTarget::NftTables
-    ) {
+    if matches!(target, UninstallTarget::Core | UninstallTarget::NftTables) {
         cleanup_project_nft_tables(&mut report);
-    }
-    if matches!(target, UninstallTarget::Console | UninstallTarget::All) {
-        stop_disable_remove_service(
-            "nat-console",
-            &uninstall::CONSOLE_SERVICE_PATHS,
-            &mut report,
-        );
-        remove_path(uninstall::NAT_CONSOLE_BINARY, &mut report);
     }
     cleanup_data_paths(data_mode, &mut report);
     let _ = Command::new("systemctl").arg("daemon-reload").output();
@@ -726,13 +709,7 @@ fn cleanup_data_paths(data_mode: DataMode, report: &mut UninstallReport) {
     match data_mode {
         DataMode::Keep => {}
         DataMode::KeepConfig => {
-            for path in [
-                uninstall::CONFIG_LEGACY,
-                uninstall::STATS_JSON,
-                uninstall::CONSOLE_ENV,
-                uninstall::CONSOLE_CERT,
-                uninstall::CONSOLE_KEY,
-            ] {
+            for path in [uninstall::CONFIG_LEGACY, uninstall::STATS_JSON] {
                 remove_path(path, report);
             }
         }
@@ -742,9 +719,6 @@ fn cleanup_data_paths(data_mode: DataMode, report: &mut UninstallReport) {
                 uninstall::CONFIG_LEGACY,
                 uninstall::STATS_DIR,
                 uninstall::BACKUPS_ROOT,
-                uninstall::CONSOLE_DIR,
-                uninstall::CONSOLE_CERT,
-                uninstall::CONSOLE_KEY,
             ] {
                 remove_path(path, report);
             }
@@ -802,33 +776,23 @@ fn update_menu() -> Result<(), io::Error> {
         r#"====================================
 一键更新 nftables-nat-rust-enhanced
 ====================================
-1) 更新当前已安装组件，推荐
-2) 仅更新核心转发 nat
-3) 仅更新 WebUI nat-console
-4) 更新全部 core + WebUI
+1) 更新核心转发 nat，推荐
+2) 指定版本更新核心 nat
 0) 返回"#
     );
-    let choice = prompt("请选择 [0/1/2/3/4]: ")?;
+    let choice = prompt("请选择 [0/1/2]: ")?;
     if choice.trim() == "0" {
         return Ok(());
     }
-    let target_arg = match choice.trim() {
-        "1" => None,
-        "2" => Some("--core-only"),
-        "3" => Some("--console-only"),
-        "4" => Some("--with-console"),
+    let specify_version = match choice.trim() {
+        "1" => false,
+        "2" => true,
         _ => {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "未知更新目标"));
         }
     };
 
-    println!(
-        r#"版本选择：
-1) 最新 release
-2) 指定版本 tag"#
-    );
-    let version_choice = prompt("请选择 [1/2]: ")?;
-    let version = if version_choice.trim() == "2" {
+    let version = if specify_version {
         let tag = prompt("请输入版本 tag，例如 v0.1.2: ")?;
         if !valid_update_version(&tag) {
             return Err(io::Error::new(
@@ -842,25 +806,19 @@ fn update_menu() -> Result<(), io::Error> {
     };
 
     println!("更新摘要：");
-    println!(
-        "  将更新: {}",
-        target_arg.unwrap_or("当前已安装组件（由 install.sh 自动检测）")
-    );
+    println!("  将更新: 核心转发 nat 和 nat.service");
     println!("  版本: {version}");
     println!("  下载方式: GitHub Release 预编译包优先");
     println!("  备份: /etc/nftables-nat/backups/update-YYYYmmdd-HHMMSS/");
-    println!("  保留: /etc/nat.toml、/etc/nat.conf、stats、backups、/opt/nat-console/env");
-    println!("  重启: 按已安装组件重启 nat.service / nat-console.service");
+    println!("  保留: /etc/nat.toml、/etc/nat.conf、stats、backups");
+    println!("  重启: nat.service");
     let confirm = prompt("继续更新？[y/N]: ")?;
     if !matches!(confirm.as_str(), "y" | "Y" | "yes" | "YES") {
         println!("已取消更新");
         return Ok(());
     }
 
-    let mut args = vec!["--update", "--use-release"];
-    if let Some(target) = target_arg {
-        args.push(target);
-    }
+    let mut args = vec!["--update", "--core-only", "--use-release"];
     if version != "latest" {
         args.push("--version");
         args.push(&version);
@@ -990,7 +948,7 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
         "注意：本机 curl 127.0.0.1:{} 通常不能完整验证 DNAT PREROUTING。",
         rule.sport
     );
-    println!("如果测试后 counter 有变化，可在 WebUI 点击刷新统计，或调用 /api/stats/collect-now。");
+    println!("如果测试后 counter 有变化，可回到 CLI 查看 stats 流量统计。");
     Ok(())
 }
 

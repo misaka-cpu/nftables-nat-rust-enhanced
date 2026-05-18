@@ -3,48 +3,67 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY_RUN=0
-UNINSTALL_TARGET=""
-UNINSTALL_DATA_MODE="keep"
 RELEASE_REPO="misaka-cpu/nftables-nat-rust-enhanced"
 RELEASE_VERSION="latest"
 INSTALL_MODE="auto"
-INSTALL_SOURCE_DIR="$SCRIPT_DIR"
-RELEASE_PAYLOAD_DIR=""
 RELEASE_ASSET=""
+RELEASE_PAYLOAD_DIR=""
+INSTALL_SOURCE_DIR="$SCRIPT_DIR"
 USE_RELEASE_SEEN=0
 BUILD_SOURCE_SEEN=0
 ENTER_MENU=0
-NAT_MENU_BIN="${NAT_MENU_BIN:-/usr/local/bin/nat}"
 UPDATE_MODE=0
-UPDATE_TARGET_AUTO=0
+ACTION=""
+NAT_MENU_BIN="${NAT_MENU_BIN:-/usr/local/bin/nat}"
+UNINSTALL_DATA_MODE="keep"
 
-log_info() {
-    echo "[INFO] $1"
+log_info() { echo "[INFO] $1"; }
+log_ok() { echo "[OK] $1"; }
+log_warn() { echo "[WARN] $1"; }
+log_err() { echo "[ERR] $1"; }
+log_dry_run() { echo "[DRY-RUN] $1"; }
+
+usage() {
+    cat <<EOF
+用法: $0 [选项]
+
+选项:
+  --dry-run        只输出计划执行的动作，不实际安装或修改系统
+  --core-only      安装核心转发服务 nat
+  --use-release    优先从 GitHub Releases 下载预编译二进制
+  --build-from-source
+                   强制从源码 cargo build --release
+  --version TAG    指定 GitHub Release 版本，默认 latest
+  --repo OWNER/REPO
+                   指定 GitHub 仓库，默认 $RELEASE_REPO
+  --enter-menu     安装完成后自动进入 CLI 管理菜单
+  --update         更新核心组件
+  --uninstall      交互卸载/清理核心组件
+  --keep-data      与 --uninstall 组合，保留配置、统计、备份（默认）
+  --purge          与 --uninstall 组合，完全删除，必须输入 DELETE
+  --help           显示此帮助
+
+已移除:
+  --with-console / --console-only / --assets-only
+
+环境变量:
+  NAT_CONFIG_TYPE=toml|legacy   非交互核心安装配置格式，默认 toml
+
+示例:
+  $0 --dry-run --core-only --use-release
+  $0 --core-only --use-release --enter-menu
+  $0 --update --core-only --use-release
+  $0 --uninstall
+EOF
 }
 
-log_ok() {
-    echo "[OK] $1"
-}
-
-log_warn() {
-    echo "[WARN] $1"
-}
-
-log_err() {
-    echo "[ERR] $1"
-}
-
-log_dry_run() {
-    echo "[DRY-RUN] $1"
-}
-
-interactive_input_error() {
-    log_err "当前环境不支持交互输入。"
-    echo "请使用以下方式之一："
-    echo "1) 先下载脚本再执行："
-    echo '   tmp="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh -o "$tmp" && bash "$tmp" --with-console --use-release'
-    echo "2) 使用非交互参数指定配置。"
-    exit 1
+deprecated_webui_arg() {
+    log_err "WebUI / nat-console 已从本项目移除。"
+    echo "请使用："
+    echo "  --core-only"
+    echo "或："
+    echo "  --update --core-only"
+    exit 2
 }
 
 prompt_read() {
@@ -55,59 +74,8 @@ prompt_read() {
     elif [ -t 0 ]; then
         read -r -p "$prompt" "$var_name"
     else
-        interactive_input_error
+        return 1
     fi
-}
-
-usage() {
-    cat <<EOF
-用法: $0 [选项]
-
-选项:
-  --dry-run        只输出计划执行的动作，不实际安装或修改系统
-  --core-only      只安装核心转发服务 nat
-  --with-console   安装核心转发服务 nat + WebUI nat-console
-  --console-only   只安装 WebUI nat-console
-  --assets-only    只安装/更新 WebUI 静态资源 assets
-  --use-release    优先从 GitHub Releases 下载预编译二进制
-  --build-from-source
-                   强制从源码 cargo build --release
-  --version TAG    指定 GitHub Release 版本，默认 latest
-  --repo OWNER/REPO
-                   指定 GitHub 仓库，默认 $RELEASE_REPO
-  --enter-menu     安装完成后自动进入 CLI 管理菜单
-  --update         更新已安装组件，默认自动检测目标
-  --webui-bind ADDR
-                   设置 WebUI 监听地址，避免交互选择
-  --webui-port PORT
-                   设置 WebUI 端口
-  --webui-username NAME
-                   设置 WebUI 用户名
-  --webui-password PASSWORD
-                   设置 WebUI 密码
-  --webui-auto-password
-                   自动生成 WebUI 密码，避免交互输入密码
-  --webui-random-secret
-                   自动生成新的 WebUI JWT secret
-  --uninstall      交互卸载/清理本项目
-  --core           与 --uninstall 组合，仅卸载核心 nat
-  --console        与 --uninstall 组合，仅卸载 WebUI nat-console
-  --all            与 --uninstall 组合，卸载全部
-  --keep-data      与 --uninstall 组合，保留配置、统计、备份（默认）
-  --purge          与 --uninstall 组合，完全删除，必须输入 DELETE
-  --help           显示此帮助
-
-环境变量:
-  NAT_CONFIG_TYPE=toml|legacy   非交互核心安装配置格式，默认 toml
-
-示例:
-  $0 --dry-run --core-only
-  $0 --core-only --use-release
-  $0 --core-only --use-release --enter-menu
-  $0 --with-console --use-release
-  $0 --console-only
-  $0 --assets-only
-EOF
 }
 
 detect_release_platform() {
@@ -119,12 +87,8 @@ detect_release_platform() {
         return 1
     fi
     case "$arch" in
-        x86_64|amd64)
-            printf '%s' "linux-amd64"
-            ;;
-        aarch64|arm64)
-            printf '%s' "linux-arm64"
-            ;;
+        x86_64|amd64) printf '%s' "linux-amd64" ;;
+        aarch64|arm64) printf '%s' "linux-arm64" ;;
         *)
             echo "[WARN] no prebuilt release asset for architecture: $arch" >&2
             return 1
@@ -141,21 +105,7 @@ release_download_base_url() {
 }
 
 local_binary_available() {
-    local action="$1"
-    case "$action" in
-        --core-only)
-            [ -x "$SCRIPT_DIR/target/release/nat" ]
-            ;;
-        --with-console)
-            [ -x "$SCRIPT_DIR/target/release/nat" ] && [ -x "$SCRIPT_DIR/target/release/nat-console" ]
-            ;;
-        --console-only|--assets-only)
-            [ -x "$SCRIPT_DIR/target/release/nat-console" ]
-            ;;
-        *)
-            return 0
-            ;;
-    esac
+    [ -x "$SCRIPT_DIR/target/release/nat" ]
 }
 
 prepare_release_payload() {
@@ -171,7 +121,7 @@ prepare_release_payload() {
         log_dry_run "would download GitHub Release asset: ${base_url}/${RELEASE_ASSET}"
         log_dry_run "would download SHA256SUMS if available: ${base_url}/SHA256SUMS"
         log_dry_run "would verify ${RELEASE_ASSET} with SHA256SUMS when the asset is listed"
-        log_dry_run "would extract release payload and use nat/nat-console/static from it"
+        log_dry_run "would extract release payload and use nat from it"
         return 0
     fi
 
@@ -200,7 +150,7 @@ prepare_release_payload() {
             }
             log_ok "SHA256 verified: ${RELEASE_ASSET}"
         else
-            log_warn "SHA256SUMS does not list ${RELEASE_ASSET}; refusing to silently trust a mismatched checksum file"
+            log_err "SHA256SUMS does not list ${RELEASE_ASSET}; refusing to trust a mismatched checksum file"
             return 1
         fi
     else
@@ -209,39 +159,38 @@ prepare_release_payload() {
 
     mkdir -p "$tmp_dir/payload"
     tar -xzf "$archive_path" -C "$tmp_dir/payload"
-    if [ -x "$tmp_dir/payload/nat" ] || [ -x "$tmp_dir/payload/nat-console" ]; then
+    if [ -x "$tmp_dir/payload/nat" ]; then
         payload_dir="$tmp_dir/payload"
     else
         payload_dir="$(find "$tmp_dir/payload" -mindepth 1 -maxdepth 1 -type d | head -n1)"
     fi
-    if [ -z "${payload_dir:-}" ] || { [ ! -x "$payload_dir/nat" ] && [ ! -x "$payload_dir/nat-console" ]; }; then
-        log_err "release payload does not contain executable nat or nat-console"
+    if [ -z "${payload_dir:-}" ] || [ ! -x "$payload_dir/nat" ]; then
+        log_err "release payload does not contain executable nat"
         return 1
     fi
 
     RELEASE_PAYLOAD_DIR="$payload_dir"
-    if [ -f "$payload_dir/setup.sh" ] && [ -f "$payload_dir/setup-console.sh" ] && [ -f "$payload_dir/setup-console-assets.sh" ]; then
+    if [ -f "$payload_dir/setup.sh" ]; then
         INSTALL_SOURCE_DIR="$payload_dir"
-    elif [ -f "$SCRIPT_DIR/setup.sh" ] && [ -f "$SCRIPT_DIR/setup-console.sh" ] && [ -f "$SCRIPT_DIR/setup-console-assets.sh" ]; then
+    elif [ -f "$SCRIPT_DIR/setup.sh" ]; then
         INSTALL_SOURCE_DIR="$SCRIPT_DIR"
     else
-        log_err "release payload does not contain setup scripts and local setup scripts are unavailable"
+        log_err "release payload does not contain setup.sh and local setup.sh is unavailable"
         return 1
     fi
     export NAT_BINARY_DIR="$payload_dir"
-    export NAT_STATIC_DIR="$payload_dir/static"
     log_ok "release payload ready: $RELEASE_ASSET"
 }
 
 build_from_source() {
     if [ "$DRY_RUN" -eq 1 ]; then
         log_dry_run "would build from source with: cargo build --release"
-        log_dry_run "would use local binaries from target/release"
+        log_dry_run "would use local binary from target/release/nat"
         return 0
     fi
     if [ ! -f "$SCRIPT_DIR/Cargo.toml" ]; then
         log_err "source tree not found; cannot build from source here"
-        log_err "download the source archive first, then run: cargo build --release && bash install.sh --with-console --build-from-source"
+        log_err "download source first, then run: cargo build --release && bash install.sh --core-only --build-from-source"
         return 1
     fi
     if ! command -v cargo >/dev/null 2>&1; then
@@ -253,19 +202,14 @@ build_from_source() {
 }
 
 prepare_install_payload() {
-    local action="$1"
-    case "$action" in
-        --uninstall|--help|-h)
-            return 0
-            ;;
-    esac
-
+    if [ "$ACTION" = "--uninstall" ] || [ "$ACTION" = "--help" ] || [ "$ACTION" = "-h" ]; then
+        return 0
+    fi
     if [ "$INSTALL_MODE" = "source" ]; then
         build_from_source
         return $?
     fi
-
-    if [ "$INSTALL_MODE" = "release" ] || ! local_binary_available "$action"; then
+    if [ "$INSTALL_MODE" = "release" ] || ! local_binary_available; then
         if prepare_release_payload; then
             return 0
         fi
@@ -274,9 +218,8 @@ prepare_install_payload() {
         build_from_source
         return $?
     fi
-
     if [ "$DRY_RUN" -eq 1 ]; then
-        log_dry_run "would use existing local build under target/release"
+        log_dry_run "would use existing local build: target/release/nat"
     fi
 }
 
@@ -293,113 +236,19 @@ dry_run_core_install() {
     fi
     log_dry_run "would install /usr/local/bin/nat"
     log_dry_run "would create/update /lib/systemd/system/nat.service with $config_type config"
+    log_dry_run "would preserve existing /etc/nat.conf if present"
+    log_dry_run "would preserve existing /etc/nat.toml if present"
     log_dry_run "would run systemctl daemon-reload"
     log_dry_run "would run systemctl enable nat"
     log_dry_run "would run systemctl restart nat"
     log_dry_run "would check nat.service active: systemctl is-active nat"
-    log_dry_run "would preserve existing /etc/nat.conf if present"
-    log_dry_run "would preserve existing /etc/nat.toml if present"
-    log_dry_run "would preserve existing /opt/nat/env if present"
     log_dry_run "would show CLI management entry: nat --menu"
-}
-
-dry_run_console_install() {
-    log_dry_run "would install nat-console WebUI service"
-    log_dry_run "would check WebUI runtime dependencies: curl ca-certificates openssl systemd procps tar"
-    if [ -n "$RELEASE_ASSET" ]; then
-        log_dry_run "would use release payload: $RELEASE_ASSET"
-    elif [ -x "$SCRIPT_DIR/target/release/nat-console" ]; then
-        log_dry_run "would use local build: target/release/nat-console"
-    else
-        log_dry_run "local build not found, would try release binary then fallback to source build"
-    fi
-    log_dry_run "would install /usr/local/bin/nat-console"
-    log_dry_run "would create/update /lib/systemd/system/nat-console.service"
-    log_dry_run "would update nat-console.service to use EnvironmentFile"
-    log_dry_run "would not put --password or --jwt-secret in ExecStart"
-    log_dry_run "would set nat-console.service LimitNOFILE=65535"
-    log_dry_run "would use WebUI username from NAT_CONSOLE_USERNAME/--webui-username or default admin"
-    log_dry_run "would use WebUI port from NAT_CONSOLE_PORT/--webui-port or default 5533"
-    if [ -n "${NAT_CONSOLE_BIND:-}" ]; then
-        log_dry_run "would use WebUI bind from --webui-bind/NAT_CONSOLE_BIND: $NAT_CONSOLE_BIND"
-    else
-        log_dry_run "would use existing/default WebUI bind or ask user to choose via /dev/tty"
-    fi
-    log_dry_run "would default to 127.0.0.1 for SSH tunnel access"
-    if [ -n "${NAT_CONSOLE_PASSWORD:-}" ]; then
-        log_dry_run "would use password from --webui-password/NAT_CONSOLE_PASSWORD"
-    elif [ "${NAT_CONSOLE_AUTO_PASSWORD:-0}" = "1" ]; then
-        log_dry_run "would generate WebUI password because --webui-auto-password was provided"
-    else
-        log_dry_run "would use existing password, generate in noninteractive mode, or ask via /dev/tty"
-    fi
-    if [ -n "${NAT_CONSOLE_JWT_SECRET:-}" ]; then
-        log_dry_run "would use JWT secret from NAT_CONSOLE_JWT_SECRET"
-    elif [ "${NAT_CONSOLE_RANDOM_SECRET:-0}" = "1" ]; then
-        log_dry_run "would generate new JWT secret because --webui-random-secret was provided"
-    else
-        log_dry_run "would preserve existing JWT secret or generate random JWT secret"
-    fi
-    log_dry_run "would create /opt/nat-console/env with mode 600"
-    log_dry_run "would write NAT_CONSOLE_BIND to /opt/nat-console/env"
-    log_dry_run "would not print JWT secret"
-    log_dry_run "would run systemctl daemon-reload"
-    log_dry_run "would run systemctl enable nat-console"
-    log_dry_run "would run systemctl restart nat-console"
-    log_dry_run "would check nat-console.service active through WebUI health check"
-    log_dry_run "would run WebUI health check: curl -k https://127.0.0.1:${NAT_CONSOLE_PORT:-5533}/health"
-    log_dry_run "would preserve existing /etc/ssl/nat-webui.crt if present"
-    log_dry_run "would preserve existing /etc/ssl/nat-webui.key if present"
-    if [ -x "/usr/local/bin/nat" ]; then
-        log_dry_run "would mention existing core nat CLI menu: nat --menu"
-    fi
-}
-
-dry_run_assets_install() {
-    log_dry_run "would install/update WebUI assets"
-    log_dry_run "would check asset runtime dependencies: curl ca-certificates systemd tar"
-    if [ -n "$RELEASE_ASSET" ]; then
-        log_dry_run "would copy static/ from release payload when present"
-    fi
-    log_dry_run "would not add NodeSource or other third-party apt sources"
-    log_dry_run "would install/update /usr/local/bin/nat-console via setup-console-assets.sh"
-    log_dry_run "would update nat-console.service compatibility flags if the service exists"
-}
-
-detect_update_action() {
-    if [ -n "$ACTION" ]; then
-        return 0
-    fi
-    UPDATE_TARGET_AUTO=1
-    local has_core=0 has_console=0
-    if [ -x /usr/local/bin/nat ] || [ -f /lib/systemd/system/nat.service ] || [ -f /etc/systemd/system/nat.service ]; then
-        has_core=1
-    fi
-    if [ -x /usr/local/bin/nat-console ] || [ -f /lib/systemd/system/nat-console.service ] || [ -f /etc/systemd/system/nat-console.service ]; then
-        has_console=1
-    fi
-    if [ "$has_core" -eq 1 ] && [ "$has_console" -eq 1 ]; then
-        ACTION="--with-console"
-    elif [ "$has_core" -eq 1 ]; then
-        ACTION="--core-only"
-    elif [ "$has_console" -eq 1 ]; then
-        ACTION="--console-only"
-    else
-        ACTION="--with-console"
-        log_warn "未检测到已安装组件，--update 将按 core + WebUI 计划执行"
-    fi
 }
 
 backup_update_files() {
     local backup_dir="$1"
     mkdir -p "$backup_dir"
-    for path in \
-        /usr/local/bin/nat \
-        /usr/local/bin/nat-console \
-        /lib/systemd/system/nat.service \
-        /lib/systemd/system/nat-console.service \
-        /etc/systemd/system/nat.service \
-        /etc/systemd/system/nat-console.service; do
+    for path in /usr/local/bin/nat /lib/systemd/system/nat.service /etc/systemd/system/nat.service; do
         if [ -e "$path" ]; then
             mkdir -p "$backup_dir$(dirname "$path")"
             cp -a "$path" "$backup_dir$path"
@@ -410,13 +259,7 @@ backup_update_files() {
 rollback_update_files() {
     local backup_dir="$1"
     local path
-    for path in \
-        /usr/local/bin/nat \
-        /usr/local/bin/nat-console \
-        /lib/systemd/system/nat.service \
-        /lib/systemd/system/nat-console.service \
-        /etc/systemd/system/nat.service \
-        /etc/systemd/system/nat-console.service; do
+    for path in /usr/local/bin/nat /lib/systemd/system/nat.service /etc/systemd/system/nat.service; do
         if [ -e "$backup_dir$path" ]; then
             cp -a "$backup_dir$path" "$path"
         fi
@@ -424,65 +267,40 @@ rollback_update_files() {
     systemctl daemon-reload || true
 }
 
-dry_run_update() {
-    local action="$1"
-    if [ "$UPDATE_TARGET_AUTO" -eq 1 ]; then
-        log_dry_run "would auto-detect installed components: /usr/local/bin/nat /usr/local/bin/nat-console nat.service nat-console.service"
+run_core_install() {
+    local config_type="$1"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        dry_run_core_install "$config_type"
+        return 0
     fi
+    NAT_NONINTERACTIVE=1 NAT_START_SERVICE=1 "$INSTALL_SOURCE_DIR/setup.sh" "$config_type"
+}
+
+dry_run_update() {
     if [ "$INSTALL_MODE" = "release" ]; then
         prepare_release_payload || true
     fi
-    log_dry_run "would update target: $action"
-    log_dry_run "would preserve user data: /etc/nat.toml /etc/nat.conf /var/lib/nftables-nat-rust/stats.json /etc/nftables-nat/backups /opt/nat-console/env"
+    log_dry_run "would update only core nat binary and nat.service"
+    log_dry_run "would preserve user data: /etc/nat.toml /etc/nat.conf /var/lib/nftables-nat-rust/stats.json /etc/nftables-nat/backups"
     log_dry_run "would create backup directory: /etc/nftables-nat/backups/update-YYYYmmdd-HHMMSS"
-    log_dry_run "would backup old binaries and service files before replacing"
-    case "$action" in
-        --core-only)
-            log_dry_run "would update only nat binary and nat.service"
-            dry_run_core_install "${NAT_CONFIG_TYPE:-toml}"
-            ;;
-        --console-only)
-            log_dry_run "would update only nat-console, WebUI static assets, and nat-console.service"
-            dry_run_console_install
-            ;;
-        --with-console)
-            log_dry_run "would update nat + nat-console + WebUI static assets"
-            dry_run_core_install "${NAT_CONFIG_TYPE:-toml}"
-            dry_run_console_install
-            ;;
-    esac
-    log_dry_run "would rollback old binaries/service files if update or health check fails"
+    log_dry_run "would backup old /usr/local/bin/nat and nat.service before replacing"
+    dry_run_core_install "${NAT_CONFIG_TYPE:-toml}"
+    log_dry_run "would rollback old binary/service files if update or health check fails"
 }
 
 run_update() {
-    local action="$1"
     if [ "$DRY_RUN" -eq 1 ]; then
-        dry_run_update "$action"
+        dry_run_update
         return 0
     fi
     local backup_dir="/etc/nftables-nat/backups/update-$(date +%Y%m%d-%H%M%S)"
     log_info "creating update backup: $backup_dir"
     backup_update_files "$backup_dir"
-    if ! prepare_install_payload "$action"; then
+    if ! prepare_install_payload; then
         log_err "更新 payload 准备失败，保留旧版本"
         return 1
     fi
-    if ! case "$action" in
-        --core-only)
-            NAT_NONINTERACTIVE=1 NAT_START_SERVICE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}"
-            ;;
-        --console-only)
-            NAT_NONINTERACTIVE=1 NAT_SKIP_SERVICE_PROMPT=1 run_console_install
-            ;;
-        --with-console)
-            NAT_NONINTERACTIVE=1 NAT_START_SERVICE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}" &&
-            NAT_NONINTERACTIVE=1 NAT_SKIP_SERVICE_PROMPT=1 run_console_install
-            ;;
-        *)
-            log_err "invalid update target: $action"
-            false
-            ;;
-    esac; then
+    if ! run_core_install "${NAT_CONFIG_TYPE:-toml}"; then
         log_err "更新失败，尝试回滚旧二进制和 service 文件"
         rollback_update_files "$backup_dir"
         log_warn "回滚已执行，请检查服务状态和日志"
@@ -492,18 +310,13 @@ run_update() {
 }
 
 dry_run_uninstall() {
-    log_dry_run "would ask uninstall target or use --core/--console/--all"
-    log_dry_run "would ask data retention mode or use --keep-data/--purge"
-    log_dry_run "would stop and disable selected project services"
-    log_dry_run "would remove selected project service files and binaries"
+    log_dry_run "would show core-only uninstall menu"
+    log_dry_run "would stop and disable nat.service when uninstalling core"
+    log_dry_run "would remove nat.service and /usr/local/bin/nat"
     log_dry_run "would delete only project nft tables: ip/ip6 self-nat and ip/ip6 self-filter"
     log_dry_run "would never flush ruleset"
     log_dry_run "would run systemctl daemon-reload"
-    log_dry_run "default would preserve /etc/nat.conf /etc/nat.toml /var/lib/nftables-nat-rust/stats.json /etc/nftables-nat/backups /opt/nat-console/env /etc/ssl/nat-webui.crt /etc/ssl/nat-webui.key"
-}
-
-is_interactive_terminal() {
-    [ -t 0 ] && [ -t 1 ]
+    log_dry_run "default would preserve /etc/nat.conf /etc/nat.toml /var/lib/nftables-nat-rust/stats.json /etc/nftables-nat/backups"
 }
 
 run_cli_menu() {
@@ -531,86 +344,37 @@ run_cli_menu() {
 }
 
 maybe_enter_cli_menu() {
-    local action="$1"
-    case "$action" in
-        --core-only|--with-console)
-            if [ "$DRY_RUN" -eq 1 ]; then
-                if [ "$ENTER_MENU" -eq 1 ]; then
-                    log_dry_run "would automatically enter CLI management menu after install: $NAT_MENU_BIN --menu"
-                else
-                    log_dry_run "dry-run: 安装完成后可选择进入 CLI 管理菜单"
-                fi
-                return 0
-            fi
-            if [ "$ENTER_MENU" -eq 1 ]; then
-                run_cli_menu
-                return 0
-            fi
-            if is_interactive_terminal; then
-                local answer
-                prompt_read "是否立即进入 CLI 管理菜单？[y/N]: " answer
-                case "${answer:-}" in
-                    y|Y|yes|YES)
-                        run_cli_menu
-                        ;;
-                    *)
-                        log_info "后续可使用 nat --menu 进入 CLI 管理菜单。"
-                        ;;
-                esac
-            else
-                log_info "后续可使用 nat --menu 进入 CLI 管理菜单。"
-            fi
-            ;;
-        --console-only)
-            if [ "$DRY_RUN" -eq 1 ]; then
-                if [ "$ENTER_MENU" -eq 1 ]; then
-                    log_dry_run "would enter CLI management menu only if core nat is installed: $NAT_MENU_BIN --menu"
-                else
-                    log_dry_run "console-only does not enter CLI management menu by default"
-                fi
-                return 0
-            fi
-            if [ "$ENTER_MENU" -eq 1 ]; then
-                run_cli_menu
-            elif [ -x "$NAT_MENU_BIN" ]; then
-                log_info "已检测到核心 nat，可使用 nat --menu 管理转发规则。"
-            fi
-            ;;
-        *)
-            ;;
-    esac
-}
-
-run_core_install() {
-    local config_type="${1:-${NAT_CONFIG_TYPE:-toml}}"
-    if [ "$config_type" != "legacy" ] && [ "$config_type" != "toml" ]; then
-        log_err "invalid config type: $config_type"
-        exit 1
-    fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        dry_run_core_install "$config_type"
+        if [ "$ENTER_MENU" -eq 1 ]; then
+            log_dry_run "would automatically enter CLI management menu after install: $NAT_MENU_BIN --menu"
+        else
+            log_dry_run "dry-run: 安装完成后可选择进入 CLI 管理菜单"
+        fi
         return 0
     fi
-    log_info "installing nat core service with $config_type config"
-    NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}" NAT_START_SERVICE="${NAT_START_SERVICE:-0}" bash "$INSTALL_SOURCE_DIR/setup.sh" "$config_type"
-}
-
-run_console_install() {
-    if [ "$DRY_RUN" -eq 1 ]; then
-        dry_run_console_install
+    if [ "$ENTER_MENU" -eq 1 ]; then
+        run_cli_menu
         return 0
     fi
-    log_info "installing nat-console WebUI service"
-    NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}" NAT_SKIP_SERVICE_PROMPT="${NAT_SKIP_SERVICE_PROMPT:-0}" bash "$INSTALL_SOURCE_DIR/setup-console.sh"
+    if [ -t 0 ] && [ -t 1 ]; then
+        local answer
+        if prompt_read "是否立即进入 CLI 管理菜单？[y/N]: " answer; then
+            case "${answer:-}" in
+                y|Y|yes|YES) run_cli_menu ;;
+                *) log_info "后续可使用 nat --menu 进入 CLI 管理菜单。" ;;
+            esac
+        fi
+    else
+        log_info "后续可使用 nat --menu 进入 CLI 管理菜单。"
+    fi
 }
 
-run_assets_install() {
-    if [ "$DRY_RUN" -eq 1 ]; then
-        dry_run_assets_install
-        return 0
-    fi
-    log_info "installing/updating WebUI assets"
-    NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}" bash "$INSTALL_SOURCE_DIR/setup-console-assets.sh"
+cleanup_project_nft_tables() {
+    for family in ip ip6; do
+        for table in self-nat self-filter; do
+            nft delete table "$family" "$table" >/dev/null 2>&1 || true
+        done
+    done
 }
 
 run_uninstall() {
@@ -618,291 +382,94 @@ run_uninstall() {
         dry_run_uninstall
         return 0
     fi
-    local target="${UNINSTALL_TARGET:-}"
-    local data_mode="${UNINSTALL_DATA_MODE:-keep}"
-    if [ -z "$target" ]; then
-        while true; do
-            echo "卸载目标:"
-            echo "1) 仅卸载核心转发服务 nat"
-            echo "2) 仅卸载 WebUI nat-console"
-            echo "3) 卸载全部"
-            echo "4) 仅清理本项目 nft 表"
-            echo "0) 取消 / 退出卸载"
-            prompt_read "请选择 [0/1/2/3/4]: " target_choice
-            case "${target_choice:-0}" in
-                1) target="core"; break ;;
-                2) target="console"; break ;;
-                3) target="all"; break ;;
-                4) target="nft-tables"; break ;;
-                0)
-                    echo "已取消卸载。"
-                    return 0
-                    ;;
-                *)
-                    log_err "未知卸载目标"
-                    ;;
-            esac
-        done
+    local choice data_choice confirm_delete confirm
+    echo "===================================="
+    echo "卸载 / 清理 nftables-nat-rust-enhanced"
+    echo "===================================="
+    echo "1) 卸载核心转发服务 nat"
+    echo "2) 仅清理本项目 nft 表"
+    echo "3) 完全删除本项目配置/统计/备份，危险"
+    echo "0) 返回"
+    if ! prompt_read "请选择操作 [0/1/2/3]: " choice; then
+        log_err "当前环境不支持交互卸载，请在 TTY 中运行 bash install.sh --uninstall"
+        exit 1
     fi
-    if [ "$data_mode" = "keep" ] && [ "$target" != "nft-tables" ]; then
-        echo "是否保留配置和数据？"
-        echo "1) 保留配置、统计、备份，推荐"
-        echo "2) 删除程序和服务，保留 /etc/nat.toml 和 backups"
-        echo "3) 完全删除本项目配置、统计、备份、WebUI env/cert/key，危险"
-        prompt_read "请选择 [1/2/3，默认 1]: " data_choice
-        case "${data_choice:-1}" in
-            1) data_mode="keep" ;;
-            2) data_mode="keep-config" ;;
-            3) data_mode="purge" ;;
-            *) log_err "未知数据保留选项"; exit 1 ;;
-        esac
-    fi
-    if [ "$data_mode" = "purge" ]; then
-        prompt_read "危险操作：请输入 DELETE 确认完全删除: " confirm_delete
+    case "${choice:-0}" in
+        0) log_info "取消卸载"; return 0 ;;
+        1) data_choice="keep" ;;
+        2) data_choice="nft-only" ;;
+        3) data_choice="purge" ;;
+        *) log_err "未知选项: $choice"; exit 1 ;;
+    esac
+    if [ "$data_choice" = "purge" ]; then
+        prompt_read "危险操作：请输入 DELETE 确认完全删除: " confirm_delete || exit 1
         if [ "$confirm_delete" != "DELETE" ]; then
             log_err "确认文本不匹配，取消卸载"
             exit 1
         fi
     fi
-    log_warn "卸载只清理本项目组件和 self-* nft 表，不会 flush ruleset。"
-
-    case "$target" in
-        core|all)
-            systemctl stop nat >/dev/null 2>&1 || true
-            systemctl disable nat >/dev/null 2>&1 || true
-            rm -f /lib/systemd/system/nat.service /etc/systemd/system/nat.service
-            rm -f /usr/local/bin/nat
-            log_ok "removed core nat service and binary if present"
-            cleanup_nft_tables
-            ;;
-        console)
-            ;;
-        nft-tables)
-            cleanup_nft_tables
-            ;;
-        *)
-            log_err "invalid uninstall target: $target"
-            exit 1
-            ;;
+    prompt_read "即将执行卸载/清理操作。确认继续? [y/N]: " confirm || exit 1
+    case "${confirm:-}" in
+        y|Y|yes|YES) ;;
+        *) log_info "已取消卸载"; return 0 ;;
     esac
-
-    case "$target" in
-        console|all)
-            systemctl stop nat-console >/dev/null 2>&1 || true
-            systemctl disable nat-console >/dev/null 2>&1 || true
-            rm -f /lib/systemd/system/nat-console.service /etc/systemd/system/nat-console.service
-            rm -f /usr/local/bin/nat-console
-            log_ok "removed nat-console service and binary if present"
-            ;;
-    esac
-
-    cleanup_data_by_mode "$data_mode"
-
-    systemctl daemon-reload
-    log_ok "systemd daemon reloaded"
-
-    log_warn "默认保留用户配置和数据；完全删除仅在输入 DELETE 后执行。"
-}
-
-cleanup_nft_tables() {
-    for spec in "ip self-nat" "ip6 self-nat" "ip self-filter" "ip6 self-filter"; do
-        set -- $spec
-        nft delete table "$1" "$2" >/dev/null 2>&1 || true
-        log_ok "cleaned nft table $1 $2 if present"
-    done
-}
-
-cleanup_data_by_mode() {
-    local data_mode="$1"
-    case "$data_mode" in
-        keep)
-            log_warn "保留配置和数据: /etc/nat.toml /etc/nat.conf /var/lib/nftables-nat-rust/stats.json /etc/nftables-nat/backups /opt/nat-console/env /etc/ssl/nat-webui.crt /etc/ssl/nat-webui.key"
-            ;;
-        keep-config)
-            rm -f /etc/nat.conf /var/lib/nftables-nat-rust/stats.json /opt/nat-console/env /etc/ssl/nat-webui.crt /etc/ssl/nat-webui.key
-            log_warn "保留 /etc/nat.toml 和 /etc/nftables-nat/backups"
-            ;;
-        purge)
-            rm -rf /etc/nat.toml /etc/nat.conf /var/lib/nftables-nat-rust /etc/nftables-nat /opt/nat-console /etc/ssl/nat-webui.crt /etc/ssl/nat-webui.key
-            log_warn "已完全删除本项目配置、统计、备份、WebUI env/cert/key"
-            ;;
-    esac
-}
-
-ask_config_type() {
-    local config_type
-    prompt_read "请选择配置格式 [toml/legacy，默认 toml]: " config_type
-    config_type="${config_type:-toml}"
-    if [ "$config_type" != "legacy" ] && [ "$config_type" != "toml" ]; then
-        log_err "invalid config type: $config_type"
-        exit 1
+    if [ "$data_choice" != "nft-only" ]; then
+        systemctl stop nat >/dev/null 2>&1 || true
+        systemctl disable nat >/dev/null 2>&1 || true
+        rm -f /lib/systemd/system/nat.service /etc/systemd/system/nat.service
+        rm -f /usr/local/bin/nat
+        log_ok "removed nat service and binary if present"
     fi
-    echo "$config_type"
-}
-
-show_menu() {
-    cat <<EOF
-=========================================
- nftables-nat-rust-enhanced 安装菜单
-=========================================
-1) 只安装核心转发服务 nat
-2) 安装核心转发服务 nat + WebUI nat-console
-3) 只安装 WebUI nat-console
-4) 只安装/更新 WebUI 静态资源 assets
-5) 卸载
-0) 退出
-=========================================
-EOF
-}
-
-run_menu() {
-    local choice config_type
-    show_menu
-    prompt_read "请选择操作: " choice
-    case "$choice" in
-        1)
-            config_type="$(ask_config_type)"
-            prepare_install_payload "--core-only"
-            run_core_install "$config_type"
-            maybe_enter_cli_menu "--core-only"
-            ;;
-        2)
-            config_type="$(ask_config_type)"
-            prepare_install_payload "--with-console"
-            run_core_install "$config_type"
-            run_console_install
-            maybe_enter_cli_menu "--with-console"
-            ;;
-        3)
-            prepare_install_payload "--console-only"
-            run_console_install
-            maybe_enter_cli_menu "--console-only"
-            ;;
-        4)
-            prepare_install_payload "--assets-only"
-            run_assets_install
-            ;;
-        5)
-            run_uninstall
-            ;;
-        0)
-            log_info "退出"
-            ;;
-        *)
-            log_err "未知选项: $choice"
-            exit 1
-            ;;
-    esac
+    cleanup_project_nft_tables
+    log_ok "cleaned project nft tables if present"
+    if [ "$data_choice" = "purge" ]; then
+        rm -rf /etc/nat.toml /etc/nat.conf /var/lib/nftables-nat-rust /etc/nftables-nat
+        log_warn "已完全删除本项目配置、统计、备份"
+    else
+        log_warn "保留配置和数据: /etc/nat.toml /etc/nat.conf /var/lib/nftables-nat-rust/stats.json /etc/nftables-nat/backups"
+    fi
+    systemctl daemon-reload || true
 }
 
 if [ "$#" -eq 0 ]; then
-    run_menu
-    exit 0
+    ACTION="--core-only"
 fi
 
-ACTION=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --dry-run)
-            DRY_RUN=1
+        --dry-run) DRY_RUN=1 ;;
+        --core-only)
+            [ -n "$ACTION" ] && { log_err "只能指定一个动作参数"; exit 1; }
+            ACTION="--core-only"
             ;;
-        --update)
-            UPDATE_MODE=1
+        --with-console|--console-only|--assets-only|--webui-bind|--webui-port|--webui-username|--webui-password|--webui-auto-password|--webui-random-secret|--console|--all)
+            deprecated_webui_arg
             ;;
-        --use-release)
-            INSTALL_MODE="release"
-            USE_RELEASE_SEEN=1
-            ;;
-        --build-from-source)
-            INSTALL_MODE="source"
-            BUILD_SOURCE_SEEN=1
-            ;;
-        --enter-menu)
-            ENTER_MENU=1
-            ;;
-        --webui-bind)
-            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-                log_err "--webui-bind requires an address"
-                exit 1
-            fi
-            export NAT_CONSOLE_BIND="$2"
-            shift
-            ;;
-        --webui-port)
-            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-                log_err "--webui-port requires a port"
-                exit 1
-            fi
-            export NAT_CONSOLE_PORT="$2"
-            shift
-            ;;
-        --webui-username)
-            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-                log_err "--webui-username requires a username"
-                exit 1
-            fi
-            export NAT_CONSOLE_USERNAME="$2"
-            shift
-            ;;
-        --webui-password)
-            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-                log_err "--webui-password requires a password"
-                exit 1
-            fi
-            export NAT_CONSOLE_PASSWORD="$2"
-            shift
-            ;;
-        --webui-auto-password)
-            export NAT_CONSOLE_AUTO_PASSWORD=1
-            ;;
-        --webui-random-secret)
-            export NAT_CONSOLE_RANDOM_SECRET=1
-            ;;
+        --use-release) INSTALL_MODE="release"; USE_RELEASE_SEEN=1 ;;
+        --build-from-source) INSTALL_MODE="source"; BUILD_SOURCE_SEEN=1 ;;
+        --enter-menu) ENTER_MENU=1 ;;
+        --update) UPDATE_MODE=1 ;;
         --version)
-            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-                log_err "--version requires a tag, for example v0.1.0"
-                exit 1
-            fi
+            [ "$#" -lt 2 ] || [ -z "$2" ] && { log_err "--version requires a tag"; exit 1; }
             RELEASE_VERSION="$2"
             shift
             ;;
         --repo)
-            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
-                log_err "--repo requires OWNER/REPO"
-                exit 1
-            fi
+            [ "$#" -lt 2 ] || [ -z "$2" ] && { log_err "--repo requires OWNER/REPO"; exit 1; }
             RELEASE_REPO="$2"
             case "$RELEASE_REPO" in
                 */*) ;;
-                *)
-                    log_err "--repo must be OWNER/REPO"
-                    exit 1
-                    ;;
+                *) log_err "--repo must be OWNER/REPO"; exit 1 ;;
             esac
             shift
             ;;
-        --core-only|--with-console|--console-only|--assets-only|--uninstall|--help|-h)
-            if [ -n "$ACTION" ]; then
-                log_err "只能指定一个安装动作参数"
-                exit 1
-            fi
-            ACTION="$1"
+        --uninstall)
+            [ -n "$ACTION" ] && { log_err "只能指定一个动作参数"; exit 1; }
+            ACTION="--uninstall"
             ;;
-        --core)
-            UNINSTALL_TARGET="core"
-            ;;
-        --console)
-            UNINSTALL_TARGET="console"
-            ;;
-        --all)
-            UNINSTALL_TARGET="all"
-            ;;
-        --keep-data)
-            UNINSTALL_DATA_MODE="keep"
-            ;;
-        --purge)
-            UNINSTALL_DATA_MODE="purge"
-            ;;
+        --keep-data) UNINSTALL_DATA_MODE="keep" ;;
+        --purge) UNINSTALL_DATA_MODE="purge" ;;
+        --help|-h) ACTION="--help" ;;
         *)
             log_err "未知参数: $1"
             usage
@@ -912,71 +479,36 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-if [ "$UPDATE_MODE" -eq 1 ]; then
-    detect_update_action
-fi
-
-if [ -z "$ACTION" ]; then
-    if [ "$DRY_RUN" -eq 1 ]; then
-        log_err "--dry-run 需要和安装动作参数组合使用"
-        usage
-        exit 1
-    fi
-    usage
-    exit 1
-fi
 if [ "$USE_RELEASE_SEEN" -eq 1 ] && [ "$BUILD_SOURCE_SEEN" -eq 1 ]; then
     log_err "--use-release and --build-from-source cannot be used together"
     exit 1
 fi
-if [ "$INSTALL_MODE" = "source" ] && { [ "$RELEASE_VERSION" != "latest" ] || [ "$RELEASE_REPO" != "misaka-cpu/nftables-nat-rust-enhanced" ]; }; then
-    log_warn "--version/--repo are ignored with --build-from-source"
-fi
-if [ -n "$UNINSTALL_TARGET" ] && [ "$ACTION" != "--uninstall" ]; then
-    log_err "--core/--console/--all 只能和 --uninstall 组合使用"
-    exit 1
-fi
-if [ "$UNINSTALL_DATA_MODE" = "purge" ] && [ "$ACTION" != "--uninstall" ]; then
-    log_err "--purge 只能和 --uninstall 组合使用"
-    exit 1
-fi
 
 if [ "$UPDATE_MODE" -eq 1 ]; then
-    case "$ACTION" in
-        --core-only|--console-only|--with-console)
-            run_update "$ACTION"
-            exit $?
-            ;;
-        *)
-            log_err "--update 只能与 --core-only/--console-only/--with-console 或自动检测目标组合"
-            exit 1
-            ;;
-    esac
+    ACTION="${ACTION:-"--core-only"}"
+    if [ "$ACTION" != "--core-only" ]; then
+        log_err "--update 只能与 --core-only 组合"
+        exit 1
+    fi
+    run_update
+    exit $?
 fi
 
-prepare_install_payload "$ACTION"
-
 case "$ACTION" in
-    --core-only)
-        NAT_NONINTERACTIVE=1 NAT_START_SERVICE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}"
-        maybe_enter_cli_menu "--core-only"
-        ;;
-    --with-console)
-        NAT_NONINTERACTIVE=1 NAT_START_SERVICE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}"
-        NAT_SKIP_SERVICE_PROMPT=1 run_console_install
-        maybe_enter_cli_menu "--with-console"
-        ;;
-    --console-only)
-        NAT_SKIP_SERVICE_PROMPT=1 run_console_install
-        maybe_enter_cli_menu "--console-only"
-        ;;
-    --assets-only)
-        NAT_NONINTERACTIVE=1 run_assets_install
+    --core-only|"")
+        prepare_install_payload
+        run_core_install "${NAT_CONFIG_TYPE:-toml}"
+        maybe_enter_cli_menu
         ;;
     --uninstall)
-        NAT_NONINTERACTIVE=1 run_uninstall
+        run_uninstall
         ;;
     --help|-h)
         usage
+        ;;
+    *)
+        log_err "未知动作: $ACTION"
+        usage
+        exit 1
         ;;
 esac
