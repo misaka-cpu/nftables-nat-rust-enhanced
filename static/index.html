@@ -191,6 +191,76 @@
             min-height: 100px;
         }
 
+        .subtabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        .subtab {
+            padding: 10px 14px;
+            border: none;
+            border-bottom: 2px solid transparent;
+            background: transparent;
+            color: #555;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .subtab.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+            font-weight: 600;
+        }
+
+        .subtab-content {
+            display: none;
+        }
+
+        .subtab-content.active {
+            display: block;
+        }
+
+        .rules-code {
+            min-height: 520px;
+            max-height: calc(100vh - 300px);
+            overflow: auto;
+            background: #111827;
+            color: #e5e7eb;
+            border-radius: 6px;
+            padding: 16px;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', 'Monaco', 'SF Mono', 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.55;
+            white-space: pre;
+        }
+
+        .test-result-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px;
+            margin: 14px 0;
+        }
+
+        .test-result-item {
+            background: #f8f9fa;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 12px;
+        }
+
+        .command-block {
+            background: #f8f9fa;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 12px;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', 'Monaco', 'SF Mono', 'Courier New', monospace;
+            font-size: 13px;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+
         .alert {
             padding: 15px;
             border-radius: 6px;
@@ -752,6 +822,7 @@
             <div class="tab" onclick="switchTab('rules')">📋 规则查看</div>
             <div class="tab" onclick="switchTab('bbr')">🚀 BBR</div>
             <div class="tab" onclick="switchTab('stats')">📊 流量统计</div>
+            <div class="tab" onclick="switchTab('uninstall')">🧹 卸载 / 清理</div>
         </div>
 
         <div id="configTab" class="tab-content active">
@@ -778,37 +849,49 @@
         </div>
 
         <div id="rulesTab" class="tab-content">
-            <div class="actions" style="margin-bottom: 20px;">
-                <button class="btn btn-primary" onclick="loadRules()">🔄 刷新规则</button>
-                <button class="btn btn-secondary" onclick="loadForwardTestRules()">加载转发测试</button>
+            <div class="subtabs">
+                <button class="subtab active" id="rulesSubtabNft" onclick="switchRulesSubtab('nft')">nft 规则</button>
+                <button class="subtab" id="rulesSubtabTest" onclick="switchRulesSubtab('test')">转发测试</button>
             </div>
 
-            <div id="rulesContent" class="loading">
-                点击"刷新规则"查看当前 nftables 规则
+            <div id="rulesNftPanel" class="subtab-content active">
+                <div class="actions" style="margin-bottom: 16px;">
+                    <button class="btn btn-primary" onclick="loadRules()">🔄 刷新规则</button>
+                    <button class="btn btn-secondary" onclick="copyRules()">复制规则</button>
+                </div>
+
+                <div id="rulesContent" class="rules-code">
+                    点击“刷新规则”查看当前 nftables 规则
+                </div>
             </div>
 
-            <div class="telegram-settings" style="margin-top: 20px;">
-                <h3 style="margin: 0 0 10px 0;">转发测试</h3>
-                <div style="color: #666; font-size: 13px; margin-bottom: 12px;">
-                    本机 curl 127.0.0.1:监听端口通常不能完整验证 DNAT。建议从另一台机器访问服务器 IP:监听端口，再观察 nft counter 变化。
-                </div>
-                <div class="telegram-form-grid">
-                    <div class="telegram-field">
-                        <label for="forwardTestRule">选择规则</label>
-                        <select class="telegram-input" id="forwardTestRule"></select>
+            <div id="rulesTestPanel" class="subtab-content">
+                <div class="telegram-settings">
+                    <h3 style="margin: 0 0 10px 0;">转发连通性测试</h3>
+                    <div style="color: #666; font-size: 13px; margin-bottom: 12px;">
+                        本机 curl 127.0.0.1:监听端口通常不能完整验证 DNAT。建议从另一台机器访问服务器 IP:监听端口，再观察 nft counter 变化。
                     </div>
-                    <div class="telegram-field">
-                        <label for="forwardTestSeconds">观察时间</label>
-                        <input class="telegram-input" id="forwardTestSeconds" type="number" min="1" max="60" value="30">
-                        <div class="telegram-hint">单位为秒，最大 60。</div>
+                    <div id="forwardTestControls">
+                        <div class="telegram-form-grid">
+                            <div class="telegram-field">
+                                <label for="forwardTestRule">选择规则</label>
+                                <select class="telegram-input" id="forwardTestRule"></select>
+                            </div>
+                            <div class="telegram-field">
+                                <label for="forwardTestSeconds">观察时间</label>
+                                <input class="telegram-input" id="forwardTestSeconds" type="number" min="1" max="60" value="30">
+                                <div class="telegram-hint">单位为秒，默认 30，最大 60。</div>
+                            </div>
+                        </div>
+                        <div class="actions">
+                            <button class="btn btn-secondary" onclick="loadForwardTestRules()">加载规则</button>
+                            <button class="btn btn-primary" onclick="checkForwardRule()">开始基础检查</button>
+                            <button class="btn btn-secondary" onclick="observeForwardRule()">观察 counter 30 秒</button>
+                            <button class="btn btn-secondary" onclick="collectStatsNow()">测试完成后刷新统计</button>
+                        </div>
                     </div>
+                    <div id="forwardTestContent" class="loading">点击“加载规则”获取可测试规则列表。</div>
                 </div>
-                <div class="actions">
-                    <button class="btn btn-primary" onclick="checkForwardRule()">开始测试</button>
-                    <button class="btn btn-secondary" onclick="observeForwardRule()">观察 counter</button>
-                    <button class="btn btn-secondary" onclick="collectStatsNow()">测试完成后刷新统计</button>
-                </div>
-                <div id="forwardTestContent" class="loading">点击“加载转发测试”获取规则列表。</div>
             </div>
         </div>
 
@@ -833,6 +916,50 @@
 
             <div id="statsContent" class="loading">
                 点击"刷新统计"查看当前流量统计
+            </div>
+        </div>
+
+        <div id="uninstallTab" class="tab-content">
+            <div class="telegram-settings">
+                <h3 style="margin: 0 0 10px 0;">卸载 / 清理 nftables-nat-rust-enhanced</h3>
+                <div style="color: #666; font-size: 13px; margin-bottom: 12px;">
+                    卸载只清理本项目组件和 self-* nft 表，不会 flush ruleset，也不会删除用户其他 nftables table。
+                </div>
+                <div class="actions">
+                    <button class="btn btn-primary" onclick="loadUninstallStatus()">刷新状态</button>
+                </div>
+                <div id="uninstallStatus" class="loading">点击“刷新状态”查看当前组件状态。</div>
+                <div class="telegram-form-grid" style="margin-top: 16px;">
+                    <div class="telegram-field">
+                        <label for="uninstallTarget">卸载目标</label>
+                        <select class="telegram-input" id="uninstallTarget">
+                            <option value="core">仅卸载核心转发服务 nat</option>
+                            <option value="console">仅卸载 WebUI nat-console</option>
+                            <option value="all">卸载全部</option>
+                            <option value="nft-tables">仅清理本项目 nft 表</option>
+                        </select>
+                    </div>
+                    <div class="telegram-field">
+                        <label for="uninstallDataMode">数据保留</label>
+                        <select class="telegram-input" id="uninstallDataMode">
+                            <option value="keep">保留配置、统计、备份，推荐</option>
+                            <option value="keep-config">删除运行文件，保留 /etc/nat.toml 和 backups</option>
+                            <option value="purge">完全删除，危险</option>
+                        </select>
+                    </div>
+                    <div class="telegram-field">
+                        <label for="uninstallConfirm">危险确认</label>
+                        <input class="telegram-input" id="uninstallConfirm" type="text" placeholder="仅完全删除时输入 DELETE">
+                    </div>
+                </div>
+                <div style="margin: 12px 0; color: #842029; font-size: 13px;">
+                    卸载 WebUI 后当前页面将不可用；卸载全部后 nat-console 将停止，页面会断开。
+                </div>
+                <div class="actions">
+                    <button class="btn btn-secondary" onclick="runUninstall()">执行卸载 / 清理</button>
+                    <button class="btn btn-secondary" onclick="cancelUninstall()">取消</button>
+                </div>
+                <div id="uninstallResult" class="loading"></div>
             </div>
         </div>
 
@@ -1004,7 +1131,7 @@
 
         async function loadRules() {
             const rulesContent = document.getElementById('rulesContent');
-            rulesContent.className = 'loading';
+            rulesContent.className = 'rules-code';
             rulesContent.textContent = '加载中...';
 
             try {
@@ -1015,11 +1142,29 @@
                 }
 
                 const data = await response.json();
-                rulesContent.className = 'rules-display';
-                rulesContent.innerHTML = `<pre>${data.rules}</pre>`;
+                rulesContent.className = 'rules-code';
+                rulesContent.textContent = data.rules && data.rules.trim()
+                    ? data.rules
+                    : '当前没有已应用的 nft 规则，请检查 nat.service 或配置规则。';
             } catch (error) {
-                rulesContent.className = 'loading';
+                rulesContent.className = 'rules-code';
                 rulesContent.textContent = '加载失败: ' + error.message;
+            }
+        }
+
+        async function copyRules() {
+            const text = document.getElementById('rulesContent').textContent || '';
+            await navigator.clipboard.writeText(text);
+            showAlert('规则已复制到剪贴板', false);
+        }
+
+        function switchRulesSubtab(tab) {
+            document.getElementById('rulesSubtabNft').classList.toggle('active', tab === 'nft');
+            document.getElementById('rulesSubtabTest').classList.toggle('active', tab === 'test');
+            document.getElementById('rulesNftPanel').classList.toggle('active', tab === 'nft');
+            document.getElementById('rulesTestPanel').classList.toggle('active', tab === 'test');
+            if (tab === 'test') {
+                loadForwardTestRules();
             }
         }
 
@@ -1034,13 +1179,16 @@
                     throw new Error(await response.text());
                 }
                 const data = await response.json();
-                select.innerHTML = (data.rules || []).map(rule =>
+                const rules = data.rules || [];
+                select.innerHTML = rules.map(rule =>
                     `<option value="${Number(rule.index)}">${Number(rule.index)}) ${escapeHtml(rule.label)}</option>`
                 ).join('');
-                content.className = 'rules-display';
-                content.innerHTML = (data.rules || []).length
-                    ? '<pre>请选择规则后点击“开始测试”。</pre>'
-                    : '<pre>当前没有可测试的转发规则。</pre>';
+                select.closest('.telegram-field').style.display = rules.length ? '' : 'none';
+                document.getElementById('forwardTestSeconds').closest('.telegram-field').style.display = rules.length ? '' : 'none';
+                content.className = rules.length ? 'rules-display' : 'loading';
+                content.innerHTML = rules.length
+                    ? '请选择规则后点击“开始基础检查”。'
+                    : '当前没有可测试的转发规则，请先添加规则并确认 nat.service 已应用。';
             } catch (error) {
                 content.className = 'loading';
                 content.textContent = '加载失败: ' + error.message;
@@ -1076,29 +1224,29 @@
                 const examples = data.external_test_examples || {};
                 const accessEntries = ((data.access_control || {}).entries || []).join(', ') || '-';
                 content.className = 'rules-display';
-                content.innerHTML = `<pre>规则：${escapeHtml(rule.label)}
-type：${escapeHtml(rule.type)}
-sport：${Number(rule.sport)}
-target/domain：${escapeHtml(rule.target)}
-resolved ip：${escapeHtml(rule.resolved_ip || '解析失败或暂不可用')}
-dport：${Number(rule.dport)}
-protocol：${escapeHtml(rule.protocol)}
-ip_version：${escapeHtml(rule.ip_version)}
-access_control：${escapeHtml((data.access_control || {}).mode || 'off')}
-entries：${escapeHtml(accessEntries)}
-${data.access_control_note ? '提示：' + escapeHtml(data.access_control_note) + '\n' : ''}
-nat.service：${data.nat_service_active ? 'active' : 'inactive / unknown'}
-nft 规则：${data.nft_rule_applied ? '已应用' : '未找到'}
-目标 TCP：${data.target_tcp_reachable === null ? 'UDP/all 无法可靠判断' : (data.target_tcp_reachable ? '可达' : '不可达')}
-${data.udp_note ? 'UDP 提示：' + escapeHtml(data.udp_note) + '\n' : ''}
-baseline nat-rule：${renderCounter(data.baseline_counters && data.baseline_counters.nat_rule)}
-baseline out：${renderCounter(data.baseline_counters && data.baseline_counters.out)}
-baseline in：${renderCounter(data.baseline_counters && data.baseline_counters.in)}
+                content.innerHTML = `
+                    <div class="test-result-grid">
+                        <div class="test-result-item"><strong>规则</strong><br>${escapeHtml(rule.label)}</div>
+                        <div class="test-result-item"><strong>nat.service</strong><br>${data.nat_service_active ? 'active' : 'inactive / unknown'}</div>
+                        <div class="test-result-item"><strong>nft 规则</strong><br>${data.nft_rule_applied ? '已应用' : '未找到'}</div>
+                        <div class="test-result-item"><strong>目标 TCP</strong><br>${data.target_tcp_reachable === null ? 'UDP/all 无法可靠判断' : (data.target_tcp_reachable ? '可达' : '不可达')}</div>
+                        <div class="test-result-item"><strong>DNAT baseline</strong><br>${renderCounter(data.baseline_counters && data.baseline_counters.nat_rule)}</div>
+                        <div class="test-result-item"><strong>out baseline</strong><br>${renderCounter(data.baseline_counters && data.baseline_counters.out)}</div>
+                        <div class="test-result-item"><strong>in baseline</strong><br>${renderCounter(data.baseline_counters && data.baseline_counters.in)}</div>
+                        <div class="test-result-item"><strong>访问控制</strong><br>${escapeHtml((data.access_control || {}).mode || 'off')}<br>${escapeHtml(accessEntries)}</div>
+                    </div>
+                    ${data.access_control_note ? `<div class="alert alert-success" style="display:block;">${escapeHtml(data.access_control_note)}</div>` : ''}
+                    ${data.udp_note ? `<div class="alert alert-success" style="display:block;">${escapeHtml(data.udp_note)}</div>` : ''}
+                    <div style="margin: 12px 0; color:#666;">请在另一台机器执行下面命令测试外部访问，然后点击“观察 counter”。</div>
+                    <div class="command-block">HTTP 示例：
+${escapeHtml((examples.http || '').replaceAll('SERVER_IP', '<服务器IP>'))}
 
-请在另一台机器执行下面命令测试外部访问，然后点击“观察 counter”：
-HTTP 示例：${escapeHtml(examples.http || '')}
-TCP 示例：${escapeHtml(examples.tcp || '')}
-HTTPS/SNI 示例：${escapeHtml(examples.https_sni || '')}</pre>`;
+TCP 示例：
+${escapeHtml((examples.tcp || '').replaceAll('SERVER_IP', '<服务器IP>'))}
+
+HTTPS/SNI 示例：
+${escapeHtml((examples.https_sni || '').replaceAll('SERVER_IP', '<服务器IP>'))}</div>
+                `;
             } catch (error) {
                 content.className = 'loading';
                 content.textContent = '测试失败: ' + error.message;
@@ -1107,7 +1255,12 @@ HTTPS/SNI 示例：${escapeHtml(examples.https_sni || '')}</pre>`;
 
         async function observeForwardRule() {
             const content = document.getElementById('forwardTestContent');
-            const seconds = Math.min(60, Math.max(1, Number(document.getElementById('forwardTestSeconds').value || 30)));
+            let seconds = Math.max(1, Number(document.getElementById('forwardTestSeconds').value || 30));
+            if (seconds > 60) {
+                seconds = 60;
+                document.getElementById('forwardTestSeconds').value = '60';
+                showAlert('观察时间最大 60 秒，已自动限制。', true);
+            }
             content.className = 'loading';
             content.textContent = `正在观察 counter ${seconds} 秒...`;
             try {
@@ -1120,15 +1273,18 @@ HTTPS/SNI 示例：${escapeHtml(examples.https_sni || '')}</pre>`;
                 }
                 const data = await response.json();
                 content.className = 'rules-display';
-                content.innerHTML = `<pre>观察时间：${Number(data.seconds)} 秒
-rule_id：${escapeHtml(data.rule_id)}
-DNAT 命中增量：${renderCounter(data.delta && data.delta.nat_rule)}
-转发出站 out 增量：${renderCounter(data.delta && data.delta.out)}
-返回入站 in 增量：${renderCounter(data.delta && data.delta.in)}
-结论：${escapeHtml(data.verdict)}
-说明：${escapeHtml(data.message)}
-
-counter 有变化后，可以点击“测试完成后刷新统计”更新 stats。</pre>`;
+                content.innerHTML = `
+                    <div class="test-result-grid">
+                        <div class="test-result-item"><strong>规则</strong><br>${escapeHtml(data.rule_id)}</div>
+                        <div class="test-result-item"><strong>观察时间</strong><br>${Number(data.seconds)} 秒</div>
+                        <div class="test-result-item"><strong>DNAT 命中</strong><br>${renderCounter(data.delta && data.delta.nat_rule)}</div>
+                        <div class="test-result-item"><strong>out 转发</strong><br>${renderCounter(data.delta && data.delta.out)}</div>
+                        <div class="test-result-item"><strong>in 返回</strong><br>${renderCounter(data.delta && data.delta.in)}</div>
+                        <div class="test-result-item"><strong>结论</strong><br>${escapeHtml(data.verdict)}</div>
+                    </div>
+                    <div class="alert alert-success" style="display:block;">${escapeHtml(data.message)}</div>
+                    <div style="color:#666;">counter 有变化后，可以点击“测试完成后刷新统计”更新 stats。</div>
+                `;
             } catch (error) {
                 content.className = 'loading';
                 content.textContent = '观察失败: ' + error.message;
@@ -1483,6 +1639,86 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
             }
         }
 
+        async function loadUninstallStatus() {
+            const content = document.getElementById('uninstallStatus');
+            content.className = 'loading';
+            content.textContent = '加载中...';
+            try {
+                const response = await apiRequest('/api/uninstall/status');
+                if (!response.ok) throw new Error(await response.text());
+                const data = await response.json();
+                content.className = 'rules-display';
+                content.innerHTML = `<pre>nat.service: ${escapeHtml(data.nat_service)}
+nat-console.service: ${escapeHtml(data.nat_console_service)}
+/usr/local/bin/nat: ${data.nat_binary ? 'exists' : 'missing'}
+/usr/local/bin/nat-console: ${data.nat_console_binary ? 'exists' : 'missing'}
+
+nft tables:
+  ip self-nat: ${data.nft_tables.ip_self_nat ? 'exists' : 'missing'}
+  ip6 self-nat: ${data.nft_tables.ip6_self_nat ? 'exists' : 'missing'}
+  ip self-filter: ${data.nft_tables.ip_self_filter ? 'exists' : 'missing'}
+  ip6 self-filter: ${data.nft_tables.ip6_self_filter ? 'exists' : 'missing'}
+
+files:
+  /etc/nat.toml: ${data.files.config_toml ? 'exists' : 'missing'}
+  /var/lib/nftables-nat-rust/stats.json: ${data.files.stats_json ? 'exists' : 'missing'}
+  /etc/nftables-nat/backups: ${data.files.backups_dir ? 'exists' : 'missing'}
+  /opt/nat-console/env: ${data.files.console_env ? 'exists' : 'missing'}</pre>`;
+            } catch (error) {
+                content.className = 'loading';
+                content.textContent = '加载失败: ' + error.message;
+            }
+        }
+
+        async function runUninstall() {
+            const target = document.getElementById('uninstallTarget').value;
+            const dataMode = document.getElementById('uninstallDataMode').value;
+            const confirmText = document.getElementById('uninstallConfirm').value.trim();
+            if (dataMode === 'purge' && confirmText !== 'DELETE') {
+                showAlert('完全删除必须输入 DELETE', true);
+                return;
+            }
+            if ((target === 'console' || target === 'all') && !window.confirm('卸载 WebUI 后当前页面将不可用。确认继续？')) {
+                return;
+            }
+            const result = document.getElementById('uninstallResult');
+            result.className = 'loading';
+            result.textContent = '正在执行卸载 / 清理...';
+            try {
+                const response = await apiRequest('/api/uninstall', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        target,
+                        data_mode: dataMode,
+                        confirm: confirmText || null
+                    })
+                });
+                const { data, text } = await readJsonOrText(response);
+                if (!response.ok) throw new Error((data && data.message) || text);
+                result.className = 'rules-display';
+                result.innerHTML = `<pre>ok: ${data.ok}
+
+actions:
+${(data.actions || []).map(item => '  - ' + item).join('\n') || '  - none'}
+
+kept:
+${(data.kept || []).map(item => '  - ' + item).join('\n') || '  - none'}
+
+warnings:
+${(data.warnings || []).map(item => '  - ' + item).join('\n') || '  - none'}</pre>`;
+            } catch (error) {
+                result.className = 'loading';
+                result.textContent = '卸载失败: ' + error.message;
+            }
+        }
+
+        function cancelUninstall() {
+            document.getElementById('uninstallConfirm').value = '';
+            const result = document.getElementById('uninstallResult');
+            result.className = 'loading';
+            result.textContent = '已取消卸载。';
+        }
+
         function switchTab(tab) {
             const tabs = document.querySelectorAll('.tab');
             const contents = document.querySelectorAll('.tab-content');
@@ -1507,6 +1743,10 @@ TCP 拥塞控制: ${data.tcp_congestion_control}
                 tabs[3].classList.add('active');
                 document.getElementById('statsTab').classList.add('active');
                 loadStats();
+            } else if (tab === 'uninstall') {
+                tabs[4].classList.add('active');
+                document.getElementById('uninstallTab').classList.add('active');
+                loadUninstallStatus();
             }
         }
 

@@ -14,7 +14,9 @@ use chrono::Local;
 use log::{error, info};
 use nat_common::{
     AccessControlConfig, StatsConfig, TelegramConfig, TomlConfig, TrafficMode, forward_test,
-    stats as traffic_stats, validate_legacy_config,
+    stats as traffic_stats,
+    uninstall::{self, DataMode, UninstallTarget},
+    validate_legacy_config,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -618,6 +620,52 @@ pub struct AccessControlStatusResponse {
     scope: String,
 }
 
+#[derive(Serialize)]
+pub struct NftTablesStatus {
+    ip_self_nat: bool,
+    ip6_self_nat: bool,
+    ip_self_filter: bool,
+    ip6_self_filter: bool,
+}
+
+#[derive(Serialize)]
+pub struct UninstallFilesStatus {
+    config_toml: bool,
+    config_legacy: bool,
+    stats_json: bool,
+    backups_dir: bool,
+    console_env: bool,
+    console_cert: bool,
+    console_key: bool,
+}
+
+#[derive(Serialize)]
+pub struct UninstallStatusResponse {
+    nat_service: String,
+    nat_console_service: String,
+    nat_binary: bool,
+    nat_console_binary: bool,
+    nft_tables: NftTablesStatus,
+    files: UninstallFilesStatus,
+}
+
+#[derive(Deserialize)]
+pub struct UninstallRequest {
+    target: UninstallTarget,
+    #[serde(default)]
+    data_mode: DataMode,
+    #[serde(default)]
+    confirm: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct UninstallResponse {
+    ok: bool,
+    actions: Vec<String>,
+    kept: Vec<String>,
+    warnings: Vec<String>,
+}
+
 pub async fn get_stats(
     _user: Claims,
     State(state): State<Arc<AppState>>,
@@ -794,6 +842,50 @@ pub async fn get_access_control_status(
         mode: access_control.mode.to_string(),
         entries: access_control.entries,
         scope: "只作用于本项目转发端口，不影响 SSH/WebUI".to_string(),
+    }))
+}
+
+pub async fn get_uninstall_status(
+    _user: Claims,
+) -> Result<Json<UninstallStatusResponse>, (StatusCode, String)> {
+    Ok(Json(UninstallStatusResponse {
+        nat_service: service_status("nat"),
+        nat_console_service: service_status("nat-console"),
+        nat_binary: Path::new(uninstall::NAT_BINARY).exists(),
+        nat_console_binary: Path::new(uninstall::NAT_CONSOLE_BINARY).exists(),
+        nft_tables: NftTablesStatus {
+            ip_self_nat: nft_table_exists("ip", "self-nat"),
+            ip6_self_nat: nft_table_exists("ip6", "self-nat"),
+            ip_self_filter: nft_table_exists("ip", "self-filter"),
+            ip6_self_filter: nft_table_exists("ip6", "self-filter"),
+        },
+        files: UninstallFilesStatus {
+            config_toml: Path::new(uninstall::CONFIG_TOML).exists(),
+            config_legacy: Path::new(uninstall::CONFIG_LEGACY).exists(),
+            stats_json: Path::new(uninstall::STATS_JSON).exists(),
+            backups_dir: Path::new(uninstall::BACKUPS_DIR).exists(),
+            console_env: Path::new(uninstall::CONSOLE_ENV).exists(),
+            console_cert: Path::new(uninstall::CONSOLE_CERT).exists(),
+            console_key: Path::new(uninstall::CONSOLE_KEY).exists(),
+        },
+    }))
+}
+
+pub async fn uninstall_handler(
+    _user: Claims,
+    Json(req): Json<UninstallRequest>,
+) -> Result<Json<UninstallResponse>, (StatusCode, String)> {
+    uninstall::validate_uninstall_request(req.target, req.data_mode, req.confirm.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let mut result = execute_uninstall(req.target, req.data_mode);
+    result
+        .warnings
+        .extend(uninstall::plan_uninstall(req.target, req.data_mode).warnings);
+    Ok(Json(UninstallResponse {
+        ok: result.warnings.is_empty(),
+        actions: result.actions,
+        kept: result.kept,
+        warnings: result.warnings,
     }))
 }
 
@@ -1206,6 +1298,186 @@ fn send_telegram_http(url: &str, params: &[(&str, &str)]) -> Result<(), String> 
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
     }
+}
+
+#[derive(Default)]
+struct UninstallExecResult {
+    actions: Vec<String>,
+    kept: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn execute_uninstall(target: UninstallTarget, data_mode: DataMode) -> UninstallExecResult {
+    let plan = uninstall::plan_uninstall(target, data_mode);
+    let mut result = UninstallExecResult {
+        kept: plan.kept,
+        ..Default::default()
+    };
+    if matches!(target, UninstallTarget::Core | UninstallTarget::All) {
+        stop_disable_remove_service("nat", &uninstall::CORE_SERVICE_PATHS, &mut result);
+        remove_path(uninstall::NAT_BINARY, &mut result);
+    }
+    if matches!(
+        target,
+        UninstallTarget::Core | UninstallTarget::All | UninstallTarget::NftTables
+    ) {
+        cleanup_project_nft_tables(&mut result);
+    }
+    if matches!(target, UninstallTarget::Console | UninstallTarget::All) {
+        stop_disable_remove_service(
+            "nat-console",
+            &uninstall::CONSOLE_SERVICE_PATHS,
+            &mut result,
+        );
+        remove_path(uninstall::NAT_CONSOLE_BINARY, &mut result);
+    }
+    cleanup_uninstall_data(data_mode, &mut result);
+    let _ = Command::new("systemctl").arg("daemon-reload").output();
+    result.actions.push("systemd daemon-reload".to_string());
+    result
+}
+
+fn stop_disable_remove_service(
+    service: &str,
+    service_paths: &[&str],
+    result: &mut UninstallExecResult,
+) {
+    run_best_effort(
+        Command::new("systemctl").arg("stop").arg(service),
+        result,
+        &format!("stopped {service}.service"),
+    );
+    run_best_effort(
+        Command::new("systemctl").arg("disable").arg(service),
+        result,
+        &format!("disabled {service}.service"),
+    );
+    for path in service_paths {
+        remove_path(path, result);
+    }
+}
+
+fn cleanup_project_nft_tables(result: &mut UninstallExecResult) {
+    for (family, table) in uninstall::nft_table_names() {
+        let output = Command::new("/usr/sbin/nft")
+            .arg("delete")
+            .arg("table")
+            .arg(family)
+            .arg(table)
+            .output()
+            .or_else(|_| {
+                Command::new("nft")
+                    .arg("delete")
+                    .arg("table")
+                    .arg(family)
+                    .arg(table)
+                    .output()
+            });
+        match output {
+            Ok(_) => result
+                .actions
+                .push(format!("cleaned nft table {family} {table} if present")),
+            Err(e) => result
+                .warnings
+                .push(format!("failed to delete nft table {family} {table}: {e}")),
+        }
+    }
+}
+
+fn cleanup_uninstall_data(data_mode: DataMode, result: &mut UninstallExecResult) {
+    match data_mode {
+        DataMode::Keep => {}
+        DataMode::KeepConfig => {
+            for path in [
+                uninstall::CONFIG_LEGACY,
+                uninstall::STATS_JSON,
+                uninstall::CONSOLE_ENV,
+                uninstall::CONSOLE_CERT,
+                uninstall::CONSOLE_KEY,
+            ] {
+                remove_path(path, result);
+            }
+        }
+        DataMode::Purge => {
+            for path in [
+                uninstall::CONFIG_TOML,
+                uninstall::CONFIG_LEGACY,
+                uninstall::STATS_DIR,
+                uninstall::BACKUPS_ROOT,
+                uninstall::CONSOLE_DIR,
+                uninstall::CONSOLE_CERT,
+                uninstall::CONSOLE_KEY,
+            ] {
+                remove_path(path, result);
+            }
+        }
+    }
+}
+
+fn run_best_effort(command: &mut Command, result: &mut UninstallExecResult, action: &str) {
+    match command.output() {
+        Ok(_) => result.actions.push(action.to_string()),
+        Err(e) => result.warnings.push(format!("{action} failed: {e}")),
+    }
+}
+
+fn remove_path(path: &str, result: &mut UninstallExecResult) {
+    let path_ref = Path::new(path);
+    if !path_ref.exists() {
+        return;
+    }
+    let remove_result = if path_ref.is_dir() {
+        fs::remove_dir_all(path_ref)
+    } else {
+        fs::remove_file(path_ref)
+    };
+    match remove_result {
+        Ok(()) => result.actions.push(format!("removed {path}")),
+        Err(e) => result
+            .warnings
+            .push(format!("failed to remove {path}: {e}")),
+    }
+}
+
+fn service_status(service: &str) -> String {
+    if !service_file_exists(service) {
+        return "missing".to_string();
+    }
+    match Command::new("systemctl")
+        .arg("is-active")
+        .arg(service)
+        .output()
+    {
+        Ok(output) if output.status.success() => "active".to_string(),
+        Ok(_) => "inactive".to_string(),
+        Err(_) => "inactive".to_string(),
+    }
+}
+
+fn service_file_exists(service: &str) -> bool {
+    let filename = format!("{service}.service");
+    ["/lib/systemd/system", "/etc/systemd/system"]
+        .iter()
+        .any(|dir| Path::new(dir).join(&filename).exists())
+}
+
+fn nft_table_exists(family: &str, table: &str) -> bool {
+    Command::new("/usr/sbin/nft")
+        .arg("list")
+        .arg("table")
+        .arg(family)
+        .arg(table)
+        .output()
+        .or_else(|_| {
+            Command::new("nft")
+                .arg("list")
+                .arg("table")
+                .arg(family)
+                .arg(table)
+                .output()
+        })
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn read_sysctl_value(path: &str) -> String {

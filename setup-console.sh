@@ -172,6 +172,27 @@ read_env_value() {
     fi
 }
 
+check_webui_health() {
+    local check_url="https://127.0.0.1:${PORT}/health"
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if curl -kfsS --max-time 2 "$check_url" >/dev/null 2>&1; then
+            log_ok "WebUI 已启动：OK"
+            return 0
+        fi
+        sleep 1
+    done
+    log_err "WebUI 服务未正常启动，请查看："
+    echo "  systemctl status nat-console --no-pager -l"
+    echo "  journalctl -u nat-console -n 120 --no-pager"
+    echo "  ss -lntp | grep $PORT"
+    echo "  curl -k $check_url"
+    if [ "$BIND_ADDR" != "127.0.0.1" ] && [ "$BIND_ADDR" != "0.0.0.0" ] && [ "$BIND_ADDR" != "localhost" ]; then
+        log_warn "当前绑定地址为 $BIND_ADDR；已优先检查 127.0.0.1，请同时确认实际绑定地址是否可访问。"
+    fi
+    return 1
+}
+
 # 使用说明
 usage() {
     echo "用法: $0 [选项]"
@@ -585,27 +606,20 @@ EOF
 systemctl daemon-reload
 systemctl enable nat-console
 log_ok "nat-console.service enabled"
-
-if [ "$NAT_NONINTERACTIVE" = "1" ] || [ "$NAT_SKIP_SERVICE_PROMPT" = "1" ]; then
-    log_info "非交互模式：已 enable nat-console.service，不强制 start/restart"
-else
-    read -r -p "是否立即启动/重启 nat-console.service? [y/N]: " START_CONSOLE
-    if [[ "$START_CONSOLE" =~ ^[Yy]$ ]]; then
-        if systemctl is-active --quiet nat-console; then
-            systemctl restart nat-console
-            log_ok "nat-console.service restarted"
-        else
-            systemctl start nat-console
-            log_ok "nat-console.service started"
-        fi
-    else
-        log_info "已跳过立即启动/重启 nat-console.service"
-    fi
+systemctl restart nat-console
+log_ok "nat-console.service restarted"
+WEBUI_HEALTH_OK=0
+if check_webui_health; then
+    WEBUI_HEALTH_OK=1
 fi
 
 echo ""
 echo "========================================="
-echo "安装成功！systemd service 已创建"
+if [ "$WEBUI_HEALTH_OK" -eq 1 ]; then
+    echo "安装成功！systemd service 已创建且 WebUI 已启动"
+else
+    echo "安装完成，但 WebUI 服务未通过健康检查"
+fi
 echo "========================================="
 echo "配置格式: $CONFIG_TYPE"
 echo "服务文件: $SERVICE_FILE"
@@ -613,9 +627,10 @@ echo ""
 echo "使用以下命令管理服务:"
 echo "  启动服务: systemctl start nat-console"
 echo "  停止服务: systemctl stop nat-console"
-echo "  查看状态: systemctl status nat-console"
+echo "  查看状态: systemctl status nat-console --no-pager -l"
 echo "  开机自启: systemctl enable nat-console"
 echo "  查看日志: journalctl -u nat-console -f"
+echo "  本机健康检查: curl -k https://127.0.0.1:$PORT/health"
 echo ""
 echo "WebUI 配置:"
 if [ "$BIND_ADDR" = "127.0.0.1" ] || [ "$BIND_ADDR" = "localhost" ]; then

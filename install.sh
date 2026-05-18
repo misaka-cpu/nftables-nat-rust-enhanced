@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY_RUN=0
+UNINSTALL_TARGET=""
+UNINSTALL_DATA_MODE="keep"
 
 log_info() {
     echo "[INFO] $1"
@@ -34,7 +36,12 @@ usage() {
   --with-console   安装核心转发服务 nat + WebUI nat-console
   --console-only   只安装 WebUI nat-console
   --assets-only    只安装/更新 WebUI 静态资源 assets
-  --uninstall      卸载已安装的服务文件和二进制（不删除用户配置）
+  --uninstall      交互卸载/清理本项目
+  --core           与 --uninstall 组合，仅卸载核心 nat
+  --console        与 --uninstall 组合，仅卸载 WebUI nat-console
+  --all            与 --uninstall 组合，卸载全部
+  --keep-data      与 --uninstall 组合，保留配置、统计、备份（默认）
+  --purge          与 --uninstall 组合，完全删除，必须输入 DELETE
   --help           显示此帮助
 
 环境变量:
@@ -61,11 +68,16 @@ dry_run_core_install() {
     log_dry_run "would install /usr/local/bin/nat"
     log_dry_run "would create/update /lib/systemd/system/nat.service with $config_type config"
     log_dry_run "would enable nat.service"
+    if [ "${NAT_START_SERVICE:-0}" = "1" ]; then
+        log_dry_run "would start or restart nat.service"
+    fi
     log_dry_run "would preserve existing /etc/nat.conf if present"
     log_dry_run "would preserve existing /etc/nat.toml if present"
     log_dry_run "would preserve existing /opt/nat/env if present"
     log_dry_run "would show CLI management entry: nat --menu"
-    log_dry_run "would ask before starting or restarting nat.service in interactive mode"
+    if [ "${NAT_START_SERVICE:-0}" != "1" ]; then
+        log_dry_run "would ask before starting or restarting nat.service in interactive mode"
+    fi
 }
 
 dry_run_console_install() {
@@ -99,12 +111,14 @@ dry_run_console_install() {
     log_dry_run "would write NAT_CONSOLE_BIND to /opt/nat-console/env"
     log_dry_run "would not print JWT secret"
     log_dry_run "would enable nat-console.service"
+    log_dry_run "would run systemctl daemon-reload"
+    log_dry_run "would restart nat-console.service"
+    log_dry_run "would run WebUI health check: curl -k https://127.0.0.1:${NAT_CONSOLE_PORT:-5533}/health"
     log_dry_run "would preserve existing /etc/ssl/nat-webui.crt if present"
     log_dry_run "would preserve existing /etc/ssl/nat-webui.key if present"
     if [ -x "/usr/local/bin/nat" ]; then
         log_dry_run "would mention existing core nat CLI menu: nat --menu"
     fi
-    log_dry_run "would ask before starting or restarting nat-console.service in interactive mode"
 }
 
 dry_run_assets_install() {
@@ -117,15 +131,14 @@ dry_run_assets_install() {
 }
 
 dry_run_uninstall() {
-    log_dry_run "would uninstall installed service files and binaries"
-    log_dry_run "would disable nat.service if present, without stopping it"
-    log_dry_run "would remove /lib/systemd/system/nat.service if present"
-    log_dry_run "would disable nat-console.service if present, without stopping it"
-    log_dry_run "would remove /lib/systemd/system/nat-console.service if present"
-    log_dry_run "would remove /usr/local/bin/nat if present"
-    log_dry_run "would remove /usr/local/bin/nat-console if present"
+    log_dry_run "would ask uninstall target or use --core/--console/--all"
+    log_dry_run "would ask data retention mode or use --keep-data/--purge"
+    log_dry_run "would stop and disable selected project services"
+    log_dry_run "would remove selected project service files and binaries"
+    log_dry_run "would delete only project nft tables: ip/ip6 self-nat and ip/ip6 self-filter"
+    log_dry_run "would never flush ruleset"
     log_dry_run "would run systemctl daemon-reload"
-    log_dry_run "would preserve /etc/nat.conf /etc/nat.toml /opt/nat/env /etc/ssl/nat-webui.crt /etc/ssl/nat-webui.key"
+    log_dry_run "default would preserve /etc/nat.conf /etc/nat.toml /var/lib/nftables-nat-rust/stats.json /etc/nftables-nat/backups /opt/nat-console/env /etc/ssl/nat-webui.crt /etc/ssl/nat-webui.key"
 }
 
 run_core_install() {
@@ -139,7 +152,7 @@ run_core_install() {
         return 0
     fi
     log_info "installing nat core service with $config_type config"
-    NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}" bash "$SCRIPT_DIR/setup.sh" "$config_type"
+    NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}" NAT_START_SERVICE="${NAT_START_SERVICE:-0}" bash "$SCRIPT_DIR/setup.sh" "$config_type"
 }
 
 run_console_install() {
@@ -165,32 +178,115 @@ run_uninstall() {
         dry_run_uninstall
         return 0
     fi
-    log_warn "卸载不会执行 systemctl stop，也不会删除用户配置文件。"
-
-    if [ -f /lib/systemd/system/nat.service ]; then
-        systemctl disable nat >/dev/null 2>&1 || true
-        rm -f /lib/systemd/system/nat.service
-        log_ok "removed /lib/systemd/system/nat.service"
-    else
-        log_warn "nat.service not found"
+    local target="${UNINSTALL_TARGET:-}"
+    local data_mode="${UNINSTALL_DATA_MODE:-keep}"
+    if [ -z "$target" ]; then
+        while true; do
+            echo "卸载目标:"
+            echo "1) 仅卸载核心转发服务 nat"
+            echo "2) 仅卸载 WebUI nat-console"
+            echo "3) 卸载全部"
+            echo "4) 仅清理本项目 nft 表"
+            echo "0) 取消 / 退出卸载"
+            read -r -p "请选择 [0/1/2/3/4]: " target_choice
+            case "${target_choice:-0}" in
+                1) target="core"; break ;;
+                2) target="console"; break ;;
+                3) target="all"; break ;;
+                4) target="nft-tables"; break ;;
+                0)
+                    echo "已取消卸载。"
+                    return 0
+                    ;;
+                *)
+                    log_err "未知卸载目标"
+                    ;;
+            esac
+        done
     fi
-
-    if [ -f /lib/systemd/system/nat-console.service ]; then
-        systemctl disable nat-console >/dev/null 2>&1 || true
-        rm -f /lib/systemd/system/nat-console.service
-        log_ok "removed /lib/systemd/system/nat-console.service"
-    else
-        log_warn "nat-console.service not found"
+    if [ "$data_mode" = "keep" ] && [ "$target" != "nft-tables" ]; then
+        echo "是否保留配置和数据？"
+        echo "1) 保留配置、统计、备份，推荐"
+        echo "2) 删除程序和服务，保留 /etc/nat.toml 和 backups"
+        echo "3) 完全删除本项目配置、统计、备份、WebUI env/cert/key，危险"
+        read -r -p "请选择 [1/2/3，默认 1]: " data_choice
+        case "${data_choice:-1}" in
+            1) data_mode="keep" ;;
+            2) data_mode="keep-config" ;;
+            3) data_mode="purge" ;;
+            *) log_err "未知数据保留选项"; exit 1 ;;
+        esac
     fi
+    if [ "$data_mode" = "purge" ]; then
+        read -r -p "危险操作：请输入 DELETE 确认完全删除: " confirm_delete
+        if [ "$confirm_delete" != "DELETE" ]; then
+            log_err "确认文本不匹配，取消卸载"
+            exit 1
+        fi
+    fi
+    log_warn "卸载只清理本项目组件和 self-* nft 表，不会 flush ruleset。"
 
-    rm -f /usr/local/bin/nat
-    rm -f /usr/local/bin/nat-console
-    log_ok "removed /usr/local/bin/nat and /usr/local/bin/nat-console if present"
+    case "$target" in
+        core|all)
+            systemctl stop nat >/dev/null 2>&1 || true
+            systemctl disable nat >/dev/null 2>&1 || true
+            rm -f /lib/systemd/system/nat.service /etc/systemd/system/nat.service
+            rm -f /usr/local/bin/nat
+            log_ok "removed core nat service and binary if present"
+            cleanup_nft_tables
+            ;;
+        console)
+            ;;
+        nft-tables)
+            cleanup_nft_tables
+            ;;
+        *)
+            log_err "invalid uninstall target: $target"
+            exit 1
+            ;;
+    esac
+
+    case "$target" in
+        console|all)
+            systemctl stop nat-console >/dev/null 2>&1 || true
+            systemctl disable nat-console >/dev/null 2>&1 || true
+            rm -f /lib/systemd/system/nat-console.service /etc/systemd/system/nat-console.service
+            rm -f /usr/local/bin/nat-console
+            log_ok "removed nat-console service and binary if present"
+            ;;
+    esac
+
+    cleanup_data_by_mode "$data_mode"
 
     systemctl daemon-reload
     log_ok "systemd daemon reloaded"
 
-    log_warn "保留用户配置: /etc/nat.conf /etc/nat.toml /opt/nat/env /etc/ssl/nat-webui.crt /etc/ssl/nat-webui.key"
+    log_warn "默认保留用户配置和数据；完全删除仅在输入 DELETE 后执行。"
+}
+
+cleanup_nft_tables() {
+    for spec in "ip self-nat" "ip6 self-nat" "ip self-filter" "ip6 self-filter"; do
+        set -- $spec
+        nft delete table "$1" "$2" >/dev/null 2>&1 || true
+        log_ok "cleaned nft table $1 $2 if present"
+    done
+}
+
+cleanup_data_by_mode() {
+    local data_mode="$1"
+    case "$data_mode" in
+        keep)
+            log_warn "保留配置和数据: /etc/nat.toml /etc/nat.conf /var/lib/nftables-nat-rust/stats.json /etc/nftables-nat/backups /opt/nat-console/env /etc/ssl/nat-webui.crt /etc/ssl/nat-webui.key"
+            ;;
+        keep-config)
+            rm -f /etc/nat.conf /var/lib/nftables-nat-rust/stats.json /opt/nat-console/env /etc/ssl/nat-webui.crt /etc/ssl/nat-webui.key
+            log_warn "保留 /etc/nat.toml 和 /etc/nftables-nat/backups"
+            ;;
+        purge)
+            rm -rf /etc/nat.toml /etc/nat.conf /var/lib/nftables-nat-rust /etc/nftables-nat /opt/nat-console /etc/ssl/nat-webui.crt /etc/ssl/nat-webui.key
+            log_warn "已完全删除本项目配置、统计、备份、WebUI env/cert/key"
+            ;;
+    esac
 }
 
 ask_config_type() {
@@ -270,6 +366,21 @@ while [ "$#" -gt 0 ]; do
             fi
             ACTION="$1"
             ;;
+        --core)
+            UNINSTALL_TARGET="core"
+            ;;
+        --console)
+            UNINSTALL_TARGET="console"
+            ;;
+        --all)
+            UNINSTALL_TARGET="all"
+            ;;
+        --keep-data)
+            UNINSTALL_DATA_MODE="keep"
+            ;;
+        --purge)
+            UNINSTALL_DATA_MODE="purge"
+            ;;
         *)
             log_err "未知参数: $1"
             usage
@@ -288,13 +399,21 @@ if [ -z "$ACTION" ]; then
     usage
     exit 1
 fi
+if [ -n "$UNINSTALL_TARGET" ] && [ "$ACTION" != "--uninstall" ]; then
+    log_err "--core/--console/--all 只能和 --uninstall 组合使用"
+    exit 1
+fi
+if [ "$UNINSTALL_DATA_MODE" = "purge" ] && [ "$ACTION" != "--uninstall" ]; then
+    log_err "--purge 只能和 --uninstall 组合使用"
+    exit 1
+fi
 
 case "$ACTION" in
     --core-only)
         NAT_NONINTERACTIVE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}"
         ;;
     --with-console)
-        NAT_NONINTERACTIVE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}"
+        NAT_NONINTERACTIVE=1 NAT_START_SERVICE=1 run_core_install "${NAT_CONFIG_TYPE:-toml}"
         NAT_SKIP_SERVICE_PROMPT=1 run_console_install
         ;;
     --console-only)

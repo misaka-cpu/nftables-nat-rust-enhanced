@@ -157,6 +157,14 @@ apt update && apt install -y git curl wget ca-certificates build-essential pkg-c
 tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --with-console
 ```
 
+安装核心 + WebUI 时，安装脚本会刷新 systemd、启用并启动/重启 `nat.service` 和 `nat-console.service`，随后对 WebUI 执行本机健康检查：
+
+```bash
+curl -k https://127.0.0.1:5533/health
+```
+
+如果健康检查失败，请先查看 `nat-console` 状态和日志，不要只看服务是否 enabled。
+
 ### 从源码构建并安装
 
 ```bash
@@ -590,13 +598,86 @@ GET  /api/access-control/status
 GET  /api/forward-test/rules
 POST /api/forward-test/check
 POST /api/forward-test/observe
+
+GET  /api/uninstall/status
+POST /api/uninstall
 ```
 
-WebUI 的“规则查看”页包含“转发测试”区域。它只做只读检查和 counter 观察：读取配置、读取 `nft -j list ruleset`、检查 `nat.service` 状态、对 TCP 目标做 3 秒 connect 测试，并生成外部测试命令；不会修改配置、不会执行 `nft -f`、不会重启 systemd。测试完成后可点击“测试完成后刷新统计”调用现有 `POST /api/stats/collect-now` 更新流量统计。
+WebUI 的“规则查看”页内分为两个子页：
+
+- `nft 规则`：查看当前已应用的 `self-nat` / `self-filter` 规则，并支持复制规则文本。
+- `转发测试`：选择规则后做只读检查和 counter 观察。
+
+转发测试会读取配置、读取 `nft -j list ruleset`、检查 `nat.service` 状态、对 TCP 目标做 3 秒 connect 测试，并生成外部测试命令；不会修改配置、不会执行 `nft -f`、不会重启 systemd。测试完成后可点击“测试完成后刷新统计”调用现有 `POST /api/stats/collect-now` 更新流量统计。
+
+本机直接 `curl 127.0.0.1:监听端口` 通常不能完整验证 DNAT，因为本机流量不一定走 PREROUTING。推荐从另一台机器访问 `服务器IP:监听端口`，再观察 DNAT 和 FORWARD counter 是否增长。HTTPS/SNI 场景可使用：
+
+```bash
+curl -vk --connect-to 目标域名:目标端口:服务器IP:监听端口 https://目标域名/
+```
 
 `POST /api/stats/collect-now` 只执行只读 `nft -j list ruleset` 并更新 `stats.json`，不会执行 `nft -f`、不会重启服务、不会改规则、不会发送 Telegram。
 
 `POST /api/telegram/test` 会真实发送 Telegram 测试消息。只有在 Telegram 已启用，并且 `bot_token` / `chat_id` 配置完整时才会发送。
+
+## 卸载
+
+交互卸载：
+
+```bash
+bash install.sh --uninstall
+```
+
+交互卸载菜单支持输入 `0` 取消；直接按 Enter 也会默认取消，不会停止服务、删除文件或清理 nft 表。
+
+非交互目标示例：
+
+```bash
+bash install.sh --uninstall --core
+bash install.sh --uninstall --console
+bash install.sh --uninstall --all
+```
+
+CLI 卸载：
+
+```bash
+nat --menu
+```
+
+选择“卸载 / 清理本项目”。
+
+WebUI 卸载：
+
+```text
+卸载 / 清理 -> 选择目标 -> 选择数据保留策略 -> 执行卸载 / 清理
+```
+
+默认会保留：
+
+- `/etc/nat.toml`
+- `/etc/nat.conf`
+- `/etc/nftables-nat/backups/`
+- `/var/lib/nftables-nat-rust/stats.json`
+- `/opt/nat-console/env`
+- `/etc/ssl/nat-webui.crt`
+- `/etc/ssl/nat-webui.key`
+
+完全删除配置、统计、备份、WebUI env/cert/key 时必须输入：
+
+```text
+DELETE
+```
+
+默认不会执行 purge；只有选择完全删除并输入 `DELETE` 后才会删除配置和数据。
+
+卸载只清理本项目组件和本项目 nft 表：
+
+- `table ip self-nat`
+- `table ip6 self-nat`
+- `table ip self-filter`
+- `table ip6 self-filter`
+
+不会 `flush ruleset`，不会删除用户其他 nftables table，不会删除 SSH、防火墙、系统网络配置，也不会卸载 nftables/Rust/cargo 或用户安装的依赖。
 
 ## 安全说明
 
@@ -643,8 +724,16 @@ access_control 安全边界：
 检查服务：
 
 ```bash
-systemctl status nat-console
-journalctl -u nat-console -f
+systemctl status nat-console --no-pager -l
+journalctl -u nat-console -n 120 --no-pager
+ss -lntp | grep 5533
+curl -k https://127.0.0.1:5533/health
+```
+
+如果 `nat-console` 是 `inactive (dead)`，可以手动启动或重启：
+
+```bash
+systemctl restart nat-console
 ```
 
 如果 WebUI 绑定 `127.0.0.1`，需要 SSH 隧道：

@@ -2,6 +2,7 @@ use chrono::Local;
 use nat_common::{
     AccessControlMode, Args, DdnsConfig, IpVersion, NftCell, Protocol, StatsConfig, TomlConfig,
     forward_test, stats as traffic_stats,
+    uninstall::{self, DataMode, UninstallTarget},
 };
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -52,6 +53,7 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
                 Ok(())
             }
             "14" => test_forward_interactive(config_path).map_err(Into::into),
+            "15" => uninstall_menu().map_err(Into::into),
             _ => {
                 println!("未知选项: {}", choice.trim());
                 Ok(())
@@ -100,6 +102,7 @@ nftables-nat-rust-enhanced 管理菜单
 12) 最近来源 IP 观察
 13) WebUI / BBR / Telegram 状态
 14) 测试转发规则连通性
+15) 卸载 / 清理本项目
 0) 退出
 ===================================="#
     );
@@ -451,7 +454,7 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
 6) 删除 IP/CIDR
 7) 清空 entries
 8) 保存并应用
-0) 返回
+0) 返回主菜单
 ===================================="#
         );
         let choice = prompt("请选择操作: ")?;
@@ -565,6 +568,231 @@ fn show_recent_source_design() {
 
 fn show_status_design() {
     println!("TODO: WebUI / BBR / Telegram 状态将在后续阶段整合。");
+}
+
+fn uninstall_menu() -> Result<(), io::Error> {
+    println!(
+        r#"====================================
+卸载 / 清理 nftables-nat-rust-enhanced
+====================================
+1) 仅卸载核心转发服务 nat
+2) 仅卸载 WebUI nat-console
+3) 卸载全部
+4) 仅清理本项目 nft 表
+0) 返回
+===================================="#
+    );
+    let choice = prompt("请选择操作: ")?;
+    let target = match choice.trim() {
+        "1" => UninstallTarget::Core,
+        "2" => UninstallTarget::Console,
+        "3" => UninstallTarget::All,
+        "4" => UninstallTarget::NftTables,
+        "0" => return Ok(()),
+        _ => {
+            println!("未知选项: {}", choice.trim());
+            return Ok(());
+        }
+    };
+    let data_mode = if target == UninstallTarget::NftTables {
+        DataMode::Keep
+    } else {
+        ask_uninstall_data_mode()?
+    };
+    if data_mode == DataMode::Purge {
+        let confirm_text = prompt("危险操作：请输入 DELETE 确认完全删除: ")?;
+        if confirm_text != "DELETE" {
+            println!("确认文本不匹配，已取消卸载。");
+            return Ok(());
+        }
+    }
+    let confirm = prompt("即将执行卸载/清理操作。确认继续? [y/N]: ")?;
+    if !matches!(confirm.as_str(), "y" | "Y") {
+        println!("已取消卸载。");
+        return Ok(());
+    }
+    let report = execute_uninstall(target, data_mode);
+    print_uninstall_report(&report);
+    Ok(())
+}
+
+fn ask_uninstall_data_mode() -> Result<DataMode, io::Error> {
+    println!(
+        r#"是否保留配置和数据？
+1) 保留配置、统计、备份，推荐
+2) 删除程序和服务，保留 /etc/nat.toml 和 backups
+3) 完全删除本项目配置、统计、备份、WebUI env/cert/key，危险"#
+    );
+    let choice = prompt("请选择 [1/2/3]: ")?;
+    match choice.trim() {
+        "" | "1" => Ok(DataMode::Keep),
+        "2" => Ok(DataMode::KeepConfig),
+        "3" => Ok(DataMode::Purge),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "未知数据保留选项",
+        )),
+    }
+}
+
+#[derive(Default)]
+struct UninstallReport {
+    actions: Vec<String>,
+    kept: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn execute_uninstall(target: UninstallTarget, data_mode: DataMode) -> UninstallReport {
+    let plan = uninstall::plan_uninstall(target, data_mode);
+    let mut report = UninstallReport {
+        kept: plan.kept,
+        warnings: plan.warnings,
+        ..Default::default()
+    };
+    if matches!(target, UninstallTarget::Core | UninstallTarget::All) {
+        stop_disable_remove_service("nat", &uninstall::CORE_SERVICE_PATHS, &mut report);
+        remove_path(uninstall::NAT_BINARY, &mut report);
+    }
+    if matches!(
+        target,
+        UninstallTarget::Core | UninstallTarget::All | UninstallTarget::NftTables
+    ) {
+        cleanup_project_nft_tables(&mut report);
+    }
+    if matches!(target, UninstallTarget::Console | UninstallTarget::All) {
+        stop_disable_remove_service(
+            "nat-console",
+            &uninstall::CONSOLE_SERVICE_PATHS,
+            &mut report,
+        );
+        remove_path(uninstall::NAT_CONSOLE_BINARY, &mut report);
+    }
+    cleanup_data_paths(data_mode, &mut report);
+    let _ = Command::new("systemctl").arg("daemon-reload").output();
+    report.actions.push("systemd daemon-reload".to_string());
+    report
+}
+
+fn stop_disable_remove_service(
+    service: &str,
+    service_paths: &[&str],
+    report: &mut UninstallReport,
+) {
+    run_best_effort(
+        Command::new("systemctl").arg("stop").arg(service),
+        report,
+        &format!("stopped {service}.service"),
+    );
+    run_best_effort(
+        Command::new("systemctl").arg("disable").arg(service),
+        report,
+        &format!("disabled {service}.service"),
+    );
+    for path in service_paths {
+        remove_path(path, report);
+    }
+}
+
+fn cleanup_project_nft_tables(report: &mut UninstallReport) {
+    for (family, table) in uninstall::nft_table_names() {
+        let output = Command::new("/usr/sbin/nft")
+            .arg("delete")
+            .arg("table")
+            .arg(family)
+            .arg(table)
+            .output()
+            .or_else(|_| {
+                Command::new("nft")
+                    .arg("delete")
+                    .arg("table")
+                    .arg(family)
+                    .arg(table)
+                    .output()
+            });
+        match output {
+            Ok(_) => report
+                .actions
+                .push(format!("cleaned nft table {family} {table} if present")),
+            Err(e) => report
+                .warnings
+                .push(format!("failed to delete nft table {family} {table}: {e}")),
+        }
+    }
+}
+
+fn cleanup_data_paths(data_mode: DataMode, report: &mut UninstallReport) {
+    match data_mode {
+        DataMode::Keep => {}
+        DataMode::KeepConfig => {
+            for path in [
+                uninstall::CONFIG_LEGACY,
+                uninstall::STATS_JSON,
+                uninstall::CONSOLE_ENV,
+                uninstall::CONSOLE_CERT,
+                uninstall::CONSOLE_KEY,
+            ] {
+                remove_path(path, report);
+            }
+        }
+        DataMode::Purge => {
+            for path in [
+                uninstall::CONFIG_TOML,
+                uninstall::CONFIG_LEGACY,
+                uninstall::STATS_DIR,
+                uninstall::BACKUPS_ROOT,
+                uninstall::CONSOLE_DIR,
+                uninstall::CONSOLE_CERT,
+                uninstall::CONSOLE_KEY,
+            ] {
+                remove_path(path, report);
+            }
+        }
+    }
+}
+
+fn run_best_effort(command: &mut Command, report: &mut UninstallReport, action: &str) {
+    match command.output() {
+        Ok(_) => report.actions.push(action.to_string()),
+        Err(e) => report.warnings.push(format!("{action} failed: {e}")),
+    }
+}
+
+fn remove_path(path: &str, report: &mut UninstallReport) {
+    let path_ref = Path::new(path);
+    if !path_ref.exists() {
+        return;
+    }
+    let result = if path_ref.is_dir() {
+        fs::remove_dir_all(path_ref)
+    } else {
+        fs::remove_file(path_ref)
+    };
+    match result {
+        Ok(()) => report.actions.push(format!("removed {path}")),
+        Err(e) => report
+            .warnings
+            .push(format!("failed to remove {path}: {e}")),
+    }
+}
+
+fn print_uninstall_report(report: &UninstallReport) {
+    println!("已执行操作：");
+    for action in &report.actions {
+        println!("  - {action}");
+    }
+    if !report.kept.is_empty() {
+        println!("已保留：");
+        for path in &report.kept {
+            println!("  - {path}");
+        }
+    }
+    if !report.warnings.is_empty() {
+        println!("警告：");
+        for warning in &report.warnings {
+            println!("  - {warning}");
+        }
+    }
+    println!("后续如需重新安装，请参考 README 的一键安装命令。");
 }
 
 fn test_forward_interactive(path: &str) -> Result<(), io::Error> {

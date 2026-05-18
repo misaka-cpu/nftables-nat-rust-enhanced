@@ -8,6 +8,7 @@ use std::str::FromStr;
 pub mod forward_test;
 pub mod logger;
 pub mod stats;
+pub mod uninstall;
 
 /// NAT CLI 命令行参数
 #[derive(Parser, Debug, Clone)]

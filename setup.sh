@@ -11,6 +11,7 @@ OS_ID=""
 OS_VERSION_ID=""
 OS_PRETTY_NAME=""
 NAT_NONINTERACTIVE="${NAT_NONINTERACTIVE:-0}"
+NAT_START_SERVICE="${NAT_START_SERVICE:-0}"
 
 log_info() {
     echo "[INFO] $1"
@@ -334,7 +335,15 @@ traffic_mode = "both" # both / out / in
 EOF
 fi
 
-if [ "$NAT_NONINTERACTIVE" = "1" ]; then
+if [ "$NAT_START_SERVICE" = "1" ]; then
+    if systemctl is-active --quiet nat; then
+        systemctl restart nat
+        log_ok "nat.service restarted"
+    else
+        systemctl start nat
+        log_ok "nat.service started"
+    fi
+elif [ "$NAT_NONINTERACTIVE" = "1" ]; then
     log_info "非交互模式：已 enable nat.service，不强制 start/restart"
 else
     read -r -p "是否立即启动/重启 nat.service? [y/N]: " START_NAT
