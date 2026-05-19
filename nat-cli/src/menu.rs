@@ -5,7 +5,7 @@ use nat_common::{
     MssClampConfig, NftCell, Protocol, QuotaPeriod, SnatConfig, SnatMode, StatsConfig, TomlConfig,
     TrafficMode,
     audit::{self, AuditResult},
-    build_version, format_cli_time, format_cli_time_from_rfc3339, forward_test, geoip,
+    build_version, format_cli_time_from_rfc3339_with, format_cli_time_with, forward_test, geoip,
     last_good::{LastGoodState, ResolveSource},
     quota, stats as traffic_stats,
     uninstall::{self, DataMode, UninstallTarget},
@@ -170,7 +170,7 @@ fn print_menu() {
 11) 白名单 / 黑名单管理
 12) GeoIP / CN IP 限制
 13) 出口目标限制
-14) 最近来源 IP 观察
+14) 最近来源 IP 观察（手动排查）
 15) BBR / Telegram 状态
 16) 测试转发规则连通性
 17) 一键更新本项目
@@ -798,7 +798,10 @@ fn show_quota_status(config_path: &str) {
             usage.exceeded()
         );
         if let Some(ts) = last_notified {
-            println!("  上次通知时间: {}", format_cli_time_from_rfc3339(&ts));
+            println!(
+                "  上次通知时间: {}",
+                format_cli_time_from_rfc3339_with(&ts, &config.ui)
+            );
         }
     }
 }
@@ -1098,10 +1101,25 @@ pub(crate) fn clear_access_entries(config: &mut TomlConfig) {
 }
 
 fn show_recent_source_design() {
-    println!("最近来源 IP 观察用于查看访问转发端口的来源 IP。");
-    println!("它不等同于白名单 / 黑名单管理，不会自动放行或封禁来源 IP。");
-    println!("当前 CLI 不要求启用白名单或黑名单，也不会修改 access_control 配置。");
-    println!("暂无来源 IP 记录。请从外部客户端访问转发端口后刷新。");
+    println!("====================================");
+    println!("最近来源 IP 观察（手动排查）");
+    println!("====================================");
+    println!("当前版本**不**自动采集最近来源 IP；这是一个手动排查辅助入口，");
+    println!("不依赖白名单 / 黑名单，也不会自动放行或封禁来源 IP。");
+    println!();
+    println!("可以在 shell 中手动执行以下命令观察最近访问者：");
+    println!(
+        "  conntrack -L                              # 查看活跃连接表的来源 IP（需要 conntrack 工具）"
+    );
+    println!("  nft list table ip self-nat                # 看 PREROUTING 计数器递增情况");
+    println!(
+        "  nft list table ip self-filter             # 看 FORWARD nat-traffic counter 是否有 in 流量"
+    );
+    println!("  journalctl -u nat -n 120 --no-pager       # 看 nat.service 最近行为");
+    println!();
+    println!("如果你希望把某个来源 IP 加入白名单 / 黑名单，请使用主菜单 11)。");
+    println!("如果你希望按地区限制（只允许中国大陆来源），请使用 12) GeoIP / CN IP 限制。");
+    println!("本项目不会自动安装 conntrack；也不会持续后台采集来源 IP，避免增加常驻成本。");
 }
 
 fn geoip_menu(config_path: &str) -> Result<(), io::Error> {
@@ -1968,13 +1986,7 @@ fn test_telegram_notification(config_path: &str) -> Result<(), io::Error> {
 }
 
 fn send_telegram_http_for_cli(url: &str, params: &[(&str, &str)]) -> Result<(), String> {
-    let mut command = Command::new("curl");
-    command.arg("-sS").arg("-X").arg("POST").arg(url);
-    for (key, value) in params {
-        command
-            .arg("--data-urlencode")
-            .arg(format!("{key}={value}"));
-    }
+    let mut command = build_cli_telegram_curl_command(url, params);
     let output = command
         .output()
         .map_err(|e| format!("执行 curl 失败: {e}"))?;
@@ -1986,11 +1998,52 @@ fn send_telegram_http_for_cli(url: &str, params: &[(&str, &str)]) -> Result<(), 
             .code()
             .map(|code| code.to_string())
             .unwrap_or_else(|| "unknown".to_string());
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         Err(format!(
             "HTTP 状态 {status}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            sanitize_cli_telegram_error(&stderr, url)
         ))
     }
+}
+
+/// v0.4.3：所有 CLI 触发的 Telegram HTTPS 调用都强制带连接超时和总超时，
+/// 防止 Telegram API 卡死阻塞 CLI 子页面。
+fn build_cli_telegram_curl_command(url: &str, params: &[(&str, &str)]) -> Command {
+    let mut command = Command::new("curl");
+    command
+        .arg("-sS")
+        .arg("--connect-timeout")
+        .arg(CLI_TELEGRAM_CURL_CONNECT_TIMEOUT_SECS)
+        .arg("--max-time")
+        .arg(CLI_TELEGRAM_CURL_MAX_TIME_SECS)
+        .arg("-X")
+        .arg("POST")
+        .arg(url);
+    for (key, value) in params {
+        command
+            .arg("--data-urlencode")
+            .arg(format!("{key}={value}"));
+    }
+    command
+}
+
+const CLI_TELEGRAM_CURL_CONNECT_TIMEOUT_SECS: &str = "5";
+const CLI_TELEGRAM_CURL_MAX_TIME_SECS: &str = "15";
+
+/// 与 server 端 sanitize_telegram_error 同样的脱敏逻辑，避免 stderr 把 bot_token
+/// 透传给 CLI 用户。
+fn sanitize_cli_telegram_error(stderr: &str, url: &str) -> String {
+    let mut out = stderr.to_string();
+    if let Some(start) = url.find("/bot")
+        && let Some(rest) = url.get(start + 4..)
+    {
+        let token: String = rest.chars().take_while(|c| *c != '/').collect();
+        if !token.is_empty() {
+            let masked = traffic_stats::mask_bot_token(&token);
+            out = out.replace(&token, &masked);
+        }
+    }
+    out
 }
 
 fn toggle_telegram(config_path: &str) -> Result<bool, io::Error> {
@@ -2413,6 +2466,10 @@ fn reexec_menu(bin: &str) -> io::Error {
 fn view_audit_log_interactive(config_path: &str) -> Result<(), io::Error> {
     loop {
         let audit_cfg = audit_config_from(config_path);
+        // ui_for_display：尽力读 [ui]；解析失败时回退默认，永不阻塞日志查看。
+        let ui = load_toml_config(config_path)
+            .map(|c| c.ui)
+            .unwrap_or_default();
         println!("====================================");
         println!("审计日志（最近 50 行）");
         println!("====================================");
@@ -2421,13 +2478,16 @@ fn view_audit_log_interactive(config_path: &str) -> Result<(), io::Error> {
         if !audit_cfg.enabled {
             println!("提示：audit.enabled = false，CLI 操作不会写入审计日志。");
         }
-        println!("1) 查看格式化日志（默认，CLI 友好，按 Asia/Shanghai 24 小时制）");
+        println!(
+            "1) 查看格式化日志（默认，CLI 友好，按 [ui].timezone={} 展示）",
+            ui.timezone
+        );
         println!("2) 查看原始 JSON 日志");
         println!("0) 返回");
         let choice = prompt("请选择: ")?;
         match choice.trim() {
             "" | "1" => {
-                show_audit_log_formatted(&audit_cfg);
+                show_audit_log_formatted(&audit_cfg, &ui);
                 wait_enter_to_return()?;
             }
             "2" => {
@@ -2445,16 +2505,20 @@ fn view_audit_log_interactive(config_path: &str) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn show_audit_log_formatted(audit_cfg: &AuditConfig) {
+fn show_audit_log_formatted(audit_cfg: &AuditConfig, ui: &nat_common::UiConfig) {
     println!();
-    println!("提示：JSON 内部 `time` 字段为 UTC RFC3339；CLI 默认按 Asia/Shanghai 24 小时制展示。");
+    println!(
+        "提示：JSON 内部 `time` 字段为 UTC RFC3339；CLI 按 [ui].timezone={} 展示。",
+        ui.timezone
+    );
     println!("------------------------------------");
     let lines = audit::read_tail(&audit_cfg.file, 50);
     if lines.is_empty() {
         println!("（无日志或文件不存在）");
     } else {
         for line in lines {
-            let formatted = audit::format_log_line_for_cli(&line, format_cli_time_from_rfc3339);
+            let formatted =
+                audit::format_log_line_for_cli(&line, |s| format_cli_time_from_rfc3339_with(s, ui));
             println!("{formatted}");
             println!();
         }
@@ -2497,7 +2561,10 @@ pub(crate) fn format_last_good_status(config: &TomlConfig) -> Vec<String> {
     let state = LastGoodState::load(&config.last_good.file);
     lines.push(format!("规则缓存数量: {}", state.rules.len()));
     match state.last_success_at {
-        Some(ts) => lines.push(format!("最近成功应用时间: {}", format_cli_time(ts))),
+        Some(ts) => lines.push(format!(
+            "最近成功应用时间: {}",
+            format_cli_time_with(ts, &config.ui)
+        )),
         None => lines.push("最近成功应用时间: (无)".to_string()),
     }
     for rule in &state.rules {
@@ -2508,7 +2575,7 @@ pub(crate) fn format_last_good_status(config: &TomlConfig) -> Vec<String> {
             comment,
             rule.domain,
             rule.last_good_ip,
-            format_cli_time(rule.last_resolved_at),
+            format_cli_time_with(rule.last_resolved_at, &config.ui),
             rule.egress_allowed,
             rule.last_apply_status,
         ));
@@ -3128,7 +3195,7 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
             );
             println!(
                 "  上次成功解析时间: {}",
-                format_cli_time(cached.last_resolved_at)
+                format_cli_time_with(cached.last_resolved_at, &config.ui)
             );
         }
         (Some(_), Some(cached)) => {
@@ -3139,7 +3206,7 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
             );
             println!(
                 "  上次成功解析时间: {}",
-                format_cli_time(cached.last_resolved_at)
+                format_cli_time_with(cached.last_resolved_at, &config.ui)
             );
         }
         (Some(_), None) => {
@@ -3155,7 +3222,7 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
             );
             println!(
                 "  last-good 上次成功解析时间: {}",
-                format_cli_time(cached.last_resolved_at)
+                format_cli_time_with(cached.last_resolved_at, &config.ui)
             );
             println!(
                 "  egress_control 判断: {}",
@@ -3205,7 +3272,10 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
             let last_apply_success = matches!(&last_apply, Some((a, _)) if a == "apply.success");
             let last_apply_label = match &last_apply {
                 Some((action, time)) if !time.is_empty() => {
-                    format!("{action} @ {}", format_cli_time_from_rfc3339(time))
+                    format!(
+                        "{action} @ {}",
+                        format_cli_time_from_rfc3339_with(time, &config.ui)
+                    )
                 }
                 Some((action, _)) => action.clone(),
                 None => "(无)".to_string(),
@@ -3213,10 +3283,14 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
 
             match presence {
                 Ok(presence) => {
-                    let verdict = forward_test::classify_nft_presence(
+                    // v0.4.3：把 rule 的 nft 形态（Dnat / Redirect）传进 classify，
+                    // 避免 Redirect / localhost-Single 规则因没有 FORWARD counter 被误判为 Partial。
+                    let shape = forward_test::detect_rule_shape(rule);
+                    let verdict = forward_test::classify_nft_presence_with_shape(
                         &presence,
                         rule.ip_version.as_str(),
                         rule.protocol.as_str(),
+                        shape,
                         nat_active,
                         last_apply_success,
                     );
@@ -3290,17 +3364,23 @@ fn print_nft_detection_block(
     println!("nft 规则检测：");
     let need_v4 = matches!(rule.ip_version.as_str(), "ipv4" | "all");
     let need_v6 = matches!(rule.ip_version.as_str(), "ipv6" | "all");
+    // v0.4.3：Redirect / localhost-Single 没有 FORWARD counter，避免在该路径下显示
+    // "FORWARD out: 未找到 in: 未找到" 造成误解。
+    let shape = nat_common::forward_test::detect_rule_shape(rule);
+    let is_redirect = matches!(shape, nat_common::forward_test::NftRuleShape::Redirect);
     if need_v4 {
         println!(
             "  ip self-nat PREROUTING (nat-rule:id={}): {}",
             rule.id,
             yes_no(presence.nat_rule_v4_found)
         );
-        println!(
-            "  ip self-filter FORWARD out: {}  in: {}",
-            yes_no(presence.forward_out_v4_found),
-            yes_no(presence.forward_in_v4_found)
-        );
+        if !is_redirect {
+            println!(
+                "  ip self-filter FORWARD out: {}  in: {}",
+                yes_no(presence.forward_out_v4_found),
+                yes_no(presence.forward_in_v4_found)
+            );
+        }
     }
     if need_v6 {
         println!(
@@ -3308,10 +3388,17 @@ fn print_nft_detection_block(
             rule.id,
             yes_no(presence.nat_rule_v6_found)
         );
+        if !is_redirect {
+            println!(
+                "  ip6 self-filter FORWARD out: {}  in: {}",
+                yes_no(presence.forward_out_v6_found),
+                yes_no(presence.forward_in_v6_found)
+            );
+        }
+    }
+    if is_redirect {
         println!(
-            "  ip6 self-filter FORWARD out: {}  in: {}",
-            yes_no(presence.forward_out_v6_found),
-            yes_no(presence.forward_in_v6_found)
+            "  规则形态: redirect to :port (本机重定向，无 FORWARD counter；判定不要求 self-filter FORWARD)"
         );
     }
     println!(
@@ -3333,6 +3420,11 @@ fn print_nft_detection_block(
     match verdict {
         NftDetectionVerdict::Applied => {
             println!("  nft 规则已确认应用。");
+        }
+        NftDetectionVerdict::AppliedRedirect => {
+            println!(
+                "  nft 规则已确认应用（redirect 本机重定向，不经过 forward 链，无 FORWARD counter）。"
+            );
         }
         NftDetectionVerdict::Partial => {
             println!(
@@ -4864,5 +4956,210 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             "apply.success @ 2026-05-19 20:00:00 CST",
             300,
         );
+    }
+
+    // ============ v0.4.3 ============
+
+    #[test]
+    fn telegram_curl_command_has_timeouts_server_side() {
+        // 服务侧 Telegram curl 命令必须包含 --connect-timeout 5 和 --max-time 15。
+        let cmd = crate::build_telegram_curl_command(
+            "https://api.telegram.org/bot1234:fake/sendMessage",
+            &[("chat_id", "1"), ("text", "hello")],
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--connect-timeout" && w[1] == "5"),
+            "server-side Telegram curl 缺少 --connect-timeout 5: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--max-time" && w[1] == "15"),
+            "server-side Telegram curl 缺少 --max-time 15: {args:?}"
+        );
+    }
+
+    #[test]
+    fn telegram_curl_command_has_timeouts_cli_side() {
+        let cmd = build_cli_telegram_curl_command(
+            "https://api.telegram.org/bot4321:cli/sendMessage",
+            &[("chat_id", "x"), ("text", "y")],
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--connect-timeout" && w[1] == "5"),
+            "CLI Telegram curl 缺少 --connect-timeout 5: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--max-time" && w[1] == "15"),
+            "CLI Telegram curl 缺少 --max-time 15: {args:?}"
+        );
+    }
+
+    #[test]
+    fn telegram_cli_error_sanitizes_bot_token() {
+        let url = "https://api.telegram.org/bot9876543210:LEAKME_CLI_STDERR/sendMessage";
+        // 模拟 curl 把 URL 写到 stderr（极端情况）
+        let stderr = format!("curl: (28) Connection timed out to {url}");
+        let cleaned = sanitize_cli_telegram_error(&stderr, url);
+        assert!(
+            !cleaned.contains("LEAKME_CLI_STDERR"),
+            "CLI Telegram error 必须脱敏 bot_token: {cleaned}"
+        );
+    }
+
+    #[test]
+    fn telegram_server_error_sanitizes_bot_token() {
+        let url = "https://api.telegram.org/bot1234567890:LEAKME_SERVER_STDERR/sendMessage";
+        let stderr = format!("error stdout / stderr leak: {url}");
+        let cleaned = crate::sanitize_telegram_error(&stderr, url);
+        assert!(
+            !cleaned.contains("LEAKME_SERVER_STDERR"),
+            "server Telegram error 必须脱敏 bot_token: {cleaned}"
+        );
+    }
+
+    #[test]
+    fn last_good_status_uses_ui_timezone_when_configured() {
+        use nat_common::last_good::{LastGoodRule, LastGoodState};
+        let dir = std::env::temp_dir().join(format!(
+            "nat-ui-tz-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("last-good.json");
+        let state = LastGoodState {
+            last_success_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-07-15T17:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            rules: vec![LastGoodRule {
+                rule_id: "r0".to_string(),
+                comment: Some("hk-out".to_string()),
+                domain: "example.com".to_string(),
+                last_good_ip: "1.2.3.4".to_string(),
+                last_resolved_at: chrono::DateTime::parse_from_rfc3339("2026-07-15T17:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                egress_allowed: true,
+                last_apply_status: "ok".to_string(),
+            }],
+            last_good_nft_hash: None,
+        };
+        state.save(path.to_str().unwrap()).unwrap();
+
+        // 用 America/Chicago（夏季 CDT = UTC-5），17:00 UTC → 12:00 CDT
+        let mut cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        cfg.last_good = nat_common::LastGoodConfig {
+            enabled: true,
+            file: path.to_string_lossy().to_string(),
+            use_last_good_on_dns_failure: true,
+        };
+        cfg.ui = nat_common::UiConfig {
+            timezone: "America/Chicago".to_string(),
+            time_format: "%Y-%m-%d %H:%M:%S %Z".to_string(),
+        };
+        let blob = format_last_good_status(&cfg).join("\n");
+        assert!(
+            blob.contains("2026-07-15 12:00:00"),
+            "last-good 摘要应当按 [ui].timezone 渲染：{blob}"
+        );
+        assert!(
+            !blob.contains("20:00:00 CST"),
+            "不应再写死 Shanghai CST：{blob}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_good_status_default_ui_still_shanghai() {
+        // 回归保护：[ui] 缺省时仍按 Asia/Shanghai 展示。
+        use nat_common::last_good::{LastGoodRule, LastGoodState};
+        let dir = std::env::temp_dir().join(format!(
+            "nat-ui-default-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("last-good.json");
+        let state = LastGoodState {
+            last_success_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-05-19T12:02:58Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            rules: vec![LastGoodRule {
+                rule_id: "r0".to_string(),
+                comment: None,
+                domain: "example.com".to_string(),
+                last_good_ip: "1.2.3.4".to_string(),
+                last_resolved_at: chrono::DateTime::parse_from_rfc3339("2026-05-19T12:02:58Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                egress_allowed: true,
+                last_apply_status: "ok".to_string(),
+            }],
+            last_good_nft_hash: None,
+        };
+        state.save(path.to_str().unwrap()).unwrap();
+
+        let mut cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        cfg.last_good = nat_common::LastGoodConfig {
+            enabled: true,
+            file: path.to_string_lossy().to_string(),
+            use_last_good_on_dns_failure: true,
+        };
+        // ui 走默认值
+        let blob = format_last_good_status(&cfg).join("\n");
+        assert!(
+            blob.contains("2026-05-19 20:02:58 CST"),
+            "默认 [ui] 仍按 Asia/Shanghai 渲染：{blob}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_ui_timezone_falls_back_without_panic() {
+        // chrono-tz 解析失败时 format_cli_time_with 应回退（默认 Asia/Shanghai；
+        // 退一步是 UTC），不要 panic。
+        let ui = nat_common::UiConfig {
+            timezone: "Mars/Olympus".to_string(),
+            time_format: "%Y-%m-%d %H:%M:%S %Z".to_string(),
+        };
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-05-19T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rendered = nat_common::format_cli_time_with(utc, &ui);
+        assert!(!rendered.is_empty());
+        // 兜底时间字段不会包含 "Mars" 或 "Olympus"
+        assert!(!rendered.contains("Mars"));
+        assert!(!rendered.contains("Olympus"));
+    }
+
+    #[test]
+    fn recent_source_ip_view_marks_manual_only() {
+        let menu_src = include_str!("menu.rs");
+        // v0.4.3：主菜单标签 + 页面文案明确「手动排查」/「不自动采集」
+        assert!(
+            menu_src.contains("14) 最近来源 IP 观察（手动排查）"),
+            "主菜单 14) 必须带「手动排查」后缀"
+        );
+        assert!(
+            menu_src.contains("当前版本**不**自动采集最近来源 IP"),
+            "页面必须明确「不自动采集」"
+        );
+        // 仍保留原本的"不会自动放行或封禁来源 IP"承诺
+        assert!(menu_src.contains("不会自动放行或封禁来源 IP"));
     }
 }

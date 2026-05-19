@@ -303,6 +303,9 @@ pub struct NftRulePresence {
 pub enum NftDetectionVerdict {
     /// 完整找到（期望的 IP family + PREROUTING + FORWARD 计数器全命中）
     Applied,
+    /// Redirect 类型规则只走 PREROUTING redirect，没有 FORWARD counter；
+    /// 命中 PREROUTING 即视为已应用。
+    AppliedRedirect,
     /// 部分命中：只在一个 IP family 或一个方向找到，或 protocol=all 但只看到 tcp/udp 之一
     Partial,
     /// 检测器没找到，但 nat.service active 且最近有 apply.success，可能是检测条件未覆盖
@@ -315,11 +318,40 @@ impl NftDetectionVerdict {
     pub fn label(self) -> &'static str {
         match self {
             NftDetectionVerdict::Applied => "已应用",
+            NftDetectionVerdict::AppliedRedirect => "已应用 (redirect)",
             NftDetectionVerdict::Partial => "部分匹配",
             NftDetectionVerdict::Unconfirmed => "未确认",
             NftDetectionVerdict::NotApplied => "未应用",
         }
     }
+}
+
+/// 规则的 nft 形态分类：影响 [`classify_nft_presence`] 对 FORWARD 计数器的期望。
+///
+/// - `Dnat`：常规 DNAT 转发，PREROUTING + self-filter FORWARD out/in 计数器都存在。
+/// - `Redirect`：本机端口 redirect（无论是 `NftCell::Redirect` 还是 domain=localhost 的 Single），
+///   只有 PREROUTING `redirect to :port`，**没有** FORWARD 计数器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NftRuleShape {
+    Dnat,
+    Redirect,
+}
+
+/// 根据 [`TestableRule`] 推断 nft 形态：`type == "redirect"` 直接 Redirect；
+/// `type == "single"` 但 target 是 `localhost` / `127.0.0.1` / `::1` 也走 Redirect 路径。
+pub fn detect_rule_shape(rule: &TestableRule) -> NftRuleShape {
+    if rule.r#type == "redirect" {
+        return NftRuleShape::Redirect;
+    }
+    if matches_localhost(&rule.target) {
+        NftRuleShape::Redirect
+    } else {
+        NftRuleShape::Dnat
+    }
+}
+
+fn matches_localhost(target: &str) -> bool {
+    matches!(target, "localhost" | "127.0.0.1" | "::1")
 }
 
 /// 扫描 `nft -j list ruleset` 输出中是否存在指定 rule_id 的注释。
@@ -483,6 +515,9 @@ fn scan_protocol_right(value: &Value, saw_tcp: &mut bool, saw_udp: &mut bool) {
 /// - `expected_protocol`：规则配置中的 `protocol`，取值 `"tcp"` / `"udp"` / `"all"`
 /// - `service_active`：systemctl is-active nat 是否返回 active
 /// - `last_apply_success`：最近一次 audit 是否记录到 `apply.success`
+///
+/// **v0.4.3**: 这是历史 API，等价于 `classify_nft_presence_with_shape(..., NftRuleShape::Dnat)`；
+/// 新代码推荐 [`classify_nft_presence_with_shape`]，以便区分 Redirect / localhost 规则。
 pub fn classify_nft_presence(
     presence: &NftRulePresence,
     expected_ip_version: &str,
@@ -490,17 +525,34 @@ pub fn classify_nft_presence(
     service_active: bool,
     last_apply_success: bool,
 ) -> NftDetectionVerdict {
+    classify_nft_presence_with_shape(
+        presence,
+        expected_ip_version,
+        expected_protocol,
+        NftRuleShape::Dnat,
+        service_active,
+        last_apply_success,
+    )
+}
+
+/// v0.4.3：在 [`classify_nft_presence`] 基础上加入 `NftRuleShape`。
+///
+/// - `NftRuleShape::Dnat`：保持原行为，要求 PREROUTING + FORWARD out/in 三件套都命中
+///   才视为 Applied。
+/// - `NftRuleShape::Redirect`：本机重定向规则只生成 PREROUTING redirect，**没有** FORWARD
+///   counter。只要命中期望 IP family 的 nat-rule comment 即视为 `AppliedRedirect`，
+///   避免被误判为 Partial。
+#[allow(clippy::too_many_arguments)]
+pub fn classify_nft_presence_with_shape(
+    presence: &NftRulePresence,
+    expected_ip_version: &str,
+    expected_protocol: &str,
+    shape: NftRuleShape,
+    service_active: bool,
+    last_apply_success: bool,
+) -> NftDetectionVerdict {
     let need_v4 = matches!(expected_ip_version, "ipv4" | "all");
     let need_v6 = matches!(expected_ip_version, "ipv6" | "all");
-
-    let v4_full =
-        presence.nat_rule_v4_found && presence.forward_out_v4_found && presence.forward_in_v4_found;
-    let v4_any =
-        presence.nat_rule_v4_found || presence.forward_out_v4_found || presence.forward_in_v4_found;
-    let v6_full =
-        presence.nat_rule_v6_found && presence.forward_out_v6_found && presence.forward_in_v6_found;
-    let v6_any =
-        presence.nat_rule_v6_found || presence.forward_out_v6_found || presence.forward_in_v6_found;
 
     // protocol=all 时，要求 protocol_tcp_seen && protocol_udp_seen；
     // 否则只视为部分匹配。
@@ -512,15 +564,44 @@ pub fn classify_nft_presence(
     };
     let protocol_any = presence.protocol_tcp_seen || presence.protocol_udp_seen;
 
-    let v4_ok = !need_v4 || v4_full;
-    let v6_ok = !need_v6 || v6_full;
-    let any_family_found = v4_any || v6_any;
+    match shape {
+        NftRuleShape::Redirect => {
+            // Redirect 只看 nat-rule（PREROUTING redirect to :port），不要 FORWARD counter。
+            let v4_ok = !need_v4 || presence.nat_rule_v4_found;
+            let v6_ok = !need_v6 || presence.nat_rule_v6_found;
+            let any_nat_rule = presence.nat_rule_v4_found || presence.nat_rule_v6_found;
+            if v4_ok && v6_ok && protocol_ok && any_nat_rule {
+                return NftDetectionVerdict::AppliedRedirect;
+            }
+            if any_nat_rule || protocol_any {
+                return NftDetectionVerdict::Partial;
+            }
+        }
+        NftRuleShape::Dnat => {
+            let v4_full = presence.nat_rule_v4_found
+                && presence.forward_out_v4_found
+                && presence.forward_in_v4_found;
+            let v4_any = presence.nat_rule_v4_found
+                || presence.forward_out_v4_found
+                || presence.forward_in_v4_found;
+            let v6_full = presence.nat_rule_v6_found
+                && presence.forward_out_v6_found
+                && presence.forward_in_v6_found;
+            let v6_any = presence.nat_rule_v6_found
+                || presence.forward_out_v6_found
+                || presence.forward_in_v6_found;
 
-    if v4_ok && v6_ok && protocol_ok && any_family_found {
-        return NftDetectionVerdict::Applied;
-    }
-    if any_family_found || protocol_any {
-        return NftDetectionVerdict::Partial;
+            let v4_ok = !need_v4 || v4_full;
+            let v6_ok = !need_v6 || v6_full;
+            let any_family_found = v4_any || v6_any;
+
+            if v4_ok && v6_ok && protocol_ok && any_family_found {
+                return NftDetectionVerdict::Applied;
+            }
+            if any_family_found || protocol_any {
+                return NftDetectionVerdict::Partial;
+            }
+        }
     }
     // 检测器一无所获：根据 service / apply 状态区分 Unconfirmed / NotApplied
     if service_active && last_apply_success {
@@ -879,5 +960,144 @@ domain = "93.184.216.34"
         let p = detect_rule_in_nft_json(json, "r0").unwrap();
         let verdict = classify_nft_presence(&p, "ipv4", "tcp", true, true);
         assert_eq!(verdict, NftDetectionVerdict::Applied);
+    }
+
+    // ============ v0.4.3: Redirect / localhost-Single 检测修复 ============
+
+    fn redirect_rule_json(rule_id: &str) -> String {
+        // Redirect 实际 nft 输出：只有一条 PREROUTING redirect to :port，无 FORWARD counter。
+        format!(
+            r#"{{"nftables":[
+                {{"rule":{{"family":"ip","table":"self-nat","chain":"PREROUTING","handle":1,
+                    "expr":[
+                        {{"match":{{"left":{{"payload":{{"protocol":"tcp","field":"dport"}}}},"op":"==","right":3128}}}},
+                        {{"counter":{{"packets":0,"bytes":0}}}},
+                        {{"comment":"nat-rule:id={rule_id}"}}
+                    ]
+                }}}}
+            ]}}"#
+        )
+    }
+
+    #[test]
+    fn redirect_shape_classified_as_applied_redirect_with_zero_counter() {
+        let json = redirect_rule_json("r0");
+        let presence = detect_rule_in_nft_json(&json, "r0").unwrap();
+        // Redirect 只在 self-nat 命中，没有 forward counter；过去会判 Partial。
+        let verdict = classify_nft_presence_with_shape(
+            &presence,
+            "ipv4",
+            "tcp",
+            NftRuleShape::Redirect,
+            true,
+            true,
+        );
+        assert_eq!(verdict, NftDetectionVerdict::AppliedRedirect);
+    }
+
+    #[test]
+    fn dnat_shape_still_requires_forward_counters() {
+        // 回归保护：把 Redirect 形状用 Dnat 解读，应该回到 Partial（因为 forward 缺失）。
+        let json = redirect_rule_json("r0");
+        let presence = detect_rule_in_nft_json(&json, "r0").unwrap();
+        let verdict = classify_nft_presence_with_shape(
+            &presence,
+            "ipv4",
+            "tcp",
+            NftRuleShape::Dnat,
+            true,
+            true,
+        );
+        assert_eq!(verdict, NftDetectionVerdict::Partial);
+    }
+
+    #[test]
+    fn detect_rule_shape_recognizes_redirect_and_localhost_targets() {
+        let mut rule = TestableRule {
+            index: 0,
+            id: "r0".to_string(),
+            label: "demo".to_string(),
+            r#type: "redirect".to_string(),
+            sport: 8000,
+            target: "localhost".to_string(),
+            resolved_ip: Some("127.0.0.1".to_string()),
+            dport: 3128,
+            protocol: "tcp".to_string(),
+            ip_version: "ipv4".to_string(),
+        };
+        // 显式 redirect 类型
+        assert_eq!(detect_rule_shape(&rule), NftRuleShape::Redirect);
+
+        // single + localhost
+        rule.r#type = "single".to_string();
+        rule.target = "localhost".to_string();
+        assert_eq!(detect_rule_shape(&rule), NftRuleShape::Redirect);
+
+        // single + 127.0.0.1
+        rule.target = "127.0.0.1".to_string();
+        assert_eq!(detect_rule_shape(&rule), NftRuleShape::Redirect);
+
+        // single + ::1
+        rule.target = "::1".to_string();
+        assert_eq!(detect_rule_shape(&rule), NftRuleShape::Redirect);
+
+        // single + 远端目标 → Dnat
+        rule.target = "example.com".to_string();
+        assert_eq!(detect_rule_shape(&rule), NftRuleShape::Dnat);
+
+        // single + 公网 IP → Dnat
+        rule.target = "1.2.3.4".to_string();
+        assert_eq!(detect_rule_shape(&rule), NftRuleShape::Dnat);
+    }
+
+    #[test]
+    fn redirect_shape_v6_only_classifies_applied() {
+        let json = r#"{"nftables":[
+            {"rule":{"family":"ip6","table":"self-nat","chain":"PREROUTING","handle":1,
+                "expr":[
+                    {"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":3128}},
+                    {"counter":{"packets":0,"bytes":0}},
+                    {"comment":"nat-rule:id=r2"}
+                ]
+            }}
+        ]}"#;
+        let p = detect_rule_in_nft_json(json, "r2").unwrap();
+        let verdict =
+            classify_nft_presence_with_shape(&p, "ipv6", "tcp", NftRuleShape::Redirect, true, true);
+        assert_eq!(verdict, NftDetectionVerdict::AppliedRedirect);
+    }
+
+    #[test]
+    fn dnat_shape_regression_with_full_counters_still_applied() {
+        // 普通 DNAT 规则在 v0.4.3 后仍能正确识别为 Applied，不应回退。
+        let json = r#"{"nftables":[
+            {"rule":{"family":"ip","table":"self-nat","chain":"PREROUTING","handle":1,
+                "expr":[
+                    {"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":80}},
+                    {"counter":{"packets":0,"bytes":0}},
+                    {"comment":"nat-rule:id=r0"}
+                ]
+            }},
+            {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":2,
+                "expr":[{"counter":{"packets":0,"bytes":0}},{"comment":"nat-traffic:id=r0,dir=out"}]
+            }},
+            {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":3,
+                "expr":[{"counter":{"packets":0,"bytes":0}},{"comment":"nat-traffic:id=r0,dir=in"}]
+            }}
+        ]}"#;
+        let p = detect_rule_in_nft_json(json, "r0").unwrap();
+        let verdict =
+            classify_nft_presence_with_shape(&p, "ipv4", "tcp", NftRuleShape::Dnat, true, true);
+        assert_eq!(verdict, NftDetectionVerdict::Applied);
+    }
+
+    #[test]
+    fn redirect_shape_protocol_all_partial_when_missing_udp() {
+        let json = redirect_rule_json("r0");
+        let p = detect_rule_in_nft_json(&json, "r0").unwrap();
+        // protocol=all 但只看到 tcp → Partial（即使是 Redirect 形态）
+        let verdict =
+            classify_nft_presence_with_shape(&p, "ipv4", "all", NftRuleShape::Redirect, true, true);
+        assert_eq!(verdict, NftDetectionVerdict::Partial);
     }
 }

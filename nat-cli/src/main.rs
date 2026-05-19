@@ -953,21 +953,61 @@ fn maybe_send_telegram(
 }
 
 fn send_telegram_http(url: &str, params: &[(&str, &str)]) -> Result<(), String> {
+    build_telegram_curl_command(url, params)
+        .output()
+        .map_err(|e| format!("执行 curl 失败: {e}"))
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(())
+            } else {
+                // bot_token 已经在 URL 里，stderr 默认不会回显请求体；但稳妥起见，
+                // 用 mask_bot_token 把任何意外出现的 token 片段脱敏后再返回给上层。
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                Err(sanitize_telegram_error(&stderr, url))
+            }
+        })
+}
+
+/// 构造 Telegram HTTPS 请求的 curl 命令。强制带上 --connect-timeout 与 --max-time，
+/// 防止网络挂死阻塞 nat.service 主循环。
+fn build_telegram_curl_command(url: &str, params: &[(&str, &str)]) -> Command {
     let mut command = Command::new("curl");
-    command.arg("-sS").arg("-X").arg("POST").arg(url);
+    command
+        .arg("-sS")
+        .arg("--connect-timeout")
+        .arg(TELEGRAM_CURL_CONNECT_TIMEOUT_SECS)
+        .arg("--max-time")
+        .arg(TELEGRAM_CURL_MAX_TIME_SECS)
+        .arg("-X")
+        .arg("POST")
+        .arg(url);
     for (key, value) in params {
         command
             .arg("--data-urlencode")
             .arg(format!("{key}={value}"));
     }
-    let output = command
-        .output()
-        .map_err(|e| format!("执行 curl 失败: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    command
+}
+
+const TELEGRAM_CURL_CONNECT_TIMEOUT_SECS: &str = "5";
+const TELEGRAM_CURL_MAX_TIME_SECS: &str = "15";
+
+/// 把可能出现在 stderr 中的 bot_token 字段脱敏（curl 通常只回显 url path 的一部分，
+/// 但 5xx / timeout 错误个别版本会回显完整 URL）。
+fn sanitize_telegram_error(stderr: &str, url: &str) -> String {
+    let mut out = stderr.to_string();
+    // url 形如 https://api.telegram.org/bot<TOKEN>/sendMessage；
+    // 把 bot<token> 这段替换掉，避免 stderr 携带原 token。
+    if let Some(start) = url.find("/bot")
+        && let Some(rest) = url.get(start + 4..)
+    {
+        let token: String = rest.chars().take_while(|c| *c != '/').collect();
+        if !token.is_empty() {
+            let masked = traffic_stats::mask_bot_token(&token);
+            out = out.replace(&token, &masked);
+        }
     }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]

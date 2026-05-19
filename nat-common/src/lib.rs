@@ -15,7 +15,18 @@ pub mod stats;
 pub mod uninstall;
 
 pub fn build_version() -> &'static str {
-    option_env!("NAT_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+    // release CI 注入 NAT_BUILD_VERSION=<tag>；源码编译没有注入时回退 Cargo 包版本。
+    // 两者都为空（极端情况，例如手动 unset 后编译）时退回 "dev"，避免 `nat --version`
+    // 和主菜单标题出现空字符串。
+    let injected = option_env!("NAT_BUILD_VERSION").unwrap_or("");
+    if !injected.is_empty() {
+        return injected;
+    }
+    let pkg = env!("CARGO_PKG_VERSION");
+    if !pkg.is_empty() {
+        return pkg;
+    }
+    "dev"
 }
 
 /// CLI 默认展示时区：Asia/Shanghai（IANA 名，处理潜在 DST 由 chrono-tz 兜底）。

@@ -2,6 +2,8 @@
 
 `nftables-nat-rust-enhanced` 是基于 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 增强的 CLI-first nftables NAT 转发管理工具。本项目当前为纯 CLI-first 工具，不提供 WebUI。
 
+> 命名约定：项目正式名为 **`nftables-nat-rust-enhanced`**（GitHub 仓库、安装命令、release 资产、README 标题、systemd 服务路径、配置 / 数据 / 日志目录均保持此名）；CLI 主菜单标题为简称 **`nft-nat-rust`**，仅用于交互界面显示。两者指向同一项目，未来不会重命名仓库或破坏安装/数据路径。
+
 核心原则：
 
 - release 预编译安装，普通 VPS 不需要编译 Rust
@@ -10,6 +12,8 @@
 - 应用 nft 前执行 `nft -c`
 - 应用前备份，失败自动回滚本项目 managed tables
 - CLI 菜单管理 `/etc/nat.toml`
+
+> **Docker v28 兼容例外**：项目原则上只管理 `self-*` 表，**唯一已知**会触碰非 self-* 表的兼容处理是：启动时检测到 `ip filter FORWARD` 或 `ip6 filter FORWARD` 的默认 policy 是 `drop`（Docker v28 在某些版本会这样设置），会写入 `chain ip(6) filter FORWARD { policy accept ; }`，否则转发链路会被默认 drop。这是一次性兼容修正，不修改链中的规则，也不接管 forward policy。如果你不希望本项目触碰这条策略，请确保 `ip filter FORWARD` 的 policy 在 nat.service 启动前已经是 `accept`。
 
 ## 功能特性
 
@@ -68,6 +72,7 @@
 - 支持定时通知
 - 支持 daily / monthly 流量通知
 - bot_token 在状态输出中脱敏
+- v0.4.3 起 Telegram curl 调用强制 `--connect-timeout 5 --max-time 15`，Telegram API 不可达 / 网络抖动不会阻塞 nat.service 主循环。失败仅 WARN + audit，并对 stderr 兜底脱敏 bot_token，不会泄露在 audit / CLI 输出中。
 
 ### 白名单 / 黑名单
 
@@ -313,6 +318,23 @@ enabled = true
 file = "/var/log/nftables-nat-rust-audit.log"
 ```
 
+#### 日志轮转建议（logrotate）
+
+audit log 是 append-only 一行 JSON，长期运行不会自动轮转。建议在 `/etc/logrotate.d/nftables-nat-rust-audit` 写入：
+
+```
+/var/log/nftables-nat-rust-audit.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    copytruncate
+}
+```
+
+- `copytruncate` 适合 append 模式：不需要重启 nat.service，nat 会继续 append 到原 inode。
+- 本项目不会自动安装 logrotate。如果你的系统没有 logrotate，可改用 cron 定期 mv + truncate。
+
 ### 规则级流量配额 quota
 
 可为每条转发规则设置 `daily` / `monthly` / `total` 流量配额，超额后**自动禁用规则**（不删除）。
@@ -457,7 +479,7 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.1.4 --enter-menu
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.4.3 --enter-menu
 ```
 
 不指定 `--version` 时使用 latest release。release 包是核心 CLI 版本，包含：
@@ -501,7 +523,7 @@ nat --menu
 nat --version
 ```
 
-release 构建会显示 GitHub tag，例如 `v0.2.2`。源码编译如果没有注入 tag，可能显示开发版本或在更新菜单中显示 `unknown`。
+release 构建会显示 GitHub tag，例如 `v0.4.3`。源码编译如果没有注入 tag，会回退到 `Cargo.toml` 的 workspace version；两者都缺失时显示 `dev`，不会输出空字符串。
 
 菜单（v0.4.2 起标题携带当前版本号，未注入版本时显示 `nft-nat-rust dev`）：
 
@@ -522,7 +544,7 @@ nft-nat-rust v0.4.2
 11) 白名单 / 黑名单管理
 12) GeoIP / CN IP 限制
 13) 出口目标限制
-14) 最近来源 IP 观察
+14) 最近来源 IP 观察（手动排查）
 15) BBR / Telegram 状态
 16) 测试转发规则连通性
 17) 一键更新本项目
@@ -559,7 +581,7 @@ systemctl restart nat
 
 `启用 / 禁用规则` 会列出所有规则，选择某一条后再启用或禁用。旧配置缺少 `enabled` 字段时默认视为 `true`；`enabled = false` 的规则会保留在 `/etc/nat.toml`，但不会生成到 nft 规则，也不会进入默认连通性测试列表。
 
-`最近来源 IP 观察` 用于观察访问转发端口的来源 IP，不等同于白名单 / 黑名单，不会自动放行或封禁来源 IP，也不会修改访问控制配置。
+`最近来源 IP 观察（手动排查）` v0.4.3 起明确为**手动排查辅助入口**，**不自动采集**最近来源 IP，也不依赖白名单 / 黑名单。页面会打印 `conntrack -L` / `nft list table ip self-nat` / `nft list table ip self-filter` / `journalctl -u nat -n 120 --no-pager` 等命令，供用户在 shell 中手动观察。本项目不会自动安装 conntrack，也不会自动放行或封禁来源 IP，也不会修改访问控制配置。
 
 `BBR / Telegram 状态` 子菜单可查看、开启、关闭 BBR；也可查看 Telegram 配置状态、配置 bot_token 和 chat_id、发送测试通知、启用 / 禁用通知、设置通知间隔。
 
@@ -686,7 +708,7 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.1.4
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.4.3
 ```
 
 CLI 更新：
@@ -799,7 +821,7 @@ bash install.sh --core-only --build-from-source
 可指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.1.4
+bash install.sh --core-only --use-release --version v0.4.3
 bash install.sh --core-only --build-from-source
 ```
 
