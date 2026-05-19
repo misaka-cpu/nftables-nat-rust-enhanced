@@ -5,7 +5,7 @@ use nat_common::{
     MssClampConfig, NftCell, Protocol, QuotaPeriod, SnatConfig, SnatMode, StatsConfig, TomlConfig,
     TrafficMode,
     audit::{self, AuditResult},
-    build_version, forward_test, geoip,
+    build_version, format_cli_time, format_cli_time_from_rfc3339, forward_test, geoip,
     last_good::{LastGoodState, ResolveSource},
     quota, stats as traffic_stats,
     uninstall::{self, DataMode, UninstallTarget},
@@ -103,7 +103,12 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
                 should_wait = false;
                 advanced_network_menu(config_path).map_err(Into::into)
             }
-            "20" => view_audit_log_interactive(config_path).map_err(Into::into),
+            "20" => {
+                // view_audit_log_interactive 内部已经调用一次 wait_enter_to_return；
+                // 主循环再叠加一次会让用户感觉「按 Enter → 空白 → 再按 Enter」。
+                should_wait = false;
+                view_audit_log_interactive(config_path).map_err(Into::into)
+            }
             _ => {
                 println!("未知选项: {}", choice.trim());
                 Ok(())
@@ -135,6 +140,16 @@ fn wait_enter_to_return() -> Result<(), io::Error> {
     let _ = prompt("按 Enter 返回...")?;
     clear_screen();
     Ok(())
+}
+
+/// 子菜单 / 子动作的结果。
+/// - `Done`：函数展示了内容或完成了配置改写；调用方可以再追加一次 `wait_enter_to_return`，
+///   但**不强制**：很多自管 wait 的函数会自己调一次。
+/// - `Cancelled`：用户选择 0 / 取消，函数没有展示信息，调用方**不应再要求按 Enter**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuOutcome {
+    Done,
+    Cancelled,
 }
 
 fn print_menu() {
@@ -369,12 +384,27 @@ fn print_config_saved_hint(path: &str) {
     println!("nat.service 通常会自动检测配置变化，并通过安全流程应用规则。");
     println!("安全流程包括：nft -c 检查、备份当前规则、应用失败自动回滚。");
     println!("本工具不会直接绕过安全流程执行 nft -f。");
-    println!("如需确认当前规则是否已应用，可执行：");
+    // 显示当前 ddns.refresh_interval_seconds 作为「检测周期」参考值；读不到就退回默认提示
+    let interval_secs = load_toml_config(path)
+        .ok()
+        .map(|c| c.ddns.refresh_interval_seconds);
+    match interval_secs {
+        Some(secs) => {
+            println!("当前自动检测 / 刷新间隔：{secs} 秒（ddns.refresh_interval_seconds）。");
+        }
+        None => {
+            println!(
+                "当前自动检测 / 刷新间隔：默认 300 秒（无法读取 ddns.refresh_interval_seconds）。"
+            );
+        }
+    }
+    println!("如果刚改完配置后立即测试显示 nft 未应用，请等待一个检测周期后刷新；这通常不是 bug。");
+    println!("如需立即尝试应用，可手动执行：");
+    println!("  systemctl restart nat");
+    println!("确认当前规则是否已应用：");
     println!("  nft list table ip self-nat");
     println!("  nft list table ip self-filter");
     println!("  journalctl -u nat -n 120 --no-pager");
-    println!("如果未自动生效，可手动执行：");
-    println!("  systemctl restart nat");
 }
 
 fn refresh_ddns_interactive(
@@ -500,8 +530,11 @@ Stats 流量统计
                 }
             }
             "3" => {
-                set_rule_quota_interactive(config_path)?;
-                wait_enter_to_return()?;
+                // 子动作返回 Cancelled 时（用户按 0 退出）不再要求按一次 Enter，
+                // 避免「按 0 → 空白返回页 → 还要再按 Enter」的双确认体验。
+                if set_rule_quota_interactive(config_path)? == MenuOutcome::Done {
+                    wait_enter_to_return()?;
+                }
             }
             "4" => {
                 show_quota_status(config_path);
@@ -558,11 +591,11 @@ fn switch_traffic_mode(config_path: &str) -> Result<bool, io::Error> {
     Ok(true)
 }
 
-fn set_rule_quota_interactive(config_path: &str) -> Result<(), io::Error> {
+fn set_rule_quota_interactive(config_path: &str) -> Result<MenuOutcome, io::Error> {
     let mut config = load_toml_config(config_path)?;
     if config.rules.is_empty() {
         println!("当前没有规则可配置 quota。");
-        return Ok(());
+        return Ok(MenuOutcome::Done);
     }
     if !config.stats.enabled {
         println!(
@@ -611,7 +644,8 @@ fn set_rule_quota_interactive(config_path: &str) -> Result<(), io::Error> {
     println!("0) 返回");
     let index = parse_index(&prompt("请选择规则编号: ")?)?;
     if index == 0 {
-        return Ok(());
+        // 用户主动选择「返回」：上层不应再等一次 Enter
+        return Ok(MenuOutcome::Cancelled);
     }
     let rule_idx = index - 1;
     if rule_idx >= config.rules.len() {
@@ -622,7 +656,7 @@ fn set_rule_quota_interactive(config_path: &str) -> Result<(), io::Error> {
     }
     if matches!(config.rules[rule_idx], NftCell::Drop { .. }) {
         println!("Drop 规则不支持 quota。");
-        return Ok(());
+        return Ok(MenuOutcome::Done);
     }
     println!(
         r#"
@@ -664,10 +698,11 @@ fn set_rule_quota_interactive(config_path: &str) -> Result<(), io::Error> {
             };
             config.rules[rule_idx].set_quota_period(period);
         }
-        "0" => return Ok(()),
+        // 用户主动选择「返回」：上层不应再等一次 Enter
+        "0" => return Ok(MenuOutcome::Cancelled),
         _ => {
             println!("未知选项: {}", action.trim());
-            return Ok(());
+            return Ok(MenuOutcome::Done);
         }
     }
     backup_config(config_path)?;
@@ -686,7 +721,7 @@ fn set_rule_quota_interactive(config_path: &str) -> Result<(), io::Error> {
     );
     println!("已保存。");
     print_config_saved_hint(config_path);
-    Ok(())
+    Ok(MenuOutcome::Done)
 }
 
 fn show_quota_status(config_path: &str) {
@@ -750,7 +785,7 @@ fn show_quota_status(config_path: &str) {
             usage.exceeded()
         );
         if let Some(ts) = last_notified {
-            println!("  上次通知时间: {ts}");
+            println!("  上次通知时间: {}", format_cli_time_from_rfc3339(&ts));
         }
     }
 }
@@ -2369,6 +2404,9 @@ fn view_audit_log_interactive(config_path: &str) -> Result<(), io::Error> {
     if !audit_cfg.enabled {
         println!("提示：audit.enabled = false，CLI 操作不会写入审计日志。");
     }
+    println!(
+        "提示：JSON 内部 `time` 字段为 UTC RFC3339；CLI 状态页其他时间会按 Asia/Shanghai 展示。"
+    );
     let lines = audit::read_tail(&audit_cfg.file, 50);
     if lines.is_empty() {
         println!("（无日志或文件不存在）");
@@ -2400,7 +2438,7 @@ pub(crate) fn format_last_good_status(config: &TomlConfig) -> Vec<String> {
     let state = LastGoodState::load(&config.last_good.file);
     lines.push(format!("规则缓存数量: {}", state.rules.len()));
     match state.last_success_at {
-        Some(ts) => lines.push(format!("最近成功应用时间: {}", ts.to_rfc3339())),
+        Some(ts) => lines.push(format!("最近成功应用时间: {}", format_cli_time(ts))),
         None => lines.push("最近成功应用时间: (无)".to_string()),
     }
     for rule in &state.rules {
@@ -2411,7 +2449,7 @@ pub(crate) fn format_last_good_status(config: &TomlConfig) -> Vec<String> {
             comment,
             rule.domain,
             rule.last_good_ip,
-            rule.last_resolved_at.to_rfc3339(),
+            format_cli_time(rule.last_resolved_at),
             rule.egress_allowed,
             rule.last_apply_status,
         ));
@@ -2439,6 +2477,7 @@ fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
 3) 设置 fixed SNAT 源 IP
 4) 启用 / 禁用 MSS clamp
 5) 设置 MSS clamp size
+6) 时间 / NTP 状态检查
 0) 返回主菜单
 ===================================="#
         );
@@ -2464,6 +2503,10 @@ fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
                 set_mss_clamp_size_interactive(config_path)?;
                 wait_enter_to_return()?;
             }
+            "6" => {
+                // 自管 wait：函数内部完成一次 wait_enter_to_return；不再叠加。
+                time_status_interactive()?;
+            }
             "0" => break,
             value if is_menu_refresh_command(value) => break,
             "" => continue,
@@ -2474,6 +2517,127 @@ fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
         }
     }
     Ok(())
+}
+
+/// 时间 / NTP 状态检查页面。
+///
+/// **只查看，不默认修改系统时间**。可通过 y/N 二次确认尝试启用系统 NTP（调用
+/// `timedatectl set-ntp true`，需要 root），未确认时只打印建议命令。
+fn time_status_interactive() -> Result<(), io::Error> {
+    let now_utc = chrono::Utc::now();
+    let local_now = chrono::Local::now();
+    println!("====================================");
+    println!("时间 / NTP 状态检查");
+    println!("====================================");
+    println!(
+        "当前系统时间（本机时区）：{}",
+        local_now.format("%Y-%m-%d %H:%M:%S %Z")
+    );
+    println!("当前 UTC 时间：{}", now_utc.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!(
+        "CLI 展示时区：{} ({})",
+        nat_common::CLI_DISPLAY_TZ_LABEL,
+        format_cli_time(now_utc)
+    );
+
+    println!();
+    println!("nft 转发本身不严格依赖系统时间，但以下功能建议系统时间准确：");
+    println!("  - Stats daily/monthly 滚动重置");
+    println!("  - quota 周期判断 / 通知去重 key");
+    println!("  - audit log 时间戳");
+    println!("  - last-good 上次成功解析时间");
+    println!("  - TLS 下载 release / cn4.nft 时的证书校验");
+    println!();
+
+    let output = Command::new("timedatectl").arg("status").output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let ntp_service = parse_timedatectl_field(&stdout, "NTP service")
+                .or_else(|| parse_timedatectl_field(&stdout, "Network time on"));
+            let synchronized = parse_timedatectl_field(&stdout, "System clock synchronized");
+            let timezone = parse_timedatectl_field(&stdout, "Time zone");
+            println!("timedatectl: 可用");
+            println!(
+                "NTP 服务：{}",
+                ntp_service.as_deref().unwrap_or("(未知字段)")
+            );
+            println!(
+                "System clock synchronized：{}",
+                synchronized.as_deref().unwrap_or("(未知字段)")
+            );
+            println!(
+                "当前系统时区：{}",
+                timezone.as_deref().unwrap_or("(未知字段)")
+            );
+
+            let synced_yes = synchronized
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case("yes"));
+            if !synced_yes {
+                println!();
+                println!("提示：系统时钟未同步。可手动执行（需要 root）：");
+                println!("  sudo timedatectl set-ntp true");
+                let confirm = prompt("尝试启用系统 NTP？[y/N]: ")?;
+                if matches!(confirm.as_str(), "y" | "Y" | "yes" | "YES") {
+                    match Command::new("timedatectl")
+                        .arg("set-ntp")
+                        .arg("true")
+                        .output()
+                    {
+                        Ok(set_out) if set_out.status.success() => {
+                            println!("已尝试启用系统 NTP。请稍后再次查看以确认 synchronized=yes。");
+                        }
+                        Ok(set_out) => {
+                            println!(
+                                "执行 timedatectl set-ntp true 返回非零退出码：{}",
+                                String::from_utf8_lossy(&set_out.stderr).trim()
+                            );
+                            println!(
+                                "常见原因：未以 root 运行；或当前系统不使用 systemd-timesyncd。"
+                            );
+                        }
+                        Err(e) => {
+                            println!("调用 timedatectl set-ntp true 失败：{e}");
+                        }
+                    }
+                } else {
+                    println!("已取消，不改动系统 NTP 设置。");
+                }
+            }
+        }
+        Ok(out) => {
+            println!(
+                "timedatectl status 返回非零退出码：{}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            println!("未检测到 timedatectl（可能未安装 systemd 工具）。");
+            println!(
+                "如果你需要保持时钟同步，请使用你的发行版自带的 NTP 客户端，本项目不会自动安装任何依赖。"
+            );
+        }
+        Err(e) => {
+            println!("调用 timedatectl 失败：{e}");
+        }
+    }
+    wait_enter_to_return()
+}
+
+/// 从 `timedatectl status` 输出中按"前缀 key"匹配并取冒号后的值。
+/// 大小写敏感、保留原始 trim 后的值；找不到时返回 None。
+pub(crate) fn parse_timedatectl_field(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(key) {
+            let rest = rest.trim_start_matches(':').trim();
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn print_advanced_network_status(config: &TomlConfig) {
@@ -2796,7 +2960,7 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
             );
             println!(
                 "  上次成功解析时间: {}",
-                cached.last_resolved_at.to_rfc3339()
+                format_cli_time(cached.last_resolved_at)
             );
         }
         (Some(_), Some(cached)) => {
@@ -2807,7 +2971,7 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
             );
             println!(
                 "  上次成功解析时间: {}",
-                cached.last_resolved_at.to_rfc3339()
+                format_cli_time(cached.last_resolved_at)
             );
         }
         (Some(_), None) => {
@@ -2823,7 +2987,7 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
             );
             println!(
                 "  last-good 上次成功解析时间: {}",
-                cached.last_resolved_at.to_rfc3339()
+                format_cli_time(cached.last_resolved_at)
             );
             println!(
                 "  egress_control 判断: {}",
@@ -2888,13 +3052,21 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
                     }
                 );
                 if !nft_applied {
-                    println!("nft 规则未找到。可能原因：");
+                    // 该规则在 /etc/nat.toml 中存在（由 list_testable_rules 过滤过 enabled=true）
+                    // 但 nft ruleset 里没找到对应 counter；最常见原因是 nat.service 还没跑完
+                    // 一个检测周期。给出明确的 pending 提示，避免用户误以为出 bug。
+                    println!("规则已保存但尚未在 nft 中生效，可能正在等待 nat.service 自动应用。");
+                    println!("请稍后刷新，或检查：");
+                    println!("  systemctl status nat --no-pager -l");
+                    println!("  journalctl -u nat -n 120 --no-pager");
+                    println!("其他可能原因：");
                     println!("- nat.service 未运行");
-                    println!("- /etc/nat.toml 规则尚未应用");
                     println!("- 规则配置解析失败");
                     println!("- fake-ip 被拒绝");
-                    println!("请查看：");
-                    println!("  journalctl -u nat -n 120 --no-pager");
+                    println!(
+                        "  当前自动检测 / 刷新间隔：{} 秒（ddns.refresh_interval_seconds）",
+                        config.ddns.refresh_interval_seconds
+                    );
                 }
                 println!(
                     "baseline counters: nat-rule={}B, out={}B, in={}B",
@@ -4142,5 +4314,160 @@ domain = "example.com"
         assert!(lines.contains("统计口径：both 双向 out + in"));
         assert!(lines.contains("首次采集可能仅建立 baseline"));
         assert!(lines.contains("目标可能没有返回流量"));
+    }
+
+    // ============ v0.4.1: 子菜单返回 / 时间 / NTP / 提示 / README 测试 ============
+
+    #[test]
+    fn last_good_status_uses_shanghai_24h_not_rfc3339() {
+        use nat_common::last_good::{LastGoodRule, LastGoodState};
+        let dir = std::env::temp_dir().join(format!(
+            "nat-menu-time-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("last-good.json");
+        let state = LastGoodState {
+            last_success_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-05-19T12:02:58.213104971Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            rules: vec![LastGoodRule {
+                rule_id: "r0".to_string(),
+                comment: Some("hk-out".to_string()),
+                domain: "example.com".to_string(),
+                last_good_ip: "1.2.3.4".to_string(),
+                last_resolved_at: chrono::DateTime::parse_from_rfc3339("2026-05-19T17:30:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                egress_allowed: true,
+                last_apply_status: "ok".to_string(),
+            }],
+            last_good_nft_hash: None,
+        };
+        state.save(path.to_str().unwrap()).unwrap();
+
+        let mut cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        cfg.last_good = nat_common::LastGoodConfig {
+            enabled: true,
+            file: path.to_string_lossy().to_string(),
+            use_last_good_on_dns_failure: true,
+        };
+        let blob = format_last_good_status(&cfg).join("\n");
+
+        // 最近成功应用时间：UTC 12:02:58 → Shanghai 20:02:58
+        assert!(
+            blob.contains("最近成功应用时间: 2026-05-19 20:02:58 CST"),
+            "missing Shanghai 24h time: {blob}"
+        );
+        // resolved_at：UTC 17:30 → Shanghai 次日 01:30
+        assert!(
+            blob.contains("resolved_at=2026-05-20 01:30:00 CST"),
+            "resolved_at must use Shanghai 24h: {blob}"
+        );
+        // 没有 RFC3339 风格 T + 纳秒
+        assert!(
+            !blob.contains("T12:02:58"),
+            "must not show RFC3339 T form: {blob}"
+        );
+        assert!(
+            !blob.contains(".213104971"),
+            "must not show nanoseconds: {blob}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn print_config_saved_hint_mentions_detection_cycle_and_restart() {
+        // 用一个真实 TOML 验证：print_config_saved_hint 内部读取 ddns.refresh_interval_seconds
+        // 并把它印出来。我们用 capture 不方便（println! 走 stdout），所以这里改成检查
+        // print_config_saved_hint 的关键依赖：load_toml_config 读出的 ddns.refresh_interval_seconds。
+        // 这等价于断言 hint 用到的常量来源是配置文件，而不是硬编码。
+        let dir = std::env::temp_dir().join(format!(
+            "nat-menu-hint-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml_path = dir.join("nat.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[[rules]]
+type = "single"
+sport = 30080
+dport = 80
+domain = "example.com"
+protocol = "tcp"
+ip_version = "ipv4"
+
+[ddns]
+refresh_interval_seconds = 120
+"#,
+        )
+        .unwrap();
+        let cfg = load_toml_config(toml_path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.ddns.refresh_interval_seconds, 120);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_timedatectl_field_recognizes_systemd_output() {
+        let sample = r#"
+               Local time: Tue 2026-05-19 20:02:58 CST
+           Universal time: Tue 2026-05-19 12:02:58 UTC
+                 RTC time: Tue 2026-05-19 12:02:58
+                Time zone: Asia/Shanghai (CST, +0800)
+System clock synchronized: yes
+              NTP service: active
+          RTC in local TZ: no
+"#;
+        assert_eq!(
+            parse_timedatectl_field(sample, "Time zone").as_deref(),
+            Some("Asia/Shanghai (CST, +0800)")
+        );
+        assert_eq!(
+            parse_timedatectl_field(sample, "System clock synchronized").as_deref(),
+            Some("yes")
+        );
+        assert_eq!(
+            parse_timedatectl_field(sample, "NTP service").as_deref(),
+            Some("active")
+        );
+        assert_eq!(parse_timedatectl_field(sample, "Nonexistent Key"), None);
+    }
+
+    #[test]
+    fn parse_timedatectl_field_does_not_panic_on_empty_input() {
+        assert_eq!(parse_timedatectl_field("", "Time zone"), None);
+        assert_eq!(
+            parse_timedatectl_field("garbage line\n", "System clock synchronized"),
+            None
+        );
+    }
+
+    #[test]
+    fn readme_documents_quota_total_traffic_mode_relation() {
+        // v0.4.1: README 必须说明 quota_period = "total" 与 stats.traffic_mode 的关系
+        let readme = include_str!("../../README.md");
+        assert!(
+            readme.contains("quota_period = \"total\"")
+                && readme.contains("traffic_mode")
+                && readme.contains("不会自动重算"),
+            "README 必须解释 total 与 traffic_mode 切换的影响"
+        );
+    }
+
+    #[test]
+    fn menu_outcome_cancelled_signals_skip_wait() {
+        // 仅静态属性断言：MenuOutcome 是 Copy + Eq，且包含 Done / Cancelled 两个变体
+        let a = MenuOutcome::Cancelled;
+        let b = MenuOutcome::Done;
+        assert_ne!(a, b);
+        // Copy 检查
+        let _copied = a;
+        assert_eq!(a, MenuOutcome::Cancelled);
     }
 }

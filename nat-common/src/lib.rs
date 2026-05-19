@@ -18,6 +18,32 @@ pub fn build_version() -> &'static str {
     option_env!("NAT_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
+/// CLI 默认展示时区偏移：Asia/Shanghai = UTC+8（无 DST）
+pub const CLI_DISPLAY_TZ_LABEL: &str = "Asia/Shanghai";
+pub const CLI_DISPLAY_TZ_SUFFIX: &str = "CST";
+pub const CLI_DISPLAY_TZ_OFFSET_SECS: i32 = 8 * 3600;
+
+/// 把任意时区的 `DateTime` 转换为 CLI 默认展示格式：
+/// `YYYY-MM-DD HH:MM:SS CST`（24 小时制，不带 T，不带纳秒，按 Asia/Shanghai 显示）。
+///
+/// JSON 状态文件 / audit log 内部仍以 UTC RFC3339 存储，方便机器解析；此函数只用于 CLI 展示。
+pub fn format_cli_time<Tz: chrono::TimeZone>(dt: chrono::DateTime<Tz>) -> String {
+    let offset = chrono::FixedOffset::east_opt(CLI_DISPLAY_TZ_OFFSET_SECS)
+        .or_else(|| chrono::FixedOffset::east_opt(0))
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("UTC offset 0 is always valid"));
+    dt.with_timezone(&offset)
+        .format(&format!("%Y-%m-%d %H:%M:%S {CLI_DISPLAY_TZ_SUFFIX}"))
+        .to_string()
+}
+
+/// 把可能为 RFC3339 字符串的时间标签转换成 CLI 展示格式；解析失败则原样返回，避免破坏未知格式。
+pub fn format_cli_time_from_rfc3339(value: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(value) {
+        Ok(dt) => format_cli_time(dt),
+        Err(_) => value.to_string(),
+    }
+}
+
 /// NAT CLI 命令行参数
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -1745,6 +1771,48 @@ pub fn validate_legacy_config(content: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_cli_time_renders_shanghai_24h_without_nanos() {
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-05-19T12:02:58.213104971Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rendered = format_cli_time(utc);
+        assert_eq!(rendered, "2026-05-19 20:02:58 CST");
+        // 不允许 RFC3339 风格的时间 + 时区分隔符：日期和时间之间用空格，不用 T；不要 "+08:00"。
+        // 注意 "CST" 后缀里也带 'T'，所以要检查"时间字段后紧接 T"的形式，而不是泛 contains('T')。
+        assert!(
+            !rendered.contains("T2") && !rendered.contains("T0") && !rendered.contains("T1"),
+            "must not use RFC3339 date-T-time form: {rendered}"
+        );
+        assert!(!rendered.contains('.'), "must not include nanoseconds");
+        assert!(
+            !rendered.contains('+'),
+            "must not show numeric offset like +08:00"
+        );
+    }
+
+    #[test]
+    fn format_cli_time_handles_midnight_utc_wraps_into_next_day_shanghai() {
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-05-19T17:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // UTC 17:30 → Shanghai 01:30 the next day
+        let rendered = format_cli_time(utc);
+        assert_eq!(rendered, "2026-05-20 01:30:00 CST");
+    }
+
+    #[test]
+    fn format_cli_time_from_rfc3339_falls_back_on_unknown_format() {
+        assert_eq!(
+            format_cli_time_from_rfc3339("2026-05-19T12:02:58Z"),
+            "2026-05-19 20:02:58 CST"
+        );
+        assert_eq!(
+            format_cli_time_from_rfc3339("not-a-timestamp"),
+            "not-a-timestamp"
+        );
+    }
 
     #[test]
     fn test_validate_single_rule() {

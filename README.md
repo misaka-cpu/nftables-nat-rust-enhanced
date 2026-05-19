@@ -310,6 +310,7 @@ file = "/var/log/nftables-nat-rust-audit.log"
 - `quota_period = "total"` 的累计字节同样基于当前 `stats.traffic_mode` 累积；切换 `traffic_mode` 后**历史 daily / monthly / total 都不会自动重算**，已经累计的 total 字节也不会重新统计。如果切换口径，建议手动确认 `quota.state_file` 与 `stats.data_file`，必要时按需重置 Stats 后再启用 `total` 配额
 - 第一版仅支持 `quota_action = "disable"`：超额后 `enabled` 置 false，写回 `/etc/nat.toml`，由现有安全 apply 流程在下一轮迭代中移除该规则的 nft 规则
 - **不直接执行 `nft -f`、不删除规则**；规则保留在 TOML 中，方便用户手动重新启用
+- v0.4.1 起：nat.service 在 quota 自动禁用规则、写回 `/etc/nat.toml` **前会先备份**到 `/etc/nftables-nat/backups/config/nat.toml.quota-auto-disable-YYYYmmdd-HHMMSS.bak`；备份失败 → **跳过本轮写回**，下一轮再试，不会在没有备份的情况下覆盖配置。写回使用临时文件 + rename 原子替换，写入失败时备份保留并写 audit。
 - Telegram 通知（如已配置 + `quota.notify_on_exceeded = true`）只在每个 period 内通知**一次**，去重状态写在独立 JSON 文件 `quota.state_file`
 - 写 audit 事件 `quota.exceeded` + `rule.disable.quota` + `quota.telegram.notify` / `quota.telegram.skipped`
 - Telegram 未配置或主流程任何写入失败仅 WARN，不让 nat.service 崩溃
@@ -348,6 +349,42 @@ quota_period = "monthly"
 ### BBR
 
 CLI 菜单可查看、启用或关闭 BBR。开启/关闭只处理本项目配置文件 `/etc/sysctl.d/99-nat-bbr.conf`，不会删除用户其他 sysctl 配置，也不会调用 `sysctl --system`。
+
+### 时间显示与 NTP
+
+CLI 在状态页、last-good、audit、quota 等位置显示的时间一律按 **Asia/Shanghai 24 小时制** 展示，格式形如 `2026-05-19 20:02:58 CST`，不再使用 RFC3339 的 `T...+00:00` 长格式与纳秒。
+
+- JSON 状态文件 / audit log 内部仍以 **UTC RFC3339** 存储，方便机器解析（grep / 脚本处理）。
+- 仅 CLI 显示层做转换；状态文件保持原样。
+- 暂未引入 `[ui] timezone` 配置项；如需扩展，会通过 `Asia/Shanghai` IANA 时区名做向前兼容，不会破坏现有 JSON 格式。
+
+nft 转发本身不严格依赖系统时间。但以下功能建议系统时间准确：
+
+- Stats daily / monthly 滚动重置
+- quota 周期判断与 Telegram 通知去重 key
+- audit log 时间戳
+- last-good 上次成功解析时间
+- TLS 下载 release / `cn4.nft` 时的证书校验
+
+CLI 菜单提供 **时间 / NTP 状态检查**：`19) 高级网络设置 (SNAT / MSS clamp)` → `6) 时间 / NTP 状态检查`。该页面：
+
+- 仅查看当前系统时间、UTC 时间、`timedatectl` 报告的 NTP 状态、系统时区
+- 默认**不**修改任何系统设置；`timedatectl` 不存在时只提示，不报错
+- 若 `System clock synchronized: no`，会打印建议命令 `sudo timedatectl set-ntp true`
+- 仅在用户明确输入 `y/Y/yes/YES` 时才会执行 `timedatectl set-ntp true`；任何其他输入都视为取消
+- 不会调用 `apt-get install`，不会强制改时区，不会自动调用 `sysctl --system`
+
+### 规则改动 / nat.service 应用延迟
+
+CLI 添加、删除、启用 / 禁用、修改 SNAT / MSS / Telegram / quota 等任意配置时，本工具**只写 `/etc/nat.toml`**，不绕过安全 apply 直接 `nft -f`。
+
+`nat.service` 主循环每隔 `ddns.refresh_interval_seconds`（默认 300 秒）检测一次配置变化，并通过安全流程（`nft -c` → 备份 → `nft -f` → 失败回滚 managed tables）应用规则。
+
+因此：
+
+- 刚改完配置后立即测试 `nft list table ip self-nat` 可能看不到新规则，**这不一定是 bug**，通常是 nat.service 还没跑完一个检测周期。等待一个 `ddns.refresh_interval_seconds` 之后刷新即可。
+- 如需立即应用，可手动执行：`systemctl restart nat`。
+- 「测试转发规则连通性」页面在 nft 未应用时会显示明确的 pending 提示：「规则已保存但尚未在 nft 中生效，可能正在等待 nat.service 自动应用。」
 
 ## 系统要求
 

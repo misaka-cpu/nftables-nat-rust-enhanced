@@ -603,6 +603,29 @@ fn run_quota_check(
     telegram_config: &TelegramConfig,
     now: chrono::DateTime<chrono::Utc>,
 ) {
+    run_quota_check_with(
+        args,
+        quota_config,
+        audit_config,
+        stats_config,
+        telegram_config,
+        now,
+        Path::new(BACKUP_DIR),
+    )
+}
+
+/// `run_quota_check` 的可注入备份根目录变体；生产代码走 `run_quota_check`，
+/// 测试可以注入 tmpdir，避免污染 /etc/nftables-nat/backups。
+#[allow(clippy::too_many_arguments)]
+fn run_quota_check_with(
+    args: &Args,
+    quota_config: &QuotaConfig,
+    audit_config: &AuditConfig,
+    stats_config: &StatsConfig,
+    telegram_config: &TelegramConfig,
+    now: chrono::DateTime<chrono::Utc>,
+    backup_root: &Path,
+) {
     let toml_path = match args.toml.as_deref() {
         Some(p) => p,
         None => return,
@@ -630,18 +653,73 @@ fn run_quota_check(
     }
     let changed_indices = quota::apply_disable_actions(&mut config, &decisions);
     if !changed_indices.is_empty() {
-        // 备份后写回 TOML；保存失败仅 WARN，不写 audit、不发 Telegram，下一轮再试
+        // 备份后写回 TOML。备份失败 → 跳过写回（避免配置丢失风险）；
+        // 写入失败 → 备份保留并写 audit，下一轮 quota 检查会再次尝试。
         let toml_str = match config.to_toml_string() {
             Ok(s) => s,
             Err(e) => {
                 warn!("quota 写回 TOML 失败：序列化 {e}");
+                audit::log_event(
+                    audit_config,
+                    "quota.auto_disable.skipped",
+                    AuditResult::Fail,
+                    serde_json::json!({
+                        "reason": "serialize",
+                        "error": e,
+                    }),
+                );
                 return;
             }
         };
-        if let Err(e) = fs::write(toml_path, toml_str) {
-            warn!("quota 写回 TOML 失败：{e}");
+        let backup_path = match backup_toml_for_quota_auto_disable(
+            toml_path,
+            backup_root,
+            audit_config,
+        ) {
+            Ok(path) => path,
+            Err(e) => {
+                warn!(
+                    "quota 自动禁用写回前备份失败 ({toml_path})：{e}；本轮跳过写回，等待下一轮重试"
+                );
+                audit::log_event(
+                    audit_config,
+                    "quota.backup.fail",
+                    AuditResult::Fail,
+                    serde_json::json!({
+                        "toml_path": toml_path,
+                        "error": e.to_string(),
+                    }),
+                );
+                return;
+            }
+        };
+        if let Err(e) = atomic_write_text_file(toml_path, &toml_str) {
+            warn!(
+                "quota 写回 TOML 失败：{e}；备份保留在 {}",
+                backup_path.display()
+            );
+            audit::log_event(
+                audit_config,
+                "quota.auto_disable.write_fail",
+                AuditResult::Fail,
+                serde_json::json!({
+                    "toml_path": toml_path,
+                    "backup": backup_path.display().to_string(),
+                    "error": e.to_string(),
+                }),
+            );
             return;
         }
+        audit::log_event(
+            audit_config,
+            "quota.auto_disable.write_ok",
+            AuditResult::Ok,
+            serde_json::json!({
+                "toml_path": toml_path,
+                "backup": backup_path.display().to_string(),
+                "changed_indices": changed_indices,
+            }),
+        );
     }
     for decision in &decisions {
         let usage = &decision.usage;
@@ -716,6 +794,72 @@ fn run_quota_check(
     if let Err(e) = quota_state.save(&quota_config.state_file) {
         warn!("保存 quota 通知状态失败 ({}): {e}", quota_config.state_file);
     }
+}
+
+/// 把 `<toml_path>` 复制到 `<backup_root>/config/<stem>.quota-auto-disable-YYYYmmdd-HHMMSS.bak`。
+///
+/// 复制失败时返回 `Err`，调用方必须跳过本轮 quota 自动禁用写回，避免在没有备份的情况下
+/// 直接覆盖用户配置。生产代码 `backup_root = Path::new(BACKUP_DIR)`；测试可以注入 tmpdir。
+fn backup_toml_for_quota_auto_disable(
+    toml_path: &str,
+    backup_root: &Path,
+    audit_config: &AuditConfig,
+) -> Result<PathBuf, io::Error> {
+    let backup_dir = backup_root.join("config");
+    fs::create_dir_all(&backup_dir)?;
+    let stem = Path::new(toml_path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("nat.toml");
+    let backup_path = backup_dir.join(format!(
+        "{stem}.quota-auto-disable-{}.bak",
+        Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    fs::copy(toml_path, &backup_path)?;
+    audit::log_event(
+        audit_config,
+        "quota.backup.create",
+        AuditResult::Ok,
+        serde_json::json!({
+            "toml_path": toml_path,
+            "backup": backup_path.display().to_string(),
+        }),
+    );
+    Ok(backup_path)
+}
+
+/// 原子化写文本文件：`path.tmp` → fsync → rename。
+/// 失败时尽量删除 .tmp 文件，避免污染目录。
+fn atomic_write_text_file(path: &str, contents: &str) -> Result<(), io::Error> {
+    let target = Path::new(path);
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let mut tmp = target.as_os_str().to_owned();
+    tmp.push(".quota-auto-disable.tmp");
+    let tmp_path = PathBuf::from(tmp);
+    let write_result: io::Result<()> = (|| {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(contents.as_bytes())?;
+        if let Err(e) = file.sync_all() {
+            warn!(
+                "atomic_write_text_file fsync 失败 ({}): {e}",
+                tmp_path.display()
+            );
+        }
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp_path, target) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn remaining_seconds(
@@ -3482,13 +3626,14 @@ state_file = "{}"
         )
         .unwrap();
         let toml_path = write_quota_test_toml(&dir, stats_file.to_str().unwrap());
+        let backup_root = dir.join("backups");
 
         let runtime_config = load_runtime_config(&Args {
             menu: false,
             compatible_config_file: None,
             toml: Some(toml_path.to_string_lossy().to_string()),
         });
-        run_quota_check(
+        run_quota_check_with(
             &Args {
                 menu: false,
                 compatible_config_file: None,
@@ -3499,6 +3644,7 @@ state_file = "{}"
             &runtime_config.stats,
             &runtime_config.telegram,
             chrono::Utc::now(),
+            &backup_root,
         );
 
         // 配置文件应已写回，r0 enabled=false，r1 不变
@@ -3506,6 +3652,23 @@ state_file = "{}"
         let cfg = TomlConfig::from_toml_str(&after).unwrap();
         assert!(!cfg.rules[0].enabled(), "exceeded rule must be disabled");
         assert!(cfg.rules[1].enabled(), "non-quota rule must remain enabled");
+
+        // 写回前应已备份到 backup_root/config/nat.toml.quota-auto-disable-...bak
+        let backup_subdir = backup_root.join("config");
+        let backups: Vec<_> = std::fs::read_dir(&backup_subdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".quota-auto-disable-")
+            })
+            .collect();
+        assert!(
+            !backups.is_empty(),
+            "quota auto-disable should write a backup file under {}",
+            backup_subdir.display()
+        );
 
         // audit 日志应包含 quota.exceeded + rule.disable.quota + quota.telegram.skipped
         let audit_lines = audit::read_tail(&runtime_config.audit.file, 50);
@@ -3519,6 +3682,15 @@ state_file = "{}"
         assert!(actions.contains(&"quota.exceeded".to_string()));
         assert!(actions.contains(&"rule.disable.quota".to_string()));
         assert!(actions.contains(&"quota.telegram.skipped".to_string()));
+        // v0.4.1: quota 自动禁用前会备份 + 原子写回，要求两条新 audit 事件
+        assert!(
+            actions.contains(&"quota.backup.create".to_string()),
+            "quota 自动禁用前必须写 quota.backup.create audit"
+        );
+        assert!(
+            actions.contains(&"quota.auto_disable.write_ok".to_string()),
+            "quota 自动禁用写回成功后必须写 quota.auto_disable.write_ok audit"
+        );
         // 未配置 Telegram 不应产生 quota.telegram.notify
         assert!(!actions.contains(&"quota.telegram.notify".to_string()));
 
@@ -3543,6 +3715,7 @@ state_file = "{}"
         )
         .unwrap();
         let toml_path = write_quota_test_toml(&dir, stats_file.to_str().unwrap());
+        let backup_root = dir.join("backups");
 
         let args = Args {
             menu: false,
@@ -3552,23 +3725,25 @@ state_file = "{}"
         let runtime_config = load_runtime_config(&args);
 
         // 两次连续调用：第二次不应再产生 quota.telegram.* 类事件（已通知过 + 已禁用）
-        run_quota_check(
+        run_quota_check_with(
             &args,
             &runtime_config.quota,
             &runtime_config.audit,
             &runtime_config.stats,
             &runtime_config.telegram,
             chrono::Utc::now(),
+            &backup_root,
         );
         let lines_after_first = audit::read_tail(&runtime_config.audit.file, 200).len();
 
-        run_quota_check(
+        run_quota_check_with(
             &args,
             &runtime_config.quota,
             &runtime_config.audit,
             &runtime_config.stats,
             &runtime_config.telegram,
             chrono::Utc::now(),
+            &backup_root,
         );
         let lines_after_second = audit::read_tail(&runtime_config.audit.file, 200).len();
         // 第二次只会写 quota.exceeded（仍超额），但不再 rule.disable.quota / telegram，
@@ -3613,19 +3788,21 @@ state_file = "{}"
         )
         .unwrap();
         let toml_path = write_quota_test_toml(&dir, stats_file.to_str().unwrap());
+        let backup_root = dir.join("backups");
         let args = Args {
             menu: false,
             compatible_config_file: None,
             toml: Some(toml_path.to_string_lossy().to_string()),
         };
         let runtime_config = load_runtime_config(&args);
-        run_quota_check(
+        run_quota_check_with(
             &args,
             &runtime_config.quota,
             &runtime_config.audit,
             &runtime_config.stats,
             &runtime_config.telegram,
             chrono::Utc::now(),
+            &backup_root,
         );
         // 没有 apply.success / apply.fail 事件
         let lines = audit::read_tail(&runtime_config.audit.file, 200);
@@ -3695,6 +3872,104 @@ state_file = "{}"
         assert!(
             cfg.rules[0].enabled(),
             "rule must not be disabled when used=0"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ============ v0.4.1: quota 自动禁用前备份相关测试 ============
+
+    #[test]
+    fn backup_fail_skips_write_and_keeps_original_toml() {
+        // 备份目录指向一个无法创建子目录的位置（用一个 regular file 当作 "目录"），
+        // 触发 backup_toml_for_quota_auto_disable 失败；此时 run_quota_check_with 必须：
+        //   - 不修改 /etc/nat.toml（保持原内容）
+        //   - 写一条 quota.backup.fail audit
+        //   - 不写 quota.auto_disable.write_ok
+        let dir = tempdir("backup-fail-skip");
+        let stats_file = dir.join("stats.json");
+        let mut stats_state = nat_common::stats::StatsState::default();
+        stats_state
+            .per_rule_monthly_bytes
+            .insert("r0".to_string(), 500);
+        std::fs::write(
+            &stats_file,
+            serde_json::to_string_pretty(&stats_state).unwrap(),
+        )
+        .unwrap();
+        let toml_path = write_quota_test_toml(&dir, stats_file.to_str().unwrap());
+        let original = std::fs::read_to_string(&toml_path).unwrap();
+
+        // 用一个普通文件占位的 backup_root：fs::create_dir_all 在 "<file>/config" 上必然失败
+        let blocker = dir.join("backups");
+        std::fs::write(&blocker, b"i am a regular file, not a directory").unwrap();
+
+        let args = Args {
+            menu: false,
+            compatible_config_file: None,
+            toml: Some(toml_path.to_string_lossy().to_string()),
+        };
+        let runtime_config = load_runtime_config(&args);
+        run_quota_check_with(
+            &args,
+            &runtime_config.quota,
+            &runtime_config.audit,
+            &runtime_config.stats,
+            &runtime_config.telegram,
+            chrono::Utc::now(),
+            &blocker,
+        );
+
+        // TOML 必须保持原状（rule 仍为 enabled=true）
+        let after = std::fs::read_to_string(&toml_path).unwrap();
+        assert_eq!(
+            after, original,
+            "backup 失败时 quota 不应继续覆盖 /etc/nat.toml"
+        );
+        let cfg = TomlConfig::from_toml_str(&after).unwrap();
+        assert!(cfg.rules[0].enabled(), "backup 失败时被超额规则不应被禁用");
+
+        // audit 应包含 quota.backup.fail，并且不应包含 quota.auto_disable.write_ok
+        let lines = audit::read_tail(&runtime_config.audit.file, 50);
+        let actions: Vec<String> = lines
+            .iter()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v["action"].as_str().map(ToString::to_string))
+            .collect();
+        assert!(
+            actions.contains(&"quota.backup.fail".to_string()),
+            "backup 失败必须写 quota.backup.fail audit，实际：{actions:?}"
+        );
+        assert!(
+            !actions.contains(&"quota.auto_disable.write_ok".to_string()),
+            "backup 失败时不应再产出 write_ok audit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_text_file_overwrites_existing_and_cleans_tmp() {
+        let dir = tempdir("atomic-write");
+        let target = dir.join("nat.toml");
+        std::fs::write(&target, b"OLD CONTENT").unwrap();
+        atomic_write_text_file(target.to_str().unwrap(), "NEW CONTENT").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "NEW CONTENT",
+            "atomic_write_text_file 必须覆盖目标文件"
+        );
+        // .quota-auto-disable.tmp 不应残留在父目录
+        let tmp_residue: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".quota-auto-disable.tmp")
+            })
+            .collect();
+        assert!(
+            tmp_residue.is_empty(),
+            "atomic write 完成后不应留下 .quota-auto-disable.tmp 残留"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
