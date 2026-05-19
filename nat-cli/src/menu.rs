@@ -6,8 +6,11 @@ use nat_common::{
 };
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const NAT_BIN_PATH: &str = "/usr/local/bin/nat";
 
 const DEFAULT_TOML_CONFIG: &str = "/etc/nat.toml";
 const CONFIG_BACKUP_DIR: &str = "/etc/nftables-nat/backups/config";
@@ -1814,16 +1817,73 @@ fn update_menu() -> Result<(), io::Error> {
     );
     println!("开始更新，install.sh 会负责备份、重启和失败回滚。");
     let status = Command::new("sh").arg("-c").arg(command_line).status()?;
-    if status.success() {
-        println!("更新完成，请重新进入菜单：");
-        println!("  nat --menu");
-        wait_enter_to_return()?;
-        Ok(())
-    } else {
+    if !status.success() {
         println!("更新命令执行失败。install.sh 会保留旧二进制并在可能时回滚，请查看输出和服务日志");
         wait_enter_to_return()?;
-        Ok(())
+        return Ok(());
     }
+
+    println!("更新完成，正在重新载入新版 CLI 菜单...");
+    match installed_nat_version() {
+        Some(v) => println!("已安装版本: {v}"),
+        None => println!("warning: 无法读取新版本号，将继续重载菜单。"),
+    }
+
+    let bin_path = Path::new(NAT_BIN_PATH);
+    let action = reload_action(true, tty_available(), bin_path.exists());
+    match action {
+        ReloadAction::Exec => {
+            let err = reexec_menu(NAT_BIN_PATH);
+            println!("更新已完成，但自动重新载入菜单失败：{err}");
+            println!("请手动执行：");
+            println!("  nat --menu");
+            wait_enter_to_return()?;
+        }
+        ReloadAction::NoTty => {
+            println!("更新已完成。请手动执行 nat --menu 进入新版菜单。");
+        }
+        ReloadAction::BinaryMissing => {
+            println!("更新已完成，但未找到 {NAT_BIN_PATH}，无法自动重载菜单。");
+            println!("请手动执行：");
+            println!("  nat --menu");
+            wait_enter_to_return()?;
+        }
+        ReloadAction::SkipUpdateFailed => {}
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReloadAction {
+    SkipUpdateFailed,
+    NoTty,
+    BinaryMissing,
+    Exec,
+}
+
+fn reload_action(update_success: bool, tty_available: bool, binary_exists: bool) -> ReloadAction {
+    if !update_success {
+        return ReloadAction::SkipUpdateFailed;
+    }
+    if !tty_available {
+        return ReloadAction::NoTty;
+    }
+    if !binary_exists {
+        return ReloadAction::BinaryMissing;
+    }
+    ReloadAction::Exec
+}
+
+fn tty_available() -> bool {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .is_ok()
+}
+
+fn reexec_menu(bin: &str) -> io::Error {
+    Command::new(bin).arg("--menu").exec()
 }
 
 fn current_version_for_update() -> String {
@@ -2540,6 +2600,108 @@ domain = "example.com"
         let lines = format_stats_top10(&state);
         assert_eq!(lines.len(), 10);
         assert!(lines[0].contains("rule-11"));
+    }
+
+    #[test]
+    fn reload_action_skips_when_update_failed() {
+        assert_eq!(
+            reload_action(false, true, true),
+            ReloadAction::SkipUpdateFailed
+        );
+        assert_eq!(
+            reload_action(false, false, false),
+            ReloadAction::SkipUpdateFailed
+        );
+    }
+
+    #[test]
+    fn reload_action_skips_when_no_tty() {
+        assert_eq!(reload_action(true, false, true), ReloadAction::NoTty);
+    }
+
+    #[test]
+    fn reload_action_reports_missing_binary() {
+        assert_eq!(
+            reload_action(true, true, false),
+            ReloadAction::BinaryMissing
+        );
+    }
+
+    #[test]
+    fn reload_action_execs_when_all_conditions_met() {
+        assert_eq!(reload_action(true, true, true), ReloadAction::Exec);
+    }
+
+    #[test]
+    fn readme_acknowledges_alecthw_chnlist_accurately() {
+        let readme = include_str!("../../README.md");
+        assert!(
+            readme.contains("感谢其提供 nftables 配置示例和 `cn4.nft` 使用参考"),
+            "README should describe alecthw/chnlist as providing nftables config examples and cn4.nft reference"
+        );
+        assert!(
+            readme.contains("不代表该项目作者参与、认可或为本项目背书"),
+            "README should clarify alecthw/chnlist author does not endorse this project"
+        );
+        assert!(
+            readme.contains("中国大陆 IP 列表本身请以上游数据源为准"),
+            "README should point users to upstream data sources for the CN IP list"
+        );
+    }
+
+    #[test]
+    fn readme_does_not_misattribute_cn_ip_list_to_alecthw() {
+        let readme = include_str!("../../README.md");
+        assert!(
+            !readme.contains("维护中国大陆 IP 地址列表"),
+            "README must not claim alecthw/chnlist maintains the China mainland IP address list"
+        );
+        assert!(
+            !readme.contains("维护大陆 IP 数据源"),
+            "README must not claim alecthw/chnlist maintains the mainland IP data source"
+        );
+        assert!(
+            !readme.contains("背书本项目"),
+            "README must not claim alecthw/chnlist 背书本项目"
+        );
+        assert!(
+            !readme.contains("认可本项目"),
+            "README must not claim alecthw/chnlist 认可本项目"
+        );
+    }
+
+    #[test]
+    fn readme_documents_cn4_url_replaceable_and_disclaimer() {
+        let readme = include_str!("../../README.md");
+        assert!(
+            readme.contains("cn4.nft` 数据源可配置")
+                || readme.contains("cn4_url` 默认值只是一个参考数据源"),
+            "README should explain that cn4_url is replaceable"
+        );
+        assert!(
+            readme.contains("中国大陆 IP 数据可能存在误差"),
+            "README should disclose that CN IP data may have errors"
+        );
+        assert!(
+            readme.contains("APNIC")
+                && readme.contains("clang.cn")
+                && readme.contains("纯真")
+                && readme.contains("ipip.net"),
+            "README should suggest alternative trusted data sources"
+        );
+    }
+
+    #[test]
+    fn readme_documents_auto_reload_after_update() {
+        let readme = include_str!("../../README.md");
+        assert!(
+            readme.contains("CLI 一键更新成功后会自动重新载入新版 `nat --menu`"),
+            "README should note that the CLI auto-reloads after one-key update"
+        );
+        assert!(
+            readme.contains("如果当前环境无 TTY 或自动重载失败"),
+            "README should document the fallback path for auto-reload"
+        );
     }
 
     #[test]

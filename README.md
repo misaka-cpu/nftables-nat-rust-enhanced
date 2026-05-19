@@ -78,13 +78,15 @@
 
 ### GeoIP / 中国大陆 IP 限制
 
-可选功能，默认关闭。使用 chnlist 的 `cn4.nft` 作为中国大陆 IPv4 set 来源。
+可选功能，默认关闭。默认通过 `cn4_url` 拉取 nftables 格式的 `cn4.nft` 作为中国大陆 IPv4 set 来源。
 仅 IPv4，IPv6 暂不支持。本项目只管理 `self-*` nft 表，不 `flush ruleset`，不修改用户其他 nft 表。
 
 - 可限制本项目转发端口只允许中国大陆 IPv4（+可选 LAN）访问
 - 可选限制 SSH 只允许中国大陆 IPv4 和 LAN 访问；SSH 限制有锁死风险，开启前务必确认
 - CN IP set 通过 CLI 手动下载并原子替换，下载失败保留旧文件
 - 启用 GeoIP 但 `cn4_file` 不存在或为空时，核心服务会跳过 GeoIP 规则并 WARN
+
+`cn4.nft` 数据源可配置，`cn4_url` 默认值只是一个参考数据源。中国大陆 IP 数据可能存在误差，使用前请自行确认；如需更严格来源，可替换为 APNIC、clang.cn、纯真、ipip.net 或其他你信任的数据源。
 
 GeoIP 与白名单/黑名单的区别：
 
@@ -344,6 +346,9 @@ nat --menu
 
 选择：`一键更新本项目`
 
+- CLI 一键更新成功后会自动重新载入新版 `nat --menu`，不需要手动退出再重新进入。
+- 如果当前环境无 TTY 或自动重载失败，会显示 fallback 提示，请手动执行 `nat --menu` 进入新版菜单。
+
 更新默认保留：
 
 - `/etc/nat.toml`
@@ -476,9 +481,9 @@ tmp="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftab
 - [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust)
 - [endview/nftpf](https://github.com/endview/nftpf)
 - [mora1n/pfwd](https://github.com/mora1n/pfwd)
-- [alecthw/chnlist](https://github.com/alecthw/chnlist)：感谢其维护中国大陆 IP 地址列表，并提供 nftables 格式的 `cn4.nft`。本项目仅使用其数据来源，不代表该项目作者参与或背书本项目。
+- [alecthw/chnlist](https://github.com/alecthw/chnlist)：感谢其提供 nftables 配置示例和 `cn4.nft` 使用参考。本项目仅作为可选数据源接入，不代表该项目作者参与、认可或为本项目背书；中国大陆 IP 列表本身请以上游数据源为准。
 
-以上项目提供了设计思路或基础实现参考，或开放的数据来源，不代表其作者参与或背书本项目。
+以上项目提供了设计思路、基础实现参考或 nftables 配置示例，不代表其作者参与或为本项目背书。
 
 ## License
 
