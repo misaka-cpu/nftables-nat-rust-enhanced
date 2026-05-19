@@ -1597,6 +1597,176 @@ refresh_interval_seconds = 123
     }
 
     #[test]
+    fn combined_blacklist_and_geoip_emit_layered_drops() {
+        let cn4 = write_temp_cn4_file("combined-bl-geoip", sample_cn4_content());
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Blacklist,
+            entries: vec!["1.0.1.5".to_string()],
+        };
+        let geoip = GeoIpConfig {
+            enabled: true,
+            forward: nat_common::GeoIpForwardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            cn4_file: cn4.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &access,
+            &geoip,
+            &Default::default(),
+        )
+        .unwrap();
+        let bl_pos = script
+            .find("ip saddr { 1.0.1.5 } tcp dport 30080 counter drop")
+            .unwrap();
+        let geoip_pos = script
+            .find("GEOIP_PREROUTING ip saddr @cn4 tcp dport 30080 counter accept")
+            .unwrap();
+        let geoip_drop_pos = script
+            .find("GEOIP_PREROUTING tcp dport 30080 counter drop")
+            .unwrap();
+        let dnat_pos = script.find("tcp dport 30080 counter dnat").unwrap();
+        assert!(
+            bl_pos < dnat_pos,
+            "blacklist drop must precede dnat to keep blacklist priority"
+        );
+        assert!(geoip_pos < geoip_drop_pos);
+        assert!(!script.contains("flush ruleset"));
+        let _ = fs::remove_dir_all(cn4.parent().unwrap());
+    }
+
+    #[test]
+    fn combined_whitelist_and_geoip_apply_both_layers() {
+        let cn4 = write_temp_cn4_file("combined-wl-geoip", sample_cn4_content());
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Whitelist,
+            entries: vec!["1.0.1.5".to_string()],
+        };
+        let geoip = GeoIpConfig {
+            enabled: true,
+            forward: nat_common::GeoIpForwardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            cn4_file: cn4.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &access,
+            &geoip,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            script.contains("ip saddr { 1.0.1.5 } tcp dport 30080 counter dnat"),
+            "whitelist must restrict DNAT to whitelisted source IPs"
+        );
+        assert!(
+            script.contains("GEOIP_PREROUTING ip saddr @cn4 tcp dport 30080 counter accept"),
+            "GeoIP allow-cn must be present"
+        );
+        assert!(
+            script.contains("GEOIP_PREROUTING tcp dport 30080 counter drop"),
+            "GeoIP default-drop must be present so non-CN sources are dropped"
+        );
+        let _ = fs::remove_dir_all(cn4.parent().unwrap());
+    }
+
+    #[test]
+    fn whitelist_alone_blocks_non_whitelisted_via_saddr_match() {
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Whitelist,
+            entries: vec!["10.0.0.1".to_string()],
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &access,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(script.contains("ip saddr { 10.0.0.1 } tcp dport 30080 counter dnat"));
+        assert!(
+            !script.contains("ct state new tcp dport 30080 counter dnat"),
+            "unrestricted dnat must not exist when whitelist is on"
+        );
+    }
+
+    #[test]
+    fn geoip_alone_drops_non_cn_even_without_blacklist() {
+        let cn4 = write_temp_cn4_file("geoip-alone", sample_cn4_content());
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let geoip = GeoIpConfig {
+            enabled: true,
+            forward: nat_common::GeoIpForwardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            cn4_file: cn4.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &geoip,
+            &Default::default(),
+        )
+        .unwrap();
+        // GEOIP_PREROUTING priority -200 runs before self-nat PREROUTING priority -110
+        assert!(script.contains(
+            "add chain ip self-filter GEOIP_PREROUTING { type filter hook prerouting priority -200 ; }"
+        ));
+        assert!(script.contains("self-nat PREROUTING { type nat hook prerouting priority -110"));
+        assert!(script.contains("GEOIP_PREROUTING tcp dport 30080 counter drop"));
+        // Access control off, so no port-scoped saddr drop rule
+        assert!(!script.contains("nat-access:id=r0,mode=blacklist"));
+        let _ = fs::remove_dir_all(cn4.parent().unwrap());
+    }
+
+    #[test]
     fn egress_control_default_disabled_does_not_filter() {
         let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
             enabled: true,

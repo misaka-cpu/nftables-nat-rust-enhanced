@@ -616,6 +616,9 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
             config.access_control.mode
         );
         print_access_entries(&config);
+        for line in format_combined_policy_status(&config) {
+            println!("{line}");
+        }
         println!(
             r#"1) 查看当前配置
 2) 设置模式 off
@@ -861,6 +864,47 @@ fn show_geoip_status(config_path: &str) {
     println!("允许 LAN：{}", geoip.allow_lan);
     println!("LAN CIDR：{}", geoip.lan_cidrs.join(", "));
     println!("更新间隔（小时）：{}", geoip.update_interval_hours);
+    println!();
+    for line in format_combined_policy_status(&config) {
+        println!("{line}");
+    }
+}
+
+pub(crate) fn format_combined_policy_status(config: &TomlConfig) -> Vec<String> {
+    let mut lines = Vec::new();
+    let ac_mode = &config.access_control.mode;
+    let ac_count = config.access_control.entries.len();
+    let geoip_forward = config.geoip.enabled && config.geoip.forward.enabled;
+    let geoip_ssh = config.geoip.enabled && config.geoip.ssh.enabled;
+
+    lines.push("------------------------------------".to_string());
+    lines.push("组合策略 (access_control + GeoIP)".to_string());
+    lines.push("------------------------------------".to_string());
+    lines.push(format!("access_control：模式={ac_mode} entries={ac_count}"));
+    lines.push(format!(
+        "GeoIP 转发端口 CN 限制：{}",
+        enabled_label(geoip_forward)
+    ));
+    lines.push(format!("GeoIP SSH CN 限制：{}", enabled_label(geoip_ssh)));
+    lines.push("评估顺序：黑名单 > 白名单 > GeoIP（同时启用 = AND）".to_string());
+    lines.push(combined_allow_summary(ac_mode, geoip_forward));
+    lines.push("注意：黑名单/白名单不影响 SSH；GeoIP SSH 限制由 geoip.ssh 单独控制。".to_string());
+    lines
+}
+
+fn enabled_label(flag: bool) -> &'static str {
+    if flag { "enabled" } else { "disabled" }
+}
+
+fn combined_allow_summary(mode: &AccessControlMode, geoip_forward: bool) -> String {
+    match (mode, geoip_forward) {
+        (AccessControlMode::Off, false) => "允许 = 所有来源（未启用任何来源限制）".to_string(),
+        (AccessControlMode::Off, true) => "允许 = 属于 CN/LAN".to_string(),
+        (AccessControlMode::Blacklist, false) => "允许 = 不在黑名单".to_string(),
+        (AccessControlMode::Blacklist, true) => "允许 = 不在黑名单 AND 属于 CN/LAN".to_string(),
+        (AccessControlMode::Whitelist, false) => "允许 = 在白名单".to_string(),
+        (AccessControlMode::Whitelist, true) => "允许 = 在白名单 AND 属于 CN/LAN".to_string(),
+    }
 }
 
 fn format_system_time(time: std::time::SystemTime) -> String {
@@ -2688,6 +2732,112 @@ domain = "example.com"
                 && readme.contains("纯真")
                 && readme.contains("ipip.net"),
             "README should suggest alternative trusted data sources"
+        );
+    }
+
+    fn make_config(
+        ac_mode: AccessControlMode,
+        ac_entries: &[&str],
+        geoip_enabled: bool,
+        forward_enabled: bool,
+        ssh_enabled: bool,
+    ) -> TomlConfig {
+        let mut cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        cfg.access_control = nat_common::AccessControlConfig {
+            mode: ac_mode,
+            entries: ac_entries.iter().map(|s| s.to_string()).collect(),
+        };
+        cfg.geoip.enabled = geoip_enabled;
+        cfg.geoip.forward.enabled = forward_enabled;
+        cfg.geoip.ssh.enabled = ssh_enabled;
+        cfg
+    }
+
+    #[test]
+    fn combined_policy_shows_and_for_blacklist_plus_geoip() {
+        let cfg = make_config(
+            AccessControlMode::Blacklist,
+            &["8.8.8.8"],
+            true,
+            true,
+            false,
+        );
+        let lines = format_combined_policy_status(&cfg).join("\n");
+        assert!(lines.contains("access_control：模式=blacklist entries=1"));
+        assert!(lines.contains("GeoIP 转发端口 CN 限制：enabled"));
+        assert!(lines.contains("评估顺序：黑名单 > 白名单 > GeoIP（同时启用 = AND）"));
+        assert!(lines.contains("允许 = 不在黑名单 AND 属于 CN/LAN"));
+    }
+
+    #[test]
+    fn combined_policy_shows_and_for_whitelist_plus_geoip() {
+        let cfg = make_config(
+            AccessControlMode::Whitelist,
+            &["1.2.3.4", "5.6.7.0/24"],
+            true,
+            true,
+            false,
+        );
+        let lines = format_combined_policy_status(&cfg).join("\n");
+        assert!(lines.contains("access_control：模式=whitelist entries=2"));
+        assert!(lines.contains("允许 = 在白名单 AND 属于 CN/LAN"));
+    }
+
+    #[test]
+    fn combined_policy_no_restriction_when_both_off() {
+        let cfg = make_config(AccessControlMode::Off, &[], false, false, false);
+        let lines = format_combined_policy_status(&cfg).join("\n");
+        assert!(lines.contains("允许 = 所有来源"));
+    }
+
+    #[test]
+    fn combined_policy_geoip_only_when_access_control_off() {
+        let cfg = make_config(AccessControlMode::Off, &[], true, true, false);
+        let lines = format_combined_policy_status(&cfg).join("\n");
+        assert!(lines.contains("允许 = 属于 CN/LAN"));
+    }
+
+    #[test]
+    fn combined_policy_blacklist_only_when_geoip_forward_off() {
+        let cfg = make_config(
+            AccessControlMode::Blacklist,
+            &["8.8.8.8"],
+            true,
+            false,
+            true,
+        );
+        let lines = format_combined_policy_status(&cfg).join("\n");
+        assert!(lines.contains("GeoIP 转发端口 CN 限制：disabled"));
+        assert!(lines.contains("允许 = 不在黑名单"));
+        assert!(!lines.contains("AND 属于 CN/LAN"));
+    }
+
+    #[test]
+    fn readme_documents_combined_policy() {
+        let readme = include_str!("../../README.md");
+        assert!(
+            readme.contains("### access_control 与 GeoIP 的组合策略"),
+            "README should document the combined policy"
+        );
+        assert!(
+            readme.contains("黑名单优先级最高"),
+            "README should state blacklist priority"
+        );
+        assert!(
+            readme.contains("白名单是精确来源限制"),
+            "README should describe whitelist as exact-source restriction"
+        );
+        assert!(
+            readme.contains("GeoIP 是国家/地区来源限制"),
+            "README should describe GeoIP as country restriction"
+        );
+        assert!(
+            readme.contains("两者可以同时启用，叠加生效，不是互相覆盖"),
+            "README should state layering, not OR override"
+        );
+        assert!(
+            readme.contains("同时启用 = AND"),
+            "README should state AND semantics"
         );
     }
 

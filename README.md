@@ -92,7 +92,35 @@ GeoIP 与白名单/黑名单的区别：
 
 - `geoip` 限制的是国家 / 地区来源（中国大陆 IPv4）
 - `access_control` 限制的是用户自定义的来源 IP / CIDR 白名单或黑名单
-- 两者可以同时启用，建议在 README/CLI 中明确各自适用范围
+- 两者可以同时启用，叠加生效，不是互相覆盖
+
+### access_control 与 GeoIP 的组合策略
+
+`access_control`（黑/白名单）与 `geoip`（国家/地区限制）是分层叠加的访问控制，不是互相替代。两者同时启用时，使用 AND 逻辑：
+
+```text
+allow = (来源不在黑名单)
+      AND (whitelist 模式关闭，或来源命中白名单)
+      AND (geoip.forward 关闭，或来源属于 CN/可选 LAN)
+```
+
+评估顺序（按 nft 链优先级）：
+
+1. **黑名单优先级最高。** `access_control.mode = "blacklist"` 命中即在 `self-nat PREROUTING` 中 drop，无论该来源是否属于 CN/LAN，无论白名单状态。
+2. **白名单是精确来源限制。** `access_control.mode = "whitelist"` 时，只有 `entries` 内的来源 IP/CIDR 能匹配本项目转发规则，其他来源不会被 DNAT，等同于拒绝转发；不会因为属于 CN/LAN 而被放行。
+3. **GeoIP 是国家/地区来源限制。** `geoip.forward.enabled = true` 时，`self-filter GEOIP_PREROUTING`（优先级 -200，早于 `self-nat PREROUTING` 的 -110）会 drop 非 CN/LAN 来源；不会因为命中白名单而被放行。
+4. **同时启用 = AND。** 黑名单 + 白名单 + GeoIP 同时启用时，三层依次叠加，必须同时满足才会被 DNAT。
+
+不要把两者理解为 OR：白名单不会绕过 GeoIP，GeoIP 也不会绕过白名单。例如：
+
+- 来源属于黑名单 **且** 也属于 CN：仍然 drop（黑名单优先）。
+- 白名单开启且来源不在白名单：即使属于 CN 也不会被转发。
+- GeoIP 开启且来源不属于 CN/LAN：即使不在黑名单，也会在 prerouting 被 drop。
+- 白名单 + GeoIP 同时启用：只有 **同时命中白名单 且 属于 CN/LAN** 的来源才会被转发。
+
+CLI 的「白名单 / 黑名单管理」和「GeoIP / CN IP 限制」状态页都会显示当前组合策略，方便核对预期。
+
+注意：上述组合不会 `flush ruleset`，不会修改用户其他 nftables 表；只在本项目的 `self-nat` / `self-filter` 表内叠加规则。
 
 ### 出口目标限制
 
