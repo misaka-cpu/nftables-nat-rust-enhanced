@@ -155,7 +155,7 @@ pub(crate) enum MenuOutcome {
 fn print_menu() {
     println!(
         r#"====================================
-nftables-nat-rust-enhanced 管理菜单
+{title}
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
@@ -178,8 +178,21 @@ nftables-nat-rust-enhanced 管理菜单
 19) 高级网络设置 (SNAT / MSS clamp)
 20) 查看审计日志
 0) 退出
-===================================="#
+===================================="#,
+        title = main_menu_title(),
     );
+}
+
+/// 拼出主菜单标题：`nft-nat-rust <版本号>`。版本来自 [`nat_common::build_version`]，
+/// 与 `nat --version` 同一来源；未注入版本时显示 `dev`。
+fn main_menu_title() -> String {
+    let raw = nat_common::build_version();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+        "nft-nat-rust dev".to_string()
+    } else {
+        format!("nft-nat-rust {trimmed}")
+    }
 }
 
 fn prompt(label: &str) -> Result<String, io::Error> {
@@ -2393,20 +2406,68 @@ fn reexec_menu(bin: &str) -> io::Error {
     Command::new(bin).arg("--menu").exec()
 }
 
-/// 查看最近 50 行 audit 日志
+/// 查看最近 50 行 audit 日志。
+///
+/// v0.4.2：默认按 CLI 友好格式展示（time 按 Asia/Shanghai 24h；detail 缩进 kv）；
+/// 子菜单可切换为查看原始 JSON 行。文件内部仍为一行 JSON 不变。
 fn view_audit_log_interactive(config_path: &str) -> Result<(), io::Error> {
-    let audit_cfg = audit_config_from(config_path);
-    println!("====================================");
-    println!("审计日志（最近 50 行）");
-    println!("====================================");
-    println!("audit.enabled: {}", audit_cfg.enabled);
-    println!("audit.file: {}", audit_cfg.file);
-    if !audit_cfg.enabled {
-        println!("提示：audit.enabled = false，CLI 操作不会写入审计日志。");
+    loop {
+        let audit_cfg = audit_config_from(config_path);
+        println!("====================================");
+        println!("审计日志（最近 50 行）");
+        println!("====================================");
+        println!("audit.enabled: {}", audit_cfg.enabled);
+        println!("audit.file: {}", audit_cfg.file);
+        if !audit_cfg.enabled {
+            println!("提示：audit.enabled = false，CLI 操作不会写入审计日志。");
+        }
+        println!("1) 查看格式化日志（默认，CLI 友好，按 Asia/Shanghai 24 小时制）");
+        println!("2) 查看原始 JSON 日志");
+        println!("0) 返回");
+        let choice = prompt("请选择: ")?;
+        match choice.trim() {
+            "" | "1" => {
+                show_audit_log_formatted(&audit_cfg);
+                wait_enter_to_return()?;
+            }
+            "2" => {
+                show_audit_log_raw(&audit_cfg);
+                wait_enter_to_return()?;
+            }
+            "0" => break,
+            value if is_menu_refresh_command(value) => break,
+            _ => {
+                println!("未知选项: {}", choice.trim());
+                wait_enter_to_return()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn show_audit_log_formatted(audit_cfg: &AuditConfig) {
+    println!();
+    println!("提示：JSON 内部 `time` 字段为 UTC RFC3339；CLI 默认按 Asia/Shanghai 24 小时制展示。");
+    println!("------------------------------------");
+    let lines = audit::read_tail(&audit_cfg.file, 50);
+    if lines.is_empty() {
+        println!("（无日志或文件不存在）");
+    } else {
+        for line in lines {
+            let formatted = audit::format_log_line_for_cli(&line, format_cli_time_from_rfc3339);
+            println!("{formatted}");
+            println!();
+        }
     }
     println!(
-        "提示：JSON 内部 `time` 字段为 UTC RFC3339；CLI 状态页其他时间会按 Asia/Shanghai 展示。"
+        "提示：每条审计日志为一行 JSON，便于 grep。完整文件位于 {}",
+        audit_cfg.file
     );
+}
+
+fn show_audit_log_raw(audit_cfg: &AuditConfig) {
+    println!();
+    println!("------------------------------------");
     let lines = audit::read_tail(&audit_cfg.file, 50);
     if lines.is_empty() {
         println!("（无日志或文件不存在）");
@@ -2420,8 +2481,6 @@ fn view_audit_log_interactive(config_path: &str) -> Result<(), io::Error> {
         "提示：每条审计日志为一行 JSON，便于 grep。完整文件位于 {}",
         audit_cfg.file
     );
-    wait_enter_to_return()?;
-    Ok(())
 }
 
 /// 把 last-good 缓存状态摘要追加到状态展示页
@@ -2504,8 +2563,8 @@ fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
                 wait_enter_to_return()?;
             }
             "6" => {
-                // 自管 wait：函数内部完成一次 wait_enter_to_return；不再叠加。
-                time_status_interactive()?;
+                // 自管 wait：函数内部完成 wait_enter_to_return；不再叠加。
+                time_status_interactive(config_path)?;
             }
             "0" => break,
             value if is_menu_refresh_command(value) => break,
@@ -2519,110 +2578,219 @@ fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
     Ok(())
 }
 
-/// 时间 / NTP 状态检查页面。
+/// 时间 / NTP 状态检查页面（v0.4.2 重构为子菜单）。
 ///
-/// **只查看，不默认修改系统时间**。可通过 y/N 二次确认尝试启用系统 NTP（调用
-/// `timedatectl set-ntp true`，需要 root），未确认时只打印建议命令。
-fn time_status_interactive() -> Result<(), io::Error> {
+/// 始终遵守：
+/// - **不默认修改系统时间，不默认修改系统时区**
+/// - 设置 CLI 展示时区只写 `/etc/nat.toml [ui]`，**不改系统**
+/// - 启用系统 NTP 需要 y/N 二次确认，调用 `timedatectl set-ntp true`
+/// - timedatectl 不存在 → 友好提示，不报错
+fn time_status_interactive(config_path: &str) -> Result<(), io::Error> {
+    loop {
+        let config = load_toml_config(config_path).ok();
+        print_time_status_overview(config.as_ref());
+        println!(
+            r#"====================================
+时间 / NTP 状态检查
+====================================
+1) 查看时间 / NTP 状态（默认）
+2) 设置 CLI 展示时区
+3) 显示修改系统时区命令
+4) 尝试启用系统 NTP
+0) 返回"#
+        );
+        let choice = prompt("请选择: ")?;
+        match choice.trim() {
+            "" | "1" => {
+                // overview 已在上方打印；用户按 Enter 返回
+                wait_enter_to_return()?;
+            }
+            "2" => {
+                set_cli_display_timezone_interactive(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "3" => {
+                show_set_system_timezone_command();
+                wait_enter_to_return()?;
+            }
+            "4" => {
+                try_enable_system_ntp_interactive()?;
+                wait_enter_to_return()?;
+            }
+            "0" => break,
+            value if is_menu_refresh_command(value) => break,
+            _ => {
+                println!("未知选项: {}", choice.trim());
+                wait_enter_to_return()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_time_status_overview(config: Option<&TomlConfig>) {
+    let ui = config.map(|c| c.ui.clone()).unwrap_or_default();
     let now_utc = chrono::Utc::now();
     let local_now = chrono::Local::now();
     println!("====================================");
-    println!("时间 / NTP 状态检查");
+    println!("时间 / NTP 状态");
     println!("====================================");
     println!(
-        "当前系统时间（本机时区）：{}",
-        local_now.format("%Y-%m-%d %H:%M:%S %Z")
+        "系统本地时间：{}",
+        local_now.format("%Y-%m-%d %H:%M:%S %Z (%:z)")
     );
-    println!("当前 UTC 时间：{}", now_utc.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!("UTC 时间：{}", now_utc.format("%Y-%m-%d %H:%M:%S UTC"));
     println!(
-        "CLI 展示时区：{} ({})",
-        nat_common::CLI_DISPLAY_TZ_LABEL,
-        format_cli_time(now_utc)
+        "CLI 展示时间：{} (时区 {})",
+        nat_common::format_cli_time_with(now_utc, &ui),
+        ui.timezone
     );
-
+    let timedatectl_tz = run_timedatectl_status()
+        .and_then(|stdout| parse_timedatectl_field(&stdout, "Time zone").map(|v| (stdout, v)));
+    let (timedatectl_stdout, system_tz) = match timedatectl_tz {
+        Some((stdout, tz)) => (Some(stdout), Some(tz)),
+        None => (run_timedatectl_status(), None),
+    };
+    match &system_tz {
+        Some(tz) => println!("当前系统时区：{tz}"),
+        None => println!("当前系统时区：(timedatectl 不可用或字段缺失)"),
+    }
+    println!("CLI 展示时区：{}", ui.timezone);
+    if let Some(sys_tz) = system_tz.as_deref()
+        && !sys_tz.starts_with(&ui.timezone)
+        && !ui
+            .timezone
+            .starts_with(sys_tz.split_whitespace().next().unwrap_or(""))
+    {
+        println!();
+        println!("提示：系统时区与 CLI 展示时区不同。这不会影响 nft 转发；");
+        println!("如果你希望日志和系统时间一致，可修改系统时区或 CLI 展示时区。");
+        println!("修改系统时区命令请见 3)；修改 CLI 展示时区请见 2)。");
+    }
     println!();
-    println!("nft 转发本身不严格依赖系统时间，但以下功能建议系统时间准确：");
+    if let Some(stdout) = timedatectl_stdout {
+        let ntp_service = parse_timedatectl_field(&stdout, "NTP service")
+            .or_else(|| parse_timedatectl_field(&stdout, "Network time on"));
+        let synchronized = parse_timedatectl_field(&stdout, "System clock synchronized");
+        println!("timedatectl 可用：是");
+        println!(
+            "NTP 服务：{}",
+            ntp_service.as_deref().unwrap_or("(未知字段)")
+        );
+        println!(
+            "System clock synchronized：{}",
+            synchronized.as_deref().unwrap_or("(未知字段)")
+        );
+    } else {
+        println!("timedatectl 可用：否（可能未安装 systemd 工具）");
+        println!("本项目不会自动安装任何依赖；如需 NTP，请使用你的发行版自带的工具自行配置。");
+    }
+    println!();
+    println!("nft 转发本身不依赖系统时区。但以下功能建议系统时间准确：");
     println!("  - Stats daily/monthly 滚动重置");
-    println!("  - quota 周期判断 / 通知去重 key");
+    println!("  - quota 周期判断 / 通知去重");
     println!("  - audit log 时间戳");
     println!("  - last-good 上次成功解析时间");
-    println!("  - TLS 下载 release / cn4.nft 时的证书校验");
+    println!("  - Telegram 通知 / TLS 下载（release 或 cn4.nft）");
+    println!("CLI 展示时区只影响显示，不改变系统时区。");
+}
+
+/// 调一次 `timedatectl status`，stdout 字符串。失败返回 None（不区分原因，调用方自行说明）。
+fn run_timedatectl_status() -> Option<String> {
+    match Command::new("timedatectl").arg("status").output() {
+        Ok(out) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).to_string()),
+        _ => None,
+    }
+}
+
+/// `[ui] timezone` 子菜单：写入 `/etc/nat.toml`，非法 timezone 不保存。
+fn set_cli_display_timezone_interactive(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    println!("当前 CLI 展示时区：{}", config.ui.timezone);
+    println!("允许输入合法 IANA 时区名，例如：");
+    println!("  Asia/Shanghai");
+    println!("  UTC");
+    println!("  America/Chicago");
+    println!("更多时区可在系统执行 `timedatectl list-timezones` 查看。");
+    let raw = prompt("请输入新的 CLI 展示时区（输入 0 取消）: ")?;
+    if raw.trim() == "0" || raw.trim().is_empty() {
+        println!("已取消，不修改 [ui].timezone。");
+        return Ok(());
+    }
+    if let Err(e) = nat_common::validate_iana_timezone(&raw) {
+        println!("无效时区，未保存：{e}");
+        return Ok(());
+    }
+    config.ui.timezone = raw.trim().to_string();
+    if let Err(e) = config.ui.validate() {
+        println!("校验失败，未保存：{e}");
+        return Ok(());
+    }
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    audit_cli(
+        config_path,
+        "ui.timezone.update",
+        AuditResult::Ok,
+        json!({"timezone": config.ui.timezone}),
+    );
+    println!("CLI 展示时区已保存为 {}。", config.ui.timezone);
+    println!("此项只影响 CLI 显示，不改变系统时区。");
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn show_set_system_timezone_command() {
+    println!("====================================");
+    println!("修改系统时区命令（建议，不会自动执行）");
+    println!("====================================");
+    println!("查看可用时区：");
+    println!("  timedatectl list-timezones | grep -i Shanghai");
+    println!("设置系统时区（需要 root）：");
+    println!("  sudo timedatectl set-timezone Asia/Shanghai");
     println!();
+    println!("注意：");
+    println!("- 修改系统时区会改变本地日志显示，不影响 audit / last-good JSON 内部 UTC RFC3339。");
+    println!("- 本工具不会自动执行 timedatectl set-timezone。");
+}
 
-    let output = Command::new("timedatectl").arg("status").output();
-    match output {
+fn try_enable_system_ntp_interactive() -> Result<(), io::Error> {
+    println!("====================================");
+    println!("尝试启用系统 NTP");
+    println!("====================================");
+    println!("这会调用 timedatectl set-ntp true（需要 root）。");
+    println!("- 不会 apt-get install 任何东西");
+    println!("- 不会自动修改系统时区");
+    println!("- timedatectl 不存在时仅打印提示，不报错");
+    let confirm = prompt("启用系统 NTP？[y/N]: ")?;
+    if !matches!(confirm.as_str(), "y" | "Y" | "yes" | "YES") {
+        println!("已取消，不改动系统 NTP 设置。");
+        return Ok(());
+    }
+    match Command::new("timedatectl")
+        .arg("set-ntp")
+        .arg("true")
+        .output()
+    {
         Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let ntp_service = parse_timedatectl_field(&stdout, "NTP service")
-                .or_else(|| parse_timedatectl_field(&stdout, "Network time on"));
-            let synchronized = parse_timedatectl_field(&stdout, "System clock synchronized");
-            let timezone = parse_timedatectl_field(&stdout, "Time zone");
-            println!("timedatectl: 可用");
-            println!(
-                "NTP 服务：{}",
-                ntp_service.as_deref().unwrap_or("(未知字段)")
-            );
-            println!(
-                "System clock synchronized：{}",
-                synchronized.as_deref().unwrap_or("(未知字段)")
-            );
-            println!(
-                "当前系统时区：{}",
-                timezone.as_deref().unwrap_or("(未知字段)")
-            );
-
-            let synced_yes = synchronized
-                .as_deref()
-                .is_some_and(|v| v.eq_ignore_ascii_case("yes"));
-            if !synced_yes {
-                println!();
-                println!("提示：系统时钟未同步。可手动执行（需要 root）：");
-                println!("  sudo timedatectl set-ntp true");
-                let confirm = prompt("尝试启用系统 NTP？[y/N]: ")?;
-                if matches!(confirm.as_str(), "y" | "Y" | "yes" | "YES") {
-                    match Command::new("timedatectl")
-                        .arg("set-ntp")
-                        .arg("true")
-                        .output()
-                    {
-                        Ok(set_out) if set_out.status.success() => {
-                            println!("已尝试启用系统 NTP。请稍后再次查看以确认 synchronized=yes。");
-                        }
-                        Ok(set_out) => {
-                            println!(
-                                "执行 timedatectl set-ntp true 返回非零退出码：{}",
-                                String::from_utf8_lossy(&set_out.stderr).trim()
-                            );
-                            println!(
-                                "常见原因：未以 root 运行；或当前系统不使用 systemd-timesyncd。"
-                            );
-                        }
-                        Err(e) => {
-                            println!("调用 timedatectl set-ntp true 失败：{e}");
-                        }
-                    }
-                } else {
-                    println!("已取消，不改动系统 NTP 设置。");
-                }
-            }
+            println!("已尝试启用系统 NTP。请稍后再次查看 1) 状态以确认 synchronized=yes。");
         }
         Ok(out) => {
             println!(
-                "timedatectl status 返回非零退出码：{}",
+                "执行 timedatectl set-ntp true 返回非零退出码：{}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
+            println!("常见原因：未以 root 运行；或当前系统不使用 systemd-timesyncd。");
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            println!("未检测到 timedatectl（可能未安装 systemd 工具）。");
-            println!(
-                "如果你需要保持时钟同步，请使用你的发行版自带的 NTP 客户端，本项目不会自动安装任何依赖。"
-            );
+            println!("未检测到 timedatectl，无法启用 NTP。");
+            println!("请使用你的发行版自带的 NTP 工具，本项目不会自动安装任何依赖。");
         }
         Err(e) => {
-            println!("调用 timedatectl 失败：{e}");
+            println!("调用 timedatectl set-ntp true 失败：{e}");
         }
     }
-    wait_enter_to_return()
+    Ok(())
 }
 
 /// 从 `timedatectl status` 输出中按"前缀 key"匹配并取冒号后的值。
@@ -3022,59 +3190,59 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
         println!("  提示: {note}");
     }
 
+    // nat.service / nft 检测合并在 print_nft_detection_block 里输出，避免重复打印 active 状态。
     let nat_active = is_nat_service_active();
-    println!(
-        "nat.service: {}",
-        if nat_active {
-            "active"
-        } else {
-            "inactive/unknown"
-        }
-    );
-    if !nat_active {
-        println!("nat.service 未运行，转发规则不会应用。");
-        println!("请执行：");
-        println!("  systemctl restart nat");
-        println!("  systemctl status nat --no-pager -l");
-        println!("  journalctl -u nat -n 120 --no-pager");
-    }
     let nft_json = read_nft_json_ruleset();
     match nft_json {
-        Ok(json) => match forward_test::parse_rule_counters(&json, &rule.id) {
-            Ok(counters) => {
-                let nft_applied = forward_test::nft_rule_applied(&counters);
-                println!(
-                    "nft 规则: {}",
-                    if nft_applied {
-                        "已应用"
-                    } else {
-                        "未找到"
-                    }
-                );
-                if !nft_applied {
-                    // 该规则在 /etc/nat.toml 中存在（由 list_testable_rules 过滤过 enabled=true）
-                    // 但 nft ruleset 里没找到对应 counter；最常见原因是 nat.service 还没跑完
-                    // 一个检测周期。给出明确的 pending 提示，避免用户误以为出 bug。
-                    println!("规则已保存但尚未在 nft 中生效，可能正在等待 nat.service 自动应用。");
-                    println!("请稍后刷新，或检查：");
-                    println!("  systemctl status nat --no-pager -l");
-                    println!("  journalctl -u nat -n 120 --no-pager");
-                    println!("其他可能原因：");
-                    println!("- nat.service 未运行");
-                    println!("- 规则配置解析失败");
-                    println!("- fake-ip 被拒绝");
-                    println!(
-                        "  当前自动检测 / 刷新间隔：{} 秒（ddns.refresh_interval_seconds）",
-                        config.ddns.refresh_interval_seconds
+        Ok(json) => {
+            // 用新的 detect_rule_in_nft_json 做"规则是否存在"检测；旧的 parse_rule_counters
+            // 仅看 counter 值，会把"刚 apply 但还没流量"误判为未应用 —— 仍保留它用于显示 baseline。
+            let presence = forward_test::detect_rule_in_nft_json(&json, &rule.id);
+            let counters = forward_test::parse_rule_counters(&json, &rule.id);
+
+            // 查 audit log 最近一次 apply 事件，作为 Unconfirmed/NotApplied 的判定依据
+            let last_apply = audit::last_apply_event(&config.audit.file, 200);
+            let last_apply_success = matches!(&last_apply, Some((a, _)) if a == "apply.success");
+            let last_apply_label = match &last_apply {
+                Some((action, time)) if !time.is_empty() => {
+                    format!("{action} @ {}", format_cli_time_from_rfc3339(time))
+                }
+                Some((action, _)) => action.clone(),
+                None => "(无)".to_string(),
+            };
+
+            match presence {
+                Ok(presence) => {
+                    let verdict = forward_test::classify_nft_presence(
+                        &presence,
+                        rule.ip_version.as_str(),
+                        rule.protocol.as_str(),
+                        nat_active,
+                        last_apply_success,
+                    );
+                    print_nft_detection_block(
+                        &presence,
+                        verdict,
+                        rule,
+                        nat_active,
+                        last_apply_success,
+                        &last_apply_label,
+                        config.ddns.refresh_interval_seconds,
                     );
                 }
-                println!(
-                    "baseline counters: nat-rule={}B, out={}B, in={}B",
-                    counters.nat_rule.bytes, counters.out.bytes, counters.r#in.bytes
-                );
+                Err(e) => {
+                    println!("nft 规则检测失败：{e}");
+                }
             }
-            Err(e) => println!("读取 nft counter 失败: {e}"),
-        },
+
+            match counters {
+                Ok(c) => println!(
+                    "baseline counters: nat-rule={}B, out={}B, in={}B",
+                    c.nat_rule.bytes, c.out.bytes, c.r#in.bytes
+                ),
+                Err(e) => println!("读取 nft counter 失败: {e}"),
+            }
+        }
         Err(e) => println!("读取 nft ruleset 失败: {e}"),
     }
 
@@ -3103,6 +3271,120 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
         println!("{line}");
     }
     Ok(())
+}
+
+/// 把 v0.4.2 的 nft 规则检测结果打印成结构化区块。
+/// - 总是显示 self-nat / self-filter / protocol 子项，避免单一行误判。
+/// - verdict 是综合结论（已应用 / 部分匹配 / 未确认 / 未应用）。
+fn print_nft_detection_block(
+    presence: &nat_common::forward_test::NftRulePresence,
+    verdict: nat_common::forward_test::NftDetectionVerdict,
+    rule: &nat_common::forward_test::TestableRule,
+    nat_active: bool,
+    last_apply_success: bool,
+    last_apply_label: &str,
+    refresh_interval_seconds: u64,
+) {
+    use nat_common::forward_test::NftDetectionVerdict;
+
+    println!("nft 规则检测：");
+    let need_v4 = matches!(rule.ip_version.as_str(), "ipv4" | "all");
+    let need_v6 = matches!(rule.ip_version.as_str(), "ipv6" | "all");
+    if need_v4 {
+        println!(
+            "  ip self-nat PREROUTING (nat-rule:id={}): {}",
+            rule.id,
+            yes_no(presence.nat_rule_v4_found)
+        );
+        println!(
+            "  ip self-filter FORWARD out: {}  in: {}",
+            yes_no(presence.forward_out_v4_found),
+            yes_no(presence.forward_in_v4_found)
+        );
+    }
+    if need_v6 {
+        println!(
+            "  ip6 self-nat PREROUTING (nat-rule:id={}): {}",
+            rule.id,
+            yes_no(presence.nat_rule_v6_found)
+        );
+        println!(
+            "  ip6 self-filter FORWARD out: {}  in: {}",
+            yes_no(presence.forward_out_v6_found),
+            yes_no(presence.forward_in_v6_found)
+        );
+    }
+    println!(
+        "  protocol 检测: tcp={}  udp={}  (规则期望 protocol={})",
+        yes_no(presence.protocol_tcp_seen),
+        yes_no(presence.protocol_udp_seen),
+        rule.protocol
+    );
+    println!(
+        "  nat.service: {}  最近一次 apply: {last_apply_label}",
+        if nat_active {
+            "active"
+        } else {
+            "inactive/unknown"
+        }
+    );
+    println!("  检测结论: {}", verdict.label());
+
+    match verdict {
+        NftDetectionVerdict::Applied => {
+            println!("  nft 规则已确认应用。");
+        }
+        NftDetectionVerdict::Partial => {
+            println!(
+                "  仅命中部分 IP family / protocol；如果规则 ip_version=all 或 protocol=all，可能某一侧 nft 表尚未应用，或 IPv6 未启用。"
+            );
+            println!("  请查看：");
+            println!("    nft list table ip self-nat");
+            println!("    nft list table ip self-filter");
+            if need_v6 {
+                println!("    nft list table ip6 self-nat");
+                println!("    nft list table ip6 self-filter");
+            }
+        }
+        NftDetectionVerdict::Unconfirmed => {
+            // 服务 active + 最近 apply.success 但检测器没找到 → 不要直接说"未应用"
+            println!(
+                "  nft 规则：未能通过当前检测器确认，但 nat.service active 且最近一次 apply 成功 ({last_apply_label})。"
+            );
+            println!("  可能是检测条件未覆盖当前规则格式。请查看当前 nft 规则确认：");
+            println!("    nft list table ip self-nat");
+            println!("    nft list table ip self-filter");
+            println!("    journalctl -u nat -n 120 --no-pager");
+            println!(
+                "  本工具不会因为检测器未确认就重启 nat.service 或绕过 safe apply 执行 nft -f。"
+            );
+        }
+        NftDetectionVerdict::NotApplied => {
+            if !nat_active {
+                println!("  nat.service 未运行，转发规则不会应用。");
+                println!("  请执行：");
+                println!("    systemctl restart nat");
+                println!("    systemctl status nat --no-pager -l");
+                println!("    journalctl -u nat -n 120 --no-pager");
+            } else if !last_apply_success {
+                println!(
+                    "  最近一次 apply 未成功 (最后事件: {last_apply_label})，规则可能尚未应用。"
+                );
+                println!("  请查看：");
+                println!("    journalctl -u nat -n 120 --no-pager");
+            } else {
+                println!("  规则可能正在等待 nat.service 自动应用。");
+                println!(
+                    "  当前自动检测 / 刷新间隔：{refresh_interval_seconds} 秒（ddns.refresh_interval_seconds）。"
+                );
+                println!("  请稍后刷新，或手动执行：systemctl restart nat");
+            }
+        }
+    }
+}
+
+fn yes_no(found: bool) -> &'static str {
+    if found { "已找到" } else { "未找到" }
 }
 
 fn is_nat_service_active() -> bool {
@@ -3573,6 +3855,7 @@ mod tests {
             last_good: Default::default(),
             audit: Default::default(),
             quota: Default::default(),
+            ui: Default::default(),
         };
         add_single_rule(
             &mut config,
@@ -3604,6 +3887,7 @@ mod tests {
             last_good: Default::default(),
             audit: Default::default(),
             quota: Default::default(),
+            ui: Default::default(),
         };
         add_range_rule(
             &mut config,
@@ -4469,5 +4753,116 @@ System clock synchronized: yes
         // Copy 检查
         let _copied = a;
         assert_eq!(a, MenuOutcome::Cancelled);
+    }
+
+    // ============ v0.4.2 ============
+
+    #[test]
+    fn main_menu_title_includes_version_string_from_build_version() {
+        let title = main_menu_title();
+        assert!(
+            title.starts_with("nft-nat-rust "),
+            "title 必须以 nft-nat-rust 开头: {title}"
+        );
+        let version = nat_common::build_version();
+        assert!(
+            title.contains(version) || title.ends_with(" dev"),
+            "title 必须包含 build_version 或回退 dev：title={title} version={version}"
+        );
+    }
+
+    #[test]
+    fn main_menu_title_uses_dev_when_unknown() {
+        // 间接验证 build_version() == "unknown" 时的兜底逻辑。
+        // build_version 返回 &'static str，不能直接 mock；但我们可以测 title
+        // 的分支逻辑通过将 build_version() 输出当作输入构造预期。
+        let v = nat_common::build_version().trim();
+        if v.is_empty() || v.eq_ignore_ascii_case("unknown") {
+            assert_eq!(main_menu_title(), "nft-nat-rust dev");
+        } else {
+            assert_eq!(main_menu_title(), format!("nft-nat-rust {v}"));
+        }
+    }
+
+    #[test]
+    fn parse_timedatectl_field_recognizes_extra_keys() {
+        let sample = "Time zone: America/Chicago (CDT, -0500)\nNTP service: inactive\nSystem clock synchronized: no\n";
+        assert_eq!(
+            parse_timedatectl_field(sample, "Time zone").as_deref(),
+            Some("America/Chicago (CDT, -0500)")
+        );
+        assert_eq!(
+            parse_timedatectl_field(sample, "System clock synchronized").as_deref(),
+            Some("no")
+        );
+    }
+
+    #[test]
+    fn ui_timezone_can_be_set_via_toml_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "nat-menu-ui-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nat.toml");
+        std::fs::write(
+            &path,
+            r#"
+[ui]
+timezone = "America/Chicago"
+time_format = "%Y-%m-%d %H:%M:%S %Z"
+"#,
+        )
+        .unwrap();
+        let cfg = load_toml_config(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.ui.timezone, "America/Chicago");
+        // 序列化往返
+        let serialized = cfg.to_toml_string().unwrap();
+        assert!(serialized.contains("America/Chicago"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn print_nft_detection_block_smoke() {
+        // 仅冒烟：构造 presence + rule + 调用，不 panic 即可（输出走 stdout）。
+        let presence = nat_common::forward_test::NftRulePresence {
+            nat_rule_v4_found: true,
+            forward_out_v4_found: true,
+            forward_in_v4_found: true,
+            protocol_tcp_seen: true,
+            ..Default::default()
+        };
+        let rule = nat_common::forward_test::TestableRule {
+            index: 0,
+            id: "r0".to_string(),
+            label: "smoke".to_string(),
+            r#type: "single".to_string(),
+            sport: 30080,
+            target: "example.com".to_string(),
+            resolved_ip: Some("1.2.3.4".to_string()),
+            dport: 80,
+            protocol: "tcp".to_string(),
+            ip_version: "ipv4".to_string(),
+        };
+        print_nft_detection_block(
+            &presence,
+            nat_common::forward_test::NftDetectionVerdict::Applied,
+            &rule,
+            true,
+            true,
+            "apply.success @ 2026-05-19 20:00:00 CST",
+            300,
+        );
+        // 用 Unconfirmed 路径再走一次：检测器没找到但 service active + apply ok
+        print_nft_detection_block(
+            &Default::default(),
+            nat_common::forward_test::NftDetectionVerdict::Unconfirmed,
+            &rule,
+            true,
+            true,
+            "apply.success @ 2026-05-19 20:00:00 CST",
+            300,
+        );
     }
 }

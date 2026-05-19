@@ -274,6 +274,262 @@ pub fn nft_rule_applied(counters: &RuleTestCounters) -> bool {
         || counters.r#in != TestCounter::default()
 }
 
+/// nft 规则在 ruleset 中的存在性检测结果。
+///
+/// 与 [`RuleTestCounters`] 不同：本结构不依赖 counter 是否非零，只看"评论是否匹配 nat-rule/nat-traffic"。
+/// 这样可以避免"规则已生效但还没流量经过 → 显示未应用"的误判。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NftRulePresence {
+    /// ip self-nat PREROUTING 中找到 `nat-rule:id=rN` 注释
+    pub nat_rule_v4_found: bool,
+    /// ip6 self-nat PREROUTING 中找到 `nat-rule:id=rN` 注释
+    pub nat_rule_v6_found: bool,
+    /// ip self-filter FORWARD 中找到 `nat-traffic:id=rN,dir=out`
+    pub forward_out_v4_found: bool,
+    /// ip self-filter FORWARD 中找到 `nat-traffic:id=rN,dir=in`
+    pub forward_in_v4_found: bool,
+    /// ip6 self-filter FORWARD 中找到 `nat-traffic:id=rN,dir=out`
+    pub forward_out_v6_found: bool,
+    /// ip6 self-filter FORWARD 中找到 `nat-traffic:id=rN,dir=in`
+    pub forward_in_v6_found: bool,
+    /// nat-rule 所在 PREROUTING 规则的 expr 里是否检测到 tcp 协议字段
+    pub protocol_tcp_seen: bool,
+    /// nat-rule 所在 PREROUTING 规则的 expr 里是否检测到 udp 协议字段
+    pub protocol_udp_seen: bool,
+}
+
+/// 综合判断：nft 规则在不同 IP family / chain 下的命中状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NftDetectionVerdict {
+    /// 完整找到（期望的 IP family + PREROUTING + FORWARD 计数器全命中）
+    Applied,
+    /// 部分命中：只在一个 IP family 或一个方向找到，或 protocol=all 但只看到 tcp/udp 之一
+    Partial,
+    /// 检测器没找到，但 nat.service active 且最近有 apply.success，可能是检测条件未覆盖
+    Unconfirmed,
+    /// 未应用：检测器没找到，nat.service inactive 或最近 apply 失败
+    NotApplied,
+}
+
+impl NftDetectionVerdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            NftDetectionVerdict::Applied => "已应用",
+            NftDetectionVerdict::Partial => "部分匹配",
+            NftDetectionVerdict::Unconfirmed => "未确认",
+            NftDetectionVerdict::NotApplied => "未应用",
+        }
+    }
+}
+
+/// 扫描 `nft -j list ruleset` 输出中是否存在指定 rule_id 的注释。
+/// 不要求 counter 非零，因此可以识别"规则已生效但没流量"的情形。
+pub fn detect_rule_in_nft_json(json: &str, rule_id: &str) -> Result<NftRulePresence, String> {
+    let value: Value =
+        serde_json::from_str(json).map_err(|e| format!("解析 nft JSON 失败: {e}"))?;
+    let entries = value
+        .get("nftables")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "nft JSON 缺少 nftables 数组".to_string())?;
+    let want_nat_rule = format!("nat-rule:id={rule_id}");
+    let want_forward_out = format!("nat-traffic:id={rule_id},dir=out");
+    let want_forward_in = format!("nat-traffic:id={rule_id},dir=in");
+    let mut presence = NftRulePresence::default();
+    for entry in entries {
+        let Some(rule) = entry.get("rule") else {
+            continue;
+        };
+        let family = rule.get("family").and_then(Value::as_str).unwrap_or("");
+        let table = rule.get("table").and_then(Value::as_str).unwrap_or("");
+        let chain = rule.get("chain").and_then(Value::as_str).unwrap_or("");
+        // 仅扫描本项目 managed table
+        if !(table == "self-nat" || table == "self-filter") {
+            continue;
+        }
+        let mut comments_in_rule: Vec<String> = Vec::new();
+        if let Some(c) = rule_level_comment(rule) {
+            comments_in_rule.push(c);
+        }
+        if let Some(expr) = rule.get("expr") {
+            collect_expr_comments(expr, &mut comments_in_rule);
+        }
+        let mut matched_this_rule = false;
+        for comment in &comments_in_rule {
+            if comment == &want_nat_rule && table == "self-nat" && chain == "PREROUTING" {
+                matched_this_rule = true;
+                match family {
+                    "ip" => presence.nat_rule_v4_found = true,
+                    "ip6" => presence.nat_rule_v6_found = true,
+                    _ => {}
+                }
+            } else if comment == &want_forward_out && table == "self-filter" && chain == "FORWARD" {
+                match family {
+                    "ip" => presence.forward_out_v4_found = true,
+                    "ip6" => presence.forward_out_v6_found = true,
+                    _ => {}
+                }
+            } else if comment == &want_forward_in && table == "self-filter" && chain == "FORWARD" {
+                match family {
+                    "ip" => presence.forward_in_v4_found = true,
+                    "ip6" => presence.forward_in_v6_found = true,
+                    _ => {}
+                }
+            }
+        }
+        // 在 nat-rule 命中的 PREROUTING 行内探测 protocol token，用于 protocol=all 时区分 tcp/udp
+        if matched_this_rule && let Some(expr) = rule.get("expr") {
+            scan_expr_protocols(
+                expr,
+                &mut presence.protocol_tcp_seen,
+                &mut presence.protocol_udp_seen,
+            );
+        }
+    }
+    Ok(presence)
+}
+
+/// 在 nft expr 树里收集所有 `comment` 字符串（包括嵌套对象 / 数组 / `{"comment": {"comment": "..."}}` 形式）。
+fn collect_expr_comments(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_expr_comments(item, out);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(s) = map.get("comment").and_then(Value::as_str) {
+                out.push(s.to_string());
+            } else if let Some(inner) = map
+                .get("comment")
+                .and_then(|v| v.get("comment"))
+                .and_then(Value::as_str)
+            {
+                out.push(inner.to_string());
+            }
+            for v in map.values() {
+                collect_expr_comments(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 在 nft expr 中扫描 protocol 标记：
+/// - `meta l4proto tcp` / `meta l4proto udp`
+/// - `meta l4proto { tcp, udp }`
+/// - `tcp dport / sport` / `udp dport / sport`
+///
+/// 任何上述出现都标记对应 protocol 已见到。
+fn scan_expr_protocols(value: &Value, saw_tcp: &mut bool, saw_udp: &mut bool) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                scan_expr_protocols(item, saw_tcp, saw_udp);
+            }
+        }
+        Value::Object(map) => {
+            // match expr：通常形如 {"match": {"left": {"meta": {"key": "l4proto"}}, "op": "==", "right": "tcp"}}
+            if let Some(m) = map.get("match")
+                && let Some(right) = m.get("right")
+            {
+                scan_protocol_right(right, saw_tcp, saw_udp);
+            }
+            // payload expr (tcp dport / udp dport)：{"payload": {"protocol": "tcp", "field": "dport"}}
+            if let Some(p) = map.get("payload")
+                && let Some(proto) = p.get("protocol").and_then(Value::as_str)
+            {
+                match proto {
+                    "tcp" => *saw_tcp = true,
+                    "udp" => *saw_udp = true,
+                    _ => {}
+                }
+            }
+            for v in map.values() {
+                scan_expr_protocols(v, saw_tcp, saw_udp);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scan_protocol_right(value: &Value, saw_tcp: &mut bool, saw_udp: &mut bool) {
+    match value {
+        Value::String(s) => match s.as_str() {
+            "tcp" => *saw_tcp = true,
+            "udp" => *saw_udp = true,
+            _ => {}
+        },
+        Value::Array(items) => {
+            for item in items {
+                scan_protocol_right(item, saw_tcp, saw_udp);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(set) = map.get("set") {
+                scan_protocol_right(set, saw_tcp, saw_udp);
+            }
+            for v in map.values() {
+                scan_protocol_right(v, saw_tcp, saw_udp);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 把 [`NftRulePresence`] 按 ip_version / protocol / nat.service 状态归并出一个综合 verdict。
+///
+/// 参数：
+/// - `expected_ip_version`：规则配置中的 `ip_version`，取值 `"ipv4"` / `"ipv6"` / `"all"`
+/// - `expected_protocol`：规则配置中的 `protocol`，取值 `"tcp"` / `"udp"` / `"all"`
+/// - `service_active`：systemctl is-active nat 是否返回 active
+/// - `last_apply_success`：最近一次 audit 是否记录到 `apply.success`
+pub fn classify_nft_presence(
+    presence: &NftRulePresence,
+    expected_ip_version: &str,
+    expected_protocol: &str,
+    service_active: bool,
+    last_apply_success: bool,
+) -> NftDetectionVerdict {
+    let need_v4 = matches!(expected_ip_version, "ipv4" | "all");
+    let need_v6 = matches!(expected_ip_version, "ipv6" | "all");
+
+    let v4_full =
+        presence.nat_rule_v4_found && presence.forward_out_v4_found && presence.forward_in_v4_found;
+    let v4_any =
+        presence.nat_rule_v4_found || presence.forward_out_v4_found || presence.forward_in_v4_found;
+    let v6_full =
+        presence.nat_rule_v6_found && presence.forward_out_v6_found && presence.forward_in_v6_found;
+    let v6_any =
+        presence.nat_rule_v6_found || presence.forward_out_v6_found || presence.forward_in_v6_found;
+
+    // protocol=all 时，要求 protocol_tcp_seen && protocol_udp_seen；
+    // 否则只视为部分匹配。
+    let protocol_ok = match expected_protocol {
+        "all" => presence.protocol_tcp_seen && presence.protocol_udp_seen,
+        "tcp" => presence.protocol_tcp_seen,
+        "udp" => presence.protocol_udp_seen,
+        _ => true,
+    };
+    let protocol_any = presence.protocol_tcp_seen || presence.protocol_udp_seen;
+
+    let v4_ok = !need_v4 || v4_full;
+    let v6_ok = !need_v6 || v6_full;
+    let any_family_found = v4_any || v6_any;
+
+    if v4_ok && v6_ok && protocol_ok && any_family_found {
+        return NftDetectionVerdict::Applied;
+    }
+    if any_family_found || protocol_any {
+        return NftDetectionVerdict::Partial;
+    }
+    // 检测器一无所获：根据 service / apply 状态区分 Unconfirmed / NotApplied
+    if service_active && last_apply_success {
+        NftDetectionVerdict::Unconfirmed
+    } else {
+        NftDetectionVerdict::NotApplied
+    }
+}
+
 pub fn verdict_from_delta(delta: &CounterDelta, applied: bool) -> ForwardTestVerdict {
     if !applied {
         return ForwardTestVerdict {
@@ -480,5 +736,148 @@ domain = "93.184.216.34"
             ip_version: "ipv4".to_string(),
         };
         assert_eq!(tcp_connect_target(&rule, Duration::from_millis(1)), None);
+    }
+
+    // ============ v0.4.2: nft 规则存在性检测 ============
+
+    /// 单条 protocol=all 的 nat-rule，PREROUTING 使用 `meta l4proto { tcp, udp }`，
+    /// 即使 counter 是 0，detect_rule_in_nft_json 也必须把 nat_rule_v4_found 标 true，
+    /// 且 protocol_tcp_seen + protocol_udp_seen 都为 true。
+    #[test]
+    fn detect_finds_protocol_all_with_zero_counter() {
+        let json = r#"{"nftables":[
+            {"rule":{"family":"ip","table":"self-nat","chain":"PREROUTING","handle":11,
+                "expr":[
+                    {"match":{"left":{"meta":{"key":"l4proto"}},"op":"==","right":{"set":["tcp","udp"]}}},
+                    {"counter":{"packets":0,"bytes":0}},
+                    {"comment":"nat-rule:id=r3"}
+                ]
+            }},
+            {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":12,
+                "expr":[
+                    {"counter":{"packets":0,"bytes":0}},
+                    {"comment":"nat-traffic:id=r3,dir=out"}
+                ]
+            }},
+            {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":13,
+                "expr":[
+                    {"counter":{"packets":0,"bytes":0}},
+                    {"comment":"nat-traffic:id=r3,dir=in"}
+                ]
+            }}
+        ]}"#;
+        let p = detect_rule_in_nft_json(json, "r3").unwrap();
+        assert!(p.nat_rule_v4_found, "PREROUTING comment 必须被识别");
+        assert!(p.forward_out_v4_found);
+        assert!(p.forward_in_v4_found);
+        assert!(p.protocol_tcp_seen, "meta l4proto {{tcp,udp}} 应识别为 tcp");
+        assert!(p.protocol_udp_seen, "meta l4proto {{tcp,udp}} 应识别为 udp");
+
+        // protocol=all + service active + apply ok → Applied
+        let verdict = classify_nft_presence(&p, "ipv4", "all", true, true);
+        assert_eq!(verdict, NftDetectionVerdict::Applied);
+    }
+
+    /// protocol=all 但 nft 里只有 tcp 一条规则 → 部分匹配。
+    #[test]
+    fn detect_protocol_all_but_only_tcp_present_is_partial() {
+        let json = r#"{"nftables":[
+            {"rule":{"family":"ip","table":"self-nat","chain":"PREROUTING","handle":1,
+                "expr":[
+                    {"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":30080}},
+                    {"counter":{"packets":0,"bytes":0}},
+                    {"comment":"nat-rule:id=r0"}
+                ]
+            }},
+            {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":2,
+                "expr":[
+                    {"counter":{"packets":0,"bytes":0}},
+                    {"comment":"nat-traffic:id=r0,dir=out"}
+                ]
+            }},
+            {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":3,
+                "expr":[
+                    {"counter":{"packets":0,"bytes":0}},
+                    {"comment":"nat-traffic:id=r0,dir=in"}
+                ]
+            }}
+        ]}"#;
+        let p = detect_rule_in_nft_json(json, "r0").unwrap();
+        assert!(p.protocol_tcp_seen);
+        assert!(!p.protocol_udp_seen);
+        let verdict = classify_nft_presence(&p, "ipv4", "all", true, true);
+        assert_eq!(verdict, NftDetectionVerdict::Partial);
+    }
+
+    /// 检测器找不到，但 nat.service active + 最近 apply 成功 → Unconfirmed（而不是 NotApplied）。
+    #[test]
+    fn no_match_but_service_and_apply_ok_is_unconfirmed() {
+        let json = r#"{"nftables":[]}"#;
+        let p = detect_rule_in_nft_json(json, "r0").unwrap();
+        let verdict = classify_nft_presence(&p, "ipv4", "tcp", true, true);
+        assert_eq!(verdict, NftDetectionVerdict::Unconfirmed);
+    }
+
+    /// 检测器找不到，nat.service inactive 或最近 apply 失败 → NotApplied。
+    #[test]
+    fn no_match_and_service_inactive_is_not_applied() {
+        let json = r#"{"nftables":[]}"#;
+        let p = detect_rule_in_nft_json(json, "r0").unwrap();
+        assert_eq!(
+            classify_nft_presence(&p, "ipv4", "tcp", false, true),
+            NftDetectionVerdict::NotApplied
+        );
+        assert_eq!(
+            classify_nft_presence(&p, "ipv4", "tcp", true, false),
+            NftDetectionVerdict::NotApplied
+        );
+    }
+
+    /// ip_version=all 但 nft 里只有 IPv4 表 → 部分匹配（v6 缺失）。
+    #[test]
+    fn ip_version_all_with_only_v4_is_partial() {
+        let json = r#"{"nftables":[
+            {"rule":{"family":"ip","table":"self-nat","chain":"PREROUTING","handle":1,
+                "expr":[
+                    {"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":80}},
+                    {"counter":{"packets":0,"bytes":0}},
+                    {"comment":"nat-rule:id=r0"}
+                ]
+            }},
+            {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":2,
+                "expr":[{"counter":{"packets":0,"bytes":0}},{"comment":"nat-traffic:id=r0,dir=out"}]
+            }},
+            {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":3,
+                "expr":[{"counter":{"packets":0,"bytes":0}},{"comment":"nat-traffic:id=r0,dir=in"}]
+            }}
+        ]}"#;
+        let p = detect_rule_in_nft_json(json, "r0").unwrap();
+        assert!(p.nat_rule_v4_found);
+        assert!(!p.nat_rule_v6_found);
+        let verdict = classify_nft_presence(&p, "all", "tcp", true, true);
+        assert_eq!(verdict, NftDetectionVerdict::Partial);
+    }
+
+    /// IP family 完整且 protocol=tcp 命中 → Applied，即使 counter 为 0。
+    #[test]
+    fn applied_with_zero_counter_when_all_pieces_present() {
+        let json = r#"{"nftables":[
+            {"rule":{"family":"ip","table":"self-nat","chain":"PREROUTING","handle":1,
+                "expr":[
+                    {"match":{"left":{"payload":{"protocol":"tcp","field":"dport"}},"op":"==","right":80}},
+                    {"counter":{"packets":0,"bytes":0}},
+                    {"comment":"nat-rule:id=r0"}
+                ]
+            }},
+            {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":2,
+                "expr":[{"counter":{"packets":0,"bytes":0}},{"comment":"nat-traffic:id=r0,dir=out"}]
+            }},
+            {"rule":{"family":"ip","table":"self-filter","chain":"FORWARD","handle":3,
+                "expr":[{"counter":{"packets":0,"bytes":0}},{"comment":"nat-traffic:id=r0,dir=in"}]
+            }}
+        ]}"#;
+        let p = detect_rule_in_nft_json(json, "r0").unwrap();
+        let verdict = classify_nft_presence(&p, "ipv4", "tcp", true, true);
+        assert_eq!(verdict, NftDetectionVerdict::Applied);
     }
 }

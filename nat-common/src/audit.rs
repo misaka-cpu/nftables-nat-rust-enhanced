@@ -75,6 +75,102 @@ fn append_line(path: &str, line: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// 在最近 `tail_limit` 行 audit 日志中查找最后一次 `apply.success` 的时间。
+/// 找不到 → `None`。任何解析失败一律返回 `None`，不让调用方崩。
+pub fn last_apply_success_time(path: &str, tail_limit: usize) -> Option<String> {
+    last_action_time_matching(path, tail_limit, &["apply.success"])
+}
+
+/// 在最近 `tail_limit` 行 audit 日志中查找最后一次 `apply.success` 或 `apply.fail` 的事件，
+/// 返回 `(action, time_rfc3339)`。找不到 → `None`。
+pub fn last_apply_event(path: &str, tail_limit: usize) -> Option<(String, String)> {
+    let lines = read_tail(path, tail_limit);
+    for line in lines.iter().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let action = value.get("action").and_then(Value::as_str).unwrap_or("");
+        if action == "apply.success" || action == "apply.fail" {
+            let time = value
+                .get("time")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            return Some((action.to_string(), time));
+        }
+    }
+    None
+}
+
+fn last_action_time_matching(path: &str, tail_limit: usize, actions: &[&str]) -> Option<String> {
+    let lines = read_tail(path, tail_limit);
+    for line in lines.iter().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let action = value.get("action").and_then(Value::as_str).unwrap_or("");
+        if actions.contains(&action) {
+            return value
+                .get("time")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
+    }
+    None
+}
+
+/// 把一行 audit JSON 转成 CLI 友好的多行文本：
+///
+/// ```text
+/// [2026-05-19 21:49:40 CST] update.start  info
+///   version: latest
+/// ```
+///
+/// - 时间字段按调用方传入的 `format_time` 闭包格式化（CLI 一般传 `format_cli_time_from_rfc3339`），
+///   找不到 / 解析失败时退回原字符串。
+/// - 解析失败的行返回 `"[无法解析] {raw_line}"`，不丢数据。
+/// - `detail` 中的字段每行一条，已经在 [`log_event`] 流程里走过 [`redact`]，
+///   这里再次调用 [`redact`] 作为防御性兜底，避免直接显示文件里残留的明文。
+pub fn format_log_line_for_cli<F>(raw_line: &str, format_time: F) -> String
+where
+    F: Fn(&str) -> String,
+{
+    let value = match serde_json::from_str::<Value>(raw_line) {
+        Ok(v) => v,
+        Err(_) => return format!("[无法解析] {raw_line}"),
+    };
+    let time_raw = value.get("time").and_then(Value::as_str).unwrap_or("");
+    let time = if time_raw.is_empty() {
+        "(无时间)".to_string()
+    } else {
+        format_time(time_raw)
+    };
+    let action = value.get("action").and_then(Value::as_str).unwrap_or("?");
+    let result = value.get("result").and_then(Value::as_str).unwrap_or("?");
+    let mut out = format!("[{time}] {action}  {result}");
+    if let Some(detail) = value.get("detail") {
+        let redacted = redact(detail.clone());
+        if let Value::Object(map) = redacted {
+            for (k, v) in map {
+                out.push('\n');
+                out.push_str(&format!("  {k}: {}", render_detail_value(&v)));
+            }
+        } else if !redacted.is_null() {
+            out.push('\n');
+            out.push_str(&format!("  detail: {}", render_detail_value(&redacted)));
+        }
+    }
+    out
+}
+
+fn render_detail_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// 读取 audit 日志的最近 `limit` 行；用于 CLI 查看。
 /// 文件不存在 / 读失败均返回空 Vec。
 pub fn read_tail(path: &str, limit: usize) -> Vec<String> {
@@ -407,5 +503,85 @@ mod tests {
             "Telegram bot_token regression: {}",
             lines[0]
         );
+    }
+
+    // ============ v0.4.2: format_log_line_for_cli / last_apply_event ============
+
+    #[test]
+    fn format_log_line_renders_time_action_and_indented_detail() {
+        let raw = r#"{"time":"2026-05-19T13:49:40Z","action":"update.start","result":"info","detail":{"version":"latest","trigger":"cli"}}"#;
+        let pretty = format_log_line_for_cli(raw, crate::format_cli_time_from_rfc3339);
+        // 时间应当转成 Asia/Shanghai 21:49:40
+        assert!(
+            pretty.contains("[2026-05-19 21:49:40"),
+            "missing Shanghai time: {pretty}"
+        );
+        assert!(pretty.contains("update.start"));
+        assert!(pretty.contains("info"));
+        // detail 字段应当各自一行，按 kv 缩进
+        assert!(pretty.contains("\n  version: latest"));
+        assert!(pretty.contains("\n  trigger: cli"));
+        // 不允许出现 RFC3339 的 T + 纳秒
+        assert!(!pretty.contains("13:49:40Z"));
+    }
+
+    #[test]
+    fn format_log_line_falls_back_to_raw_on_invalid_json() {
+        let raw = "this is not json";
+        let pretty = format_log_line_for_cli(raw, crate::format_cli_time_from_rfc3339);
+        assert!(pretty.starts_with("[无法解析] "));
+        assert!(pretty.contains(raw));
+    }
+
+    #[test]
+    fn format_log_line_double_redacts_known_secret_keys() {
+        let raw = r#"{"time":"2026-05-19T13:49:40Z","action":"telegram.config.update","result":"ok","detail":{"bot_token":"LEAKME_FORMAT","chat_id":"x"}}"#;
+        let pretty = format_log_line_for_cli(raw, crate::format_cli_time_from_rfc3339);
+        assert!(
+            !pretty.contains("LEAKME_FORMAT"),
+            "CLI 格式化也必须脱敏 bot_token: {pretty}"
+        );
+    }
+
+    #[test]
+    fn last_apply_event_finds_most_recent() {
+        let path = tempfile("last-apply");
+        let cfg = AuditConfig {
+            enabled: true,
+            file: path.clone(),
+        };
+        log_event(
+            &cfg,
+            "apply.fail",
+            AuditResult::Fail,
+            json!({"error": "boom"}),
+        );
+        log_event(&cfg, "rule.add", AuditResult::Ok, json!({"index": 1}));
+        log_event(
+            &cfg,
+            "apply.success",
+            AuditResult::Ok,
+            json!({"script_path": "/etc/nftables-nat/nat-diy.nft"}),
+        );
+        let (action, time) = last_apply_event(&path, 50).unwrap();
+        assert_eq!(action, "apply.success");
+        assert!(!time.is_empty());
+        assert_eq!(
+            last_apply_success_time(&path, 50).unwrap(),
+            time,
+            "last_apply_success_time 应返回与 last_apply_event 相同的时间"
+        );
+    }
+
+    #[test]
+    fn last_apply_event_returns_none_when_no_match() {
+        let path = tempfile("no-apply");
+        let cfg = AuditConfig {
+            enabled: true,
+            file: path.clone(),
+        };
+        log_event(&cfg, "rule.add", AuditResult::Ok, json!({}));
+        assert!(last_apply_event(&path, 50).is_none());
+        assert!(last_apply_success_time(&path, 50).is_none());
     }
 }

@@ -18,28 +18,104 @@ pub fn build_version() -> &'static str {
     option_env!("NAT_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
-/// CLI 默认展示时区偏移：Asia/Shanghai = UTC+8（无 DST）
-pub const CLI_DISPLAY_TZ_LABEL: &str = "Asia/Shanghai";
-pub const CLI_DISPLAY_TZ_SUFFIX: &str = "CST";
-pub const CLI_DISPLAY_TZ_OFFSET_SECS: i32 = 8 * 3600;
+/// CLI 默认展示时区：Asia/Shanghai（IANA 名，处理潜在 DST 由 chrono-tz 兜底）。
+pub const CLI_DISPLAY_TZ_DEFAULT: &str = "Asia/Shanghai";
+/// CLI 默认时间格式：24 小时制 + 时区缩写（chrono 的 `%Z`），无 T、无纳秒。
+pub const CLI_DISPLAY_TIME_FORMAT_DEFAULT: &str = "%Y-%m-%d %H:%M:%S %Z";
 
-/// 把任意时区的 `DateTime` 转换为 CLI 默认展示格式：
-/// `YYYY-MM-DD HH:MM:SS CST`（24 小时制，不带 T，不带纳秒，按 Asia/Shanghai 显示）。
+/// 用户可在 `[ui]` 节配置 CLI 展示时区与时间格式。
 ///
-/// JSON 状态文件 / audit log 内部仍以 UTC RFC3339 存储，方便机器解析；此函数只用于 CLI 展示。
-pub fn format_cli_time<Tz: chrono::TimeZone>(dt: chrono::DateTime<Tz>) -> String {
-    let offset = chrono::FixedOffset::east_opt(CLI_DISPLAY_TZ_OFFSET_SECS)
-        .or_else(|| chrono::FixedOffset::east_opt(0))
-        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("UTC offset 0 is always valid"));
-    dt.with_timezone(&offset)
-        .format(&format!("%Y-%m-%d %H:%M:%S {CLI_DISPLAY_TZ_SUFFIX}"))
-        .to_string()
+/// - `timezone`：IANA 时区名（"Asia/Shanghai" / "UTC" / "America/Chicago" 等）。
+///   非法值会在 `from_toml_str → validate` 阶段被拒绝；不会"隐式回退"。
+/// - `time_format`：chrono strftime 字符串，默认 `"%Y-%m-%d %H:%M:%S %Z"`。
+/// - 仅影响 CLI 展示，不改变系统时区，也不影响 audit/last-good/quota 等 JSON 内部存储（仍 UTC RFC3339）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiConfig {
+    #[serde(default = "default_ui_timezone")]
+    pub timezone: String,
+    #[serde(default = "default_ui_time_format")]
+    pub time_format: String,
 }
 
-/// 把可能为 RFC3339 字符串的时间标签转换成 CLI 展示格式；解析失败则原样返回，避免破坏未知格式。
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            timezone: default_ui_timezone(),
+            time_format: default_ui_time_format(),
+        }
+    }
+}
+
+impl UiConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_iana_timezone(&self.timezone)?;
+        if self.time_format.trim().is_empty() {
+            return Err("ui.time_format 不能为空".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn default_ui_timezone() -> String {
+    CLI_DISPLAY_TZ_DEFAULT.to_string()
+}
+
+fn default_ui_time_format() -> String {
+    CLI_DISPLAY_TIME_FORMAT_DEFAULT.to_string()
+}
+
+/// 校验 IANA 时区名是否合法（chrono-tz 数据库可解析）。
+pub fn validate_iana_timezone(name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("ui.timezone 不能为空".to_string());
+    }
+    if trimmed.parse::<chrono_tz::Tz>().is_err() {
+        return Err(format!(
+            "ui.timezone 不是合法的 IANA 时区名: {trimmed}（例如 Asia/Shanghai / UTC / America/Chicago）"
+        ));
+    }
+    Ok(())
+}
+
+/// 把任意时区的 `DateTime` 按 CLI 默认设置（Asia/Shanghai，24 小时制）转换为字符串。
+///
+/// 这是历史 API（v0.4.1），保留向后兼容；新代码推荐 [`format_cli_time_with`]。
+pub fn format_cli_time<Tz: chrono::TimeZone>(dt: chrono::DateTime<Tz>) -> String {
+    format_cli_time_with(dt, &UiConfig::default())
+}
+
+/// 用给定的 [`UiConfig`] 格式化时间。非法配置（应已被 [`UiConfig::validate`] 拦截）
+/// 退回 Asia/Shanghai + 默认格式，永不 panic。
+pub fn format_cli_time_with<Tz: chrono::TimeZone>(
+    dt: chrono::DateTime<Tz>,
+    ui: &UiConfig,
+) -> String {
+    let tz: chrono_tz::Tz = ui
+        .timezone
+        .parse()
+        .or_else(|_| CLI_DISPLAY_TZ_DEFAULT.parse::<chrono_tz::Tz>())
+        .unwrap_or(chrono_tz::UTC);
+    let fmt = if ui.time_format.trim().is_empty() {
+        CLI_DISPLAY_TIME_FORMAT_DEFAULT
+    } else {
+        ui.time_format.as_str()
+    };
+    dt.with_timezone(&tz).format(fmt).to_string()
+}
+
+/// 把可能为 RFC3339 字符串的时间标签转换成 CLI 展示格式（默认 UI 配置）。解析失败则原样返回。
 pub fn format_cli_time_from_rfc3339(value: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(value) {
         Ok(dt) => format_cli_time(dt),
+        Err(_) => value.to_string(),
+    }
+}
+
+/// 用给定 [`UiConfig`] 把 RFC3339 字符串转 CLI 展示。
+pub fn format_cli_time_from_rfc3339_with(value: &str, ui: &UiConfig) -> String {
+    match chrono::DateTime::parse_from_rfc3339(value) {
+        Ok(dt) => format_cli_time_with(dt, ui),
         Err(_) => value.to_string(),
     }
 }
@@ -293,6 +369,8 @@ pub struct TomlConfig {
     pub audit: AuditConfig,
     #[serde(default)]
     pub quota: QuotaConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1354,6 +1432,7 @@ impl TomlConfig {
         self.last_good.validate()?;
         self.audit.validate()?;
         self.quota.validate()?;
+        self.ui.validate()?;
         for (idx, rule) in self.rules.iter().enumerate() {
             rule.validate()
                 .map_err(|e| format!("规则 {} 验证失败: {}", idx + 1, e))?;
@@ -1812,6 +1891,99 @@ mod tests {
             format_cli_time_from_rfc3339("not-a-timestamp"),
             "not-a-timestamp"
         );
+    }
+
+    // ============ v0.4.2: UiConfig + format_cli_time_with ============
+
+    #[test]
+    fn ui_config_default_is_asia_shanghai_24h() {
+        let ui = UiConfig::default();
+        assert_eq!(ui.timezone, "Asia/Shanghai");
+        assert!(ui.time_format.contains("%H:%M:%S"));
+        ui.validate().unwrap();
+    }
+
+    #[test]
+    fn ui_config_validate_rejects_invalid_timezone() {
+        let ui = UiConfig {
+            timezone: "Invalid/Zone".to_string(),
+            time_format: "%Y-%m-%d %H:%M:%S %Z".to_string(),
+        };
+        assert!(ui.validate().is_err());
+        assert!(validate_iana_timezone("Invalid/Zone").is_err());
+        assert!(validate_iana_timezone("").is_err());
+    }
+
+    #[test]
+    fn ui_config_validate_accepts_common_iana_names() {
+        for tz in ["Asia/Shanghai", "UTC", "America/Chicago", "Europe/Paris"] {
+            validate_iana_timezone(tz).unwrap_or_else(|e| panic!("{tz} should be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn format_cli_time_with_utc_renders_utc_clock() {
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-05-19T12:02:58Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ui = UiConfig {
+            timezone: "UTC".to_string(),
+            time_format: "%Y-%m-%d %H:%M:%S %Z".to_string(),
+        };
+        let rendered = format_cli_time_with(utc, &ui);
+        assert!(rendered.starts_with("2026-05-19 12:02:58"));
+        assert!(rendered.contains("UTC"));
+    }
+
+    #[test]
+    fn format_cli_time_with_america_chicago_applies_dst_offset() {
+        // 2026-07-15 = CDT（夏令时，UTC-5）。chrono-tz 必须正确处理。
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-07-15T17:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ui = UiConfig {
+            timezone: "America/Chicago".to_string(),
+            time_format: "%Y-%m-%d %H:%M:%S %Z".to_string(),
+        };
+        let rendered = format_cli_time_with(utc, &ui);
+        // Chicago CDT = UTC-5：17:00 → 12:00
+        assert!(
+            rendered.starts_with("2026-07-15 12:00:00"),
+            "got {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_cli_time_default_still_returns_shanghai() {
+        // 回归保护：默认 UiConfig 渲染仍是 Asia/Shanghai +8
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-05-19T12:02:58Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(format_cli_time(utc), "2026-05-19 20:02:58 CST");
+    }
+
+    #[test]
+    fn from_toml_str_rejects_invalid_ui_timezone() {
+        let body = r#"
+[ui]
+timezone = "Mars/Olympus"
+"#;
+        let err = TomlConfig::from_toml_str(body).unwrap_err();
+        assert!(
+            err.contains("ui.timezone"),
+            "expected ui.timezone error: {err}"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_accepts_ui_section() {
+        let body = r#"
+[ui]
+timezone = "UTC"
+time_format = "%Y-%m-%d %H:%M:%S %Z"
+"#;
+        let cfg = TomlConfig::from_toml_str(body).unwrap();
+        assert_eq!(cfg.ui.timezone, "UTC");
     }
 
     #[test]

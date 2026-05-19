@@ -980,6 +980,7 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
         last_good: Default::default(),
         audit: Default::default(),
         quota: Default::default(),
+        ui: Default::default(),
     };
 
     let toml_str = example_config
