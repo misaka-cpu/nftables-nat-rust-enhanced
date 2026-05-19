@@ -10,7 +10,8 @@ use chrono::Local;
 use clap::Parser;
 use log::{error, info, warn};
 use nat_common::{
-    Args, DdnsConfig, DnsConfig, StatsConfig, TelegramConfig, TomlConfig, logger,
+    Args, DdnsConfig, DnsConfig, EgressControlConfig, GeoIpConfig, StatsConfig, TelegramConfig,
+    TomlConfig, geoip, logger,
     stats::{self as traffic_stats, StatsState},
 };
 use std::collections::HashMap;
@@ -138,6 +139,8 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
         warn_short_ddns_interval_once(refresh_interval, &mut last_short_ddns_warn);
         let dns_config = runtime_config.dns;
         let access_config = runtime_config.access_control;
+        let geoip_config = runtime_config.geoip;
+        let egress_config = runtime_config.egress_control;
         let rule_labels = runtime_config.rule_labels;
         let stats_config = runtime_config.stats;
         let telegram_config = runtime_config.telegram;
@@ -170,7 +173,13 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
             if nat_cells.is_empty() {
                 info!("no rules configured, waiting for config changes");
             }
-            let script = match build_new_script(&nat_cells, &dns_config, &access_config) {
+            let script = match build_new_script(
+                &nat_cells,
+                &dns_config,
+                &access_config,
+                &geoip_config,
+                &egress_config,
+            ) {
                 Ok(script) => script,
                 Err(e) => {
                     error!(
@@ -234,6 +243,8 @@ pub(crate) fn refresh_once(args: &Args) -> Result<(), io::Error> {
         &nat_cells,
         &runtime_config.dns,
         &runtime_config.access_control,
+        &runtime_config.geoip,
+        &runtime_config.egress_control,
     )?;
     prepare::check_and_prepare()?;
     let mut file = File::create(FILE_NAME_SCRIPT)?;
@@ -245,34 +256,35 @@ struct RuntimeConfig {
     dns: DnsConfig,
     ddns: DdnsConfig,
     access_control: nat_common::AccessControlConfig,
+    geoip: GeoIpConfig,
+    egress_control: EgressControlConfig,
     stats: StatsConfig,
     telegram: TelegramConfig,
     rule_labels: HashMap<String, String>,
 }
 
+fn default_runtime_config() -> RuntimeConfig {
+    RuntimeConfig {
+        dns: DnsConfig::default(),
+        ddns: DdnsConfig::default(),
+        access_control: Default::default(),
+        geoip: GeoIpConfig::default(),
+        egress_control: EgressControlConfig::default(),
+        stats: StatsConfig::default(),
+        telegram: TelegramConfig::default(),
+        rule_labels: HashMap::new(),
+    }
+}
+
 fn load_runtime_config(args: &Args) -> RuntimeConfig {
     let Some(toml_path) = &args.toml else {
-        return RuntimeConfig {
-            dns: DnsConfig::default(),
-            ddns: DdnsConfig::default(),
-            access_control: Default::default(),
-            stats: StatsConfig::default(),
-            telegram: TelegramConfig::default(),
-            rule_labels: HashMap::new(),
-        };
+        return default_runtime_config();
     };
     let content = match fs::read_to_string(toml_path) {
         Ok(content) => content,
         Err(e) => {
             warn!("读取 TOML 运行配置失败，使用默认 DDNS/统计/Telegram 配置: {e:?}");
-            return RuntimeConfig {
-                dns: DnsConfig::default(),
-                ddns: DdnsConfig::default(),
-                access_control: Default::default(),
-                stats: StatsConfig::default(),
-                telegram: TelegramConfig::default(),
-                rule_labels: HashMap::new(),
-            };
+            return default_runtime_config();
         }
     };
     match TomlConfig::from_toml_str(&content) {
@@ -282,6 +294,8 @@ fn load_runtime_config(args: &Args) -> RuntimeConfig {
                 dns: config.dns,
                 ddns: config.ddns,
                 access_control: config.access_control,
+                geoip: config.geoip,
+                egress_control: config.egress_control,
                 stats: config.stats,
                 telegram: config.telegram,
                 rule_labels,
@@ -289,14 +303,7 @@ fn load_runtime_config(args: &Args) -> RuntimeConfig {
         }
         Err(e) => {
             warn!("解析 TOML 运行配置失败，使用默认 DDNS/统计/Telegram 配置: {e}");
-            RuntimeConfig {
-                dns: DnsConfig::default(),
-                ddns: DdnsConfig::default(),
-                access_control: Default::default(),
-                stats: StatsConfig::default(),
-                telegram: TelegramConfig::default(),
-                rule_labels: HashMap::new(),
-            }
+            default_runtime_config()
         }
     }
 }
@@ -482,6 +489,8 @@ fn build_new_script(
     nat_cells: &[config::RuntimeCell],
     dns_config: &DnsConfig,
     access_config: &nat_common::AccessControlConfig,
+    geoip_config: &GeoIpConfig,
+    egress_config: &EgressControlConfig,
 ) -> Result<String, io::Error> {
     //脚本的前缀 - 创建IPv4和IPv6表
     let mut script = String::from(
@@ -517,7 +526,41 @@ fn build_new_script(
         ",
     );
 
+    // egress_control 启用但 allowed_target_cidrs 为空：所有转发规则都会被跳过
+    if egress_config.enabled && egress_config.allowed_target_cidrs.is_empty() {
+        warn!("egress_control 已启用但 allowed_target_cidrs 为空，所有转发目标都会被跳过");
+    }
+
+    // GeoIP 准备：仅当启用且有任意一个子开关打开
+    let geoip_active =
+        geoip_config.enabled && (geoip_config.forward.enabled || geoip_config.ssh.enabled);
+    let cn4_set_definition = if geoip_active {
+        match geoip::read_and_render_cn4_set(&geoip_config.cn4_file) {
+            Some(rendered) => Some(rendered),
+            None => {
+                warn!(
+                    "geoip 已启用但 cn4_file={} 不存在或为空，跳过 GeoIP 限制规则生成。请通过 CLI 下载 / 更新 CN IP set。",
+                    geoip_config.cn4_file
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(set_def) = &cn4_set_definition {
+        script.push_str("\n# GeoIP cn4 set\n");
+        script.push_str(set_def);
+        script.push_str(&build_geoip_prerouting_chain());
+        // ssh / forward 规则
+        if geoip_config.ssh.enabled {
+            script.push_str(&build_geoip_ssh_rules(geoip_config));
+        }
+    }
+
     let mut rule_index = 0usize;
+    let mut forward_rule_summaries: Vec<ForwardRuleSummary> = Vec::new();
     for x in nat_cells.iter() {
         let index = match x {
             config::RuntimeCell::Rule(_) => {
@@ -527,15 +570,177 @@ fn build_new_script(
             }
             config::RuntimeCell::Comment(_) => None,
         };
-        match x.build_with_rule_index(index, dns_config, access_config) {
-            Ok(rule) => script += &rule,
+        match x.build_with_rule_index(index, dns_config, access_config, egress_config) {
+            Ok(rule) => {
+                if !rule.is_empty()
+                    && let Some(summary) = forward_summary_from(x, index)
+                {
+                    forward_rule_summaries.push(summary);
+                }
+                script += &rule;
+            }
             Err(e) => {
                 log::error!("Failed to build rule for {x:?}: {e}");
                 return Err(e);
             }
         }
     }
+
+    if cn4_set_definition.is_some()
+        && geoip_config.forward.enabled
+        && !forward_rule_summaries.is_empty()
+    {
+        script.push_str(&build_geoip_forward_rules(
+            geoip_config,
+            &forward_rule_summaries,
+        ));
+    }
+
     Ok(script)
+}
+
+#[derive(Debug, Clone)]
+struct ForwardRuleSummary {
+    rule_id: String,
+    sport_expr: String,
+    protocol: nat_common::Protocol,
+}
+
+fn forward_summary_from(
+    cell: &config::RuntimeCell,
+    index: Option<usize>,
+) -> Option<ForwardRuleSummary> {
+    let rule_id = format!("r{}", index?);
+    match cell {
+        config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            sport,
+            protocol,
+            ip_version,
+            ..
+        }) => {
+            if !matches!(
+                ip_version,
+                nat_common::IpVersion::V4 | nat_common::IpVersion::All
+            ) {
+                return None;
+            }
+            Some(ForwardRuleSummary {
+                rule_id,
+                sport_expr: sport.to_string(),
+                protocol: *protocol,
+            })
+        }
+        config::RuntimeCell::Rule(nat_common::NftCell::Range {
+            port_start,
+            port_end,
+            protocol,
+            ip_version,
+            ..
+        }) => {
+            if !matches!(
+                ip_version,
+                nat_common::IpVersion::V4 | nat_common::IpVersion::All
+            ) {
+                return None;
+            }
+            Some(ForwardRuleSummary {
+                rule_id,
+                sport_expr: format!("{port_start}-{port_end}"),
+                protocol: *protocol,
+            })
+        }
+        config::RuntimeCell::Rule(nat_common::NftCell::Redirect {
+            src_port,
+            src_port_end,
+            protocol,
+            ip_version,
+            ..
+        }) => {
+            if !matches!(
+                ip_version,
+                nat_common::IpVersion::V4 | nat_common::IpVersion::All
+            ) {
+                return None;
+            }
+            let sport_expr = src_port_end
+                .map(|end| format!("{src_port}-{end}"))
+                .unwrap_or_else(|| src_port.to_string());
+            Some(ForwardRuleSummary {
+                rule_id,
+                sport_expr,
+                protocol: *protocol,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn build_geoip_prerouting_chain() -> String {
+    // 单独的 filter 链，hook prerouting，优先级在 nat 之前 (-200 < -110)
+    // accept verdict 不阻断 nat PREROUTING，drop verdict 拦截非允许来源
+    String::from(
+        "\n# GeoIP prerouting filter chain (IPv4 only, first version)\n\
+         add chain ip self-filter GEOIP_PREROUTING { type filter hook prerouting priority -200 ; }\n\
+         add rule ip self-filter GEOIP_PREROUTING ct state established,related counter accept comment \"geoip-forward:state=est\"\n",
+    )
+}
+
+fn nft_proto_token(protocol: nat_common::Protocol) -> &'static str {
+    match protocol {
+        nat_common::Protocol::All => "meta l4proto { tcp, udp } th",
+        nat_common::Protocol::Tcp => "tcp",
+        nat_common::Protocol::Udp => "udp",
+    }
+}
+
+fn build_geoip_forward_rules(
+    geoip_config: &GeoIpConfig,
+    summaries: &[ForwardRuleSummary],
+) -> String {
+    let mut out = String::from("\n# GeoIP forward port restriction (allow-cn)\n");
+    let lan = geoip_config.lan_ipv4_cidrs();
+    let allow_lan = geoip_config.allow_lan && !lan.is_empty();
+    for summary in summaries {
+        let proto = nft_proto_token(summary.protocol);
+        let id = &summary.rule_id;
+        let sport = &summary.sport_expr;
+        out.push_str(&format!(
+            "add rule ip self-filter GEOIP_PREROUTING ip saddr @cn4 {proto} dport {sport} counter accept comment \"geoip-forward:id={id},mode=allow-cn\"\n"
+        ));
+        if allow_lan {
+            let lan_list = lan.join(", ");
+            out.push_str(&format!(
+                "add rule ip self-filter GEOIP_PREROUTING ip saddr {{ {lan_list} }} {proto} dport {sport} counter accept comment \"geoip-forward:id={id},mode=allow-lan\"\n"
+            ));
+        }
+        out.push_str(&format!(
+            "add rule ip self-filter GEOIP_PREROUTING {proto} dport {sport} counter drop comment \"geoip-forward:id={id},mode=default-drop\"\n"
+        ));
+    }
+    out
+}
+
+fn build_geoip_ssh_rules(geoip_config: &GeoIpConfig) -> String {
+    let port = geoip_config.ssh.port;
+    let lan = geoip_config.lan_ipv4_cidrs();
+    let allow_lan = matches!(geoip_config.ssh.mode.as_str(), "allow-cn-and-lan")
+        && geoip_config.allow_lan
+        && !lan.is_empty();
+    let mut out = String::from("\n# GeoIP SSH input restriction (IPv4, allow-cn[-and-lan])\n");
+    out.push_str("add rule ip self-filter INPUT ct state established,related counter accept comment \"geoip-ssh:state=est\"\n");
+    out.push_str(&format!(
+        "add rule ip self-filter INPUT ip saddr @cn4 tcp dport {port} counter accept comment \"geoip-ssh:mode=allow-cn\"\n"
+    ));
+    if allow_lan {
+        let lan_list = lan.join(", ");
+        out.push_str(&format!(
+            "add rule ip self-filter INPUT ip saddr {{ {lan_list} }} tcp dport {port} counter accept comment \"geoip-ssh:mode=allow-lan\"\n"
+        ));
+    }
+    out.push_str(&format!(
+        "add rule ip self-filter INPUT tcp dport {port} counter drop comment \"geoip-ssh:mode=default-drop\"\n"
+    ));
+    out
 }
 
 fn apply_nft_script(script_path: &str) -> Result<(), io::Error> {
@@ -1073,7 +1278,13 @@ refresh_interval_seconds = 123
             ip_version: nat_common::IpVersion::V4,
             comment: Some("fake-ip-test".to_string()),
         })];
-        let result = build_new_script(&cells, &DnsConfig::default(), &Default::default());
+        let result = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert!(result.is_err());
         assert!(
@@ -1099,7 +1310,14 @@ refresh_interval_seconds = 123
             mode: nat_common::AccessControlMode::Whitelist,
             entries: vec!["1.2.3.4".to_string(), "5.6.7.0/24".to_string()],
         };
-        let script = build_new_script(&cells, &DnsConfig::default(), &access).unwrap();
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &access,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert!(script.contains("ip saddr { 1.2.3.4, 5.6.7.0/24 } tcp dport 30080 counter dnat"));
         assert!(!script.contains(" counter drop "));
     }
@@ -1119,7 +1337,14 @@ refresh_interval_seconds = 123
             mode: nat_common::AccessControlMode::Blacklist,
             entries: vec!["8.8.8.8".to_string(), "9.9.9.0/24".to_string()],
         };
-        let script = build_new_script(&cells, &DnsConfig::default(), &access).unwrap();
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &access,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert!(script.contains("ip saddr { 8.8.8.8, 9.9.9.0/24 } tcp dport 30080 counter drop comment \"nat-access:id=r0,mode=blacklist\""));
         assert!(script.contains("tcp dport 30080 counter dnat"));
     }
@@ -1139,9 +1364,473 @@ refresh_interval_seconds = 123
             mode: nat_common::AccessControlMode::Whitelist,
             entries: vec!["2001:db8::/64".to_string()],
         };
-        let script = build_new_script(&cells, &DnsConfig::default(), &access).unwrap();
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &access,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert!(script.contains("ip6 saddr { 2001:db8::/64 } meta l4proto { tcp, udp } th dport 30000-30010 counter dnat"));
         assert!(!script.contains("flush ruleset"));
+    }
+
+    fn write_temp_cn4_file(name: &str, content: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nat-geoip-test-{name}-{}-{}",
+            std::process::id(),
+            Local::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cn4.nft");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn sample_cn4_content() -> &'static str {
+        // 几个 IPv4 CIDR，足以触发 set 渲染
+        "# alecthw/chnlist cn4 sample\n1.0.1.0/24\n1.0.2.0/23\n223.255.252.0/24\n"
+    }
+
+    #[test]
+    fn geoip_disabled_produces_no_geoip_rules() {
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let geoip_off = GeoIpConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &geoip_off,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!script.contains("GEOIP_PREROUTING"));
+        assert!(!script.contains("geoip-forward"));
+        assert!(!script.contains("geoip-ssh"));
+        assert!(!script.contains("@cn4"));
+    }
+
+    #[test]
+    fn geoip_enabled_but_cn4_missing_skips_rules_with_warning() {
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let geoip = GeoIpConfig {
+            enabled: true,
+            forward: nat_common::GeoIpForwardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            cn4_file: "/nonexistent/path/cn4.nft".to_string(),
+            ..Default::default()
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &geoip,
+            &Default::default(),
+        )
+        .unwrap();
+        // cn4 缺失，不应包含 @cn4 set 引用
+        assert!(!script.contains("@cn4"));
+        assert!(!script.contains("GEOIP_PREROUTING"));
+        // 转发规则正常生成
+        assert!(script.contains("tcp dport 30080 counter dnat"));
+        assert!(!script.contains("flush ruleset"));
+    }
+
+    #[test]
+    fn geoip_forward_emits_cn4_set_and_drop_rules() {
+        let cn4 = write_temp_cn4_file("forward-on", sample_cn4_content());
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let geoip = GeoIpConfig {
+            enabled: true,
+            forward: nat_common::GeoIpForwardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            cn4_file: cn4.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &geoip,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(script.contains("add set ip self-filter cn4"));
+        assert!(script.contains("1.0.1.0/24"));
+        assert!(script.contains("add chain ip self-filter GEOIP_PREROUTING"));
+        assert!(script.contains("ip saddr @cn4 tcp dport 30080 counter accept"));
+        assert!(script.contains("geoip-forward:id=r0,mode=allow-cn"));
+        assert!(script.contains("tcp dport 30080 counter drop"));
+        // 默认 allow_lan=true 也产生 LAN 允许规则
+        assert!(script.contains("geoip-forward:id=r0,mode=allow-lan"));
+        assert!(script.contains("10.0.0.0/8"));
+        assert!(!script.contains("flush ruleset"));
+        let _ = fs::remove_dir_all(cn4.parent().unwrap());
+    }
+
+    #[test]
+    fn geoip_forward_skips_disabled_rules() {
+        let cn4 = write_temp_cn4_file("forward-skip-disabled", sample_cn4_content());
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        // disabled 规则在 read_toml_config 中已经过滤掉，所以 build_new_script 看不到。
+        // 但这里我们直接传入只包含 enabled=true 的规则集合，验证只有它生成 GeoIP 规则。
+        let geoip = GeoIpConfig {
+            enabled: true,
+            forward: nat_common::GeoIpForwardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            cn4_file: cn4.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &geoip,
+            &Default::default(),
+        )
+        .unwrap();
+        // 只有 r0 的规则
+        assert!(script.contains("geoip-forward:id=r0,mode=allow-cn"));
+        assert!(!script.contains("geoip-forward:id=r1"));
+        let _ = fs::remove_dir_all(cn4.parent().unwrap());
+    }
+
+    #[test]
+    fn geoip_ssh_default_disabled_emits_no_ssh_rules() {
+        let cn4 = write_temp_cn4_file("ssh-default-off", sample_cn4_content());
+        let cells: Vec<config::RuntimeCell> = Vec::new();
+        let geoip = GeoIpConfig {
+            enabled: true,
+            cn4_file: cn4.to_string_lossy().to_string(),
+            forward: nat_common::GeoIpForwardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!geoip.ssh.enabled);
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &geoip,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!script.contains("geoip-ssh"));
+        let _ = fs::remove_dir_all(cn4.parent().unwrap());
+    }
+
+    #[test]
+    fn geoip_ssh_restricts_only_configured_ssh_port_with_lan() {
+        let cn4 = write_temp_cn4_file("ssh-port", sample_cn4_content());
+        let cells: Vec<config::RuntimeCell> = Vec::new();
+        let geoip = GeoIpConfig {
+            enabled: true,
+            allow_lan: true,
+            cn4_file: cn4.to_string_lossy().to_string(),
+            ssh: nat_common::GeoIpSshConfig {
+                enabled: true,
+                port: 2222,
+                mode: "allow-cn-and-lan".to_string(),
+            },
+            ..Default::default()
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &geoip,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(script.contains("tcp dport 2222 counter accept"));
+        assert!(script.contains("geoip-ssh:mode=allow-cn"));
+        assert!(script.contains("geoip-ssh:mode=allow-lan"));
+        assert!(script.contains("10.0.0.0/8"));
+        assert!(script.contains("tcp dport 2222 counter drop"));
+        // 不应限制其他端口
+        assert!(!script.contains("tcp dport 22 counter drop"));
+        let _ = fs::remove_dir_all(cn4.parent().unwrap());
+    }
+
+    #[test]
+    fn egress_control_default_disabled_does_not_filter() {
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "8.8.8.8".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let egress = nat_common::EgressControlConfig::default();
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &egress,
+        )
+        .unwrap();
+        assert!(script.contains("tcp dport 30080 counter dnat to 8.8.8.8:80"));
+    }
+
+    #[test]
+    fn egress_control_empty_allowed_skips_all_forwards() {
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "8.8.8.8".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let egress = nat_common::EgressControlConfig {
+            enabled: true,
+            mode: "allow-targets".to_string(),
+            allowed_target_cidrs: Vec::new(),
+            comment: None,
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &egress,
+        )
+        .unwrap();
+        assert!(!script.contains("counter dnat to 8.8.8.8"));
+        // 基础表结构仍然存在
+        assert!(script.contains("add table ip self-nat"));
+    }
+
+    #[test]
+    fn egress_control_skips_targets_not_in_allowed_cidrs() {
+        let cells = vec![
+            config::RuntimeCell::Rule(nat_common::NftCell::Single {
+                enabled: true,
+                sport: 30080,
+                dport: 80,
+                domain: "8.8.8.8".to_string(),
+                protocol: nat_common::Protocol::Tcp,
+                ip_version: nat_common::IpVersion::V4,
+                comment: None,
+            }),
+            config::RuntimeCell::Rule(nat_common::NftCell::Single {
+                enabled: true,
+                sport: 30081,
+                dport: 80,
+                domain: "10.100.0.10".to_string(),
+                protocol: nat_common::Protocol::Tcp,
+                ip_version: nat_common::IpVersion::V4,
+                comment: None,
+            }),
+        ];
+        let egress = nat_common::EgressControlConfig {
+            enabled: true,
+            mode: "allow-targets".to_string(),
+            allowed_target_cidrs: vec!["10.100.0.0/24".to_string()],
+            comment: None,
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &egress,
+        )
+        .unwrap();
+        // 8.8.8.8 不在 allowed_target_cidrs 内，被跳过
+        assert!(!script.contains("counter dnat to 8.8.8.8"));
+        // 10.100.0.10 在 allowed_target_cidrs 内，正常生成
+        assert!(script.contains("counter dnat to 10.100.0.10:80"));
+    }
+
+    #[test]
+    fn egress_control_uses_resolved_ip_for_ip_literal_domain() {
+        // 使用 IPv4 字面量作为 domain：build_with_rule_index 内部走
+        // ip::remote_ip_with_dns 的 "直接解析为 IP" 分支
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "172.31.8.5".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let egress = nat_common::EgressControlConfig {
+            enabled: true,
+            mode: "allow-targets".to_string(),
+            allowed_target_cidrs: vec!["172.31.8.0/24".to_string()],
+            comment: None,
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &egress,
+        )
+        .unwrap();
+        assert!(script.contains("counter dnat to 172.31.8.5:80"));
+    }
+
+    #[test]
+    fn never_emits_flush_ruleset_in_any_geoip_path() {
+        let cn4 = write_temp_cn4_file("no-flush", sample_cn4_content());
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let geoip = GeoIpConfig {
+            enabled: true,
+            cn4_file: cn4.to_string_lossy().to_string(),
+            forward: nat_common::GeoIpForwardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ssh: nat_common::GeoIpSshConfig {
+                enabled: true,
+                port: 22,
+                mode: "allow-cn-and-lan".to_string(),
+            },
+            ..Default::default()
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &geoip,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!script.contains("flush ruleset"));
+        let _ = fs::remove_dir_all(cn4.parent().unwrap());
+    }
+
+    #[test]
+    fn never_touches_tables_outside_self_nat_and_self_filter() {
+        let cn4 = write_temp_cn4_file("only-self-tables", sample_cn4_content());
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "10.100.0.10".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+        })];
+        let geoip = GeoIpConfig {
+            enabled: true,
+            cn4_file: cn4.to_string_lossy().to_string(),
+            forward: nat_common::GeoIpForwardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ssh: nat_common::GeoIpSshConfig {
+                enabled: true,
+                port: 22,
+                mode: "allow-cn-and-lan".to_string(),
+            },
+            ..Default::default()
+        };
+        let egress = nat_common::EgressControlConfig {
+            enabled: true,
+            mode: "allow-targets".to_string(),
+            allowed_target_cidrs: vec!["10.100.0.0/24".to_string()],
+            comment: None,
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &geoip,
+            &egress,
+        )
+        .unwrap();
+        let valid_family = |f: &str| matches!(f, "ip" | "ip6");
+        let valid_table = |t: &str| matches!(t, "self-nat" | "self-filter");
+        for line in script.lines() {
+            // 每一行 "add chain"/"add table"/"add rule"/"add set"/"add element"
+            // 涉及到的 table 必须是 self-nat / self-filter / IPv6 对应表
+            if let Some(rest) = line.strip_prefix("add rule ") {
+                let words: Vec<&str> = rest.split_whitespace().collect();
+                if let (Some(family), Some(table)) = (words.first(), words.get(1)) {
+                    assert!(
+                        valid_family(family) && valid_table(table),
+                        "rule writes to unexpected table: {line}"
+                    );
+                }
+            } else if let Some(rest) = line.strip_prefix("add chain ") {
+                let words: Vec<&str> = rest.split_whitespace().collect();
+                if let (Some(family), Some(table)) = (words.first(), words.get(1)) {
+                    assert!(
+                        valid_family(family) && valid_table(table),
+                        "chain writes to unexpected table: {line}"
+                    );
+                }
+            } else if line.starts_with("add set ") || line.starts_with("add element ") {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                if let (Some(family), Some(table)) = (words.get(2), words.get(3)) {
+                    assert!(
+                        valid_family(family) && valid_table(table),
+                        "set/element writes to unexpected table: {line}"
+                    );
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(cn4.parent().unwrap());
     }
 
     #[test]
@@ -1150,6 +1839,8 @@ refresh_interval_seconds = 123
             &[],
             &DnsConfig::default(),
             &nat_common::AccessControlConfig::default(),
+            &Default::default(),
+            &Default::default(),
         )
         .unwrap();
         assert!(script.contains("add table ip self-nat"));

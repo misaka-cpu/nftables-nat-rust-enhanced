@@ -1,10 +1,10 @@
 #![deny(warnings)]
 use crate::ip;
 use ipnetwork::IpNetwork;
-use log::info;
+use log::{info, warn};
 use nat_common::{
-    AccessControlConfig, AccessControlMode, Chain, DdnsConfig, DnsConfig, IpVersion, NftCell,
-    ParseError, Protocol, StatsConfig, TelegramConfig, TomlConfig,
+    AccessControlConfig, AccessControlMode, Chain, DdnsConfig, DnsConfig, EgressControlConfig,
+    IpVersion, NftCell, ParseError, Protocol, StatsConfig, TelegramConfig, TomlConfig,
 };
 use std::env;
 use std::fmt::Display;
@@ -54,6 +54,7 @@ pub trait NftCellBuilder {
         rule_index: Option<usize>,
         dns_config: &DnsConfig,
         access_config: &AccessControlConfig,
+        egress_config: &EgressControlConfig,
     ) -> Result<String, io::Error>;
 }
 
@@ -63,6 +64,7 @@ impl NftCellBuilder for NftCell {
         rule_index: Option<usize>,
         dns_config: &DnsConfig,
         access_config: &AccessControlConfig,
+        egress_config: &EgressControlConfig,
     ) -> Result<String, io::Error> {
         match self {
             NftCell::Drop { .. } => build_drop_rule(self),
@@ -75,7 +77,7 @@ impl NftCellBuilder for NftCell {
                         domain, ip_version, ..
                     } => (domain, ip_version),
                     NftCell::Redirect { ip_version, .. } => {
-                        // Redirect doesn't need domain resolution
+                        // Redirect 是本机重定向，不受 egress_control 约束
                         return build_redirect_rules(self, ip_version, rule_index, access_config);
                     }
                     NftCell::Drop { .. } => unreachable!(),
@@ -83,6 +85,18 @@ impl NftCellBuilder for NftCell {
 
                 // 根据配置的IP版本解析目标IP
                 let dst_ip = ip::remote_ip_with_dns(domain, ip_version, dns_config)?;
+
+                // egress_control 检查：目标 IP 必须在允许 CIDR 列表中
+                if egress_config.enabled && !egress_config.allows_ip(&dst_ip) {
+                    warn!(
+                        "egress_control 跳过规则 id={} 目标 {} 不在 allowed_target_cidrs",
+                        rule_index
+                            .map(|i| format!("r{i}"))
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        dst_ip
+                    );
+                    return Ok(String::new());
+                }
 
                 let mut result = String::new();
 
@@ -153,10 +167,11 @@ impl RuntimeCell {
         rule_index: Option<usize>,
         dns_config: &DnsConfig,
         access_config: &AccessControlConfig,
+        egress_config: &EgressControlConfig,
     ) -> Result<String, io::Error> {
         match self {
             RuntimeCell::Rule(cell) => {
-                cell.build_with_rule_index(rule_index, dns_config, access_config)
+                cell.build_with_rule_index(rule_index, dns_config, access_config, egress_config)
             }
             RuntimeCell::Comment(content) => Ok(content.clone() + "\n"),
         }
@@ -806,6 +821,8 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
         stats: StatsConfig::default(),
         telegram: TelegramConfig::default(),
         access_control: AccessControlConfig::default(),
+        geoip: Default::default(),
+        egress_control: Default::default(),
     };
 
     let toml_str = example_config
@@ -930,7 +947,7 @@ mod redirect_build_tests {
         };
 
         let result = cell
-            .build_with_rule_index(Some(0), &DnsConfig::default(), &access)
+            .build_with_rule_index(Some(0), &DnsConfig::default(), &access, &Default::default())
             .unwrap();
         let comments = nft_comment_values(&result);
 
@@ -956,7 +973,12 @@ mod redirect_build_tests {
         };
 
         let result = cell
-            .build_with_rule_index(Some(7), &DnsConfig::default(), &Default::default())
+            .build_with_rule_index(
+                Some(7),
+                &DnsConfig::default(),
+                &Default::default(),
+                &Default::default(),
+            )
             .unwrap();
         let comments = nft_comment_values(&result);
 
@@ -1003,7 +1025,12 @@ mod redirect_build_tests {
         };
 
         let result = cell
-            .build_with_rule_index(None, &DnsConfig::default(), &Default::default())
+            .build_with_rule_index(
+                None,
+                &DnsConfig::default(),
+                &Default::default(),
+                &Default::default(),
+            )
             .unwrap();
         // all协议使用th dport匹配所有传输层协议
         assert!(result.contains("add rule ip self-nat PREROUTING ct state new meta l4proto { tcp, udp } th dport 8000 counter redirect to :3128"));
@@ -1023,7 +1050,12 @@ mod redirect_build_tests {
         };
 
         let result = cell
-            .build_with_rule_index(None, &DnsConfig::default(), &Default::default())
+            .build_with_rule_index(
+                None,
+                &DnsConfig::default(),
+                &Default::default(),
+                &Default::default(),
+            )
             .unwrap();
         // tcp协议只生成tcp规则
         assert!(result.contains(
@@ -1046,7 +1078,12 @@ mod redirect_build_tests {
         };
 
         let result = cell
-            .build_with_rule_index(None, &DnsConfig::default(), &Default::default())
+            .build_with_rule_index(
+                None,
+                &DnsConfig::default(),
+                &Default::default(),
+                &Default::default(),
+            )
             .unwrap();
         // all协议应该使用th dport，同时包含IPv4和IPv6
         assert!(result.contains("add rule ip self-nat PREROUTING ct state new meta l4proto { tcp, udp } th dport 5000 counter redirect to :4000"));

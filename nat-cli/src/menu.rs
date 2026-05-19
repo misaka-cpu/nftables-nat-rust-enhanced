@@ -1,7 +1,7 @@
 use chrono::Local;
 use nat_common::{
     AccessControlMode, Args, DdnsConfig, IpVersion, NftCell, Protocol, StatsConfig, TomlConfig,
-    TrafficMode, build_version, forward_test, stats as traffic_stats,
+    TrafficMode, build_version, forward_test, geoip, stats as traffic_stats,
     uninstall::{self, DataMode, UninstallTarget},
 };
 use std::fs::{self, OpenOptions};
@@ -55,19 +55,27 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
                 access_control_menu(config_path).map_err(Into::into)
             }
             "12" => {
-                show_recent_source_design();
-                Ok(())
+                should_wait = false;
+                geoip_menu(config_path).map_err(Into::into)
             }
             "13" => {
                 should_wait = false;
+                egress_control_menu(config_path).map_err(Into::into)
+            }
+            "14" => {
+                show_recent_source_design();
+                Ok(())
+            }
+            "15" => {
+                should_wait = false;
                 bbr_telegram_menu(config_path).map_err(Into::into)
             }
-            "14" => test_forward_interactive(config_path).map_err(Into::into),
-            "15" => {
+            "16" => test_forward_interactive(config_path).map_err(Into::into),
+            "17" => {
                 should_wait = false;
                 update_menu().map_err(Into::into)
             }
-            "16" => {
+            "18" => {
                 should_wait = false;
                 uninstall_menu().map_err(Into::into)
             }
@@ -120,11 +128,13 @@ nftables-nat-rust-enhanced 管理菜单
 9) 备份当前配置
 10) 从备份恢复配置
 11) 白名单 / 黑名单管理
-12) 最近来源 IP 观察
-13) BBR / Telegram 状态
-14) 测试转发规则连通性
-15) 一键更新本项目
-16) 卸载 / 清理本项目
+12) GeoIP / CN IP 限制
+13) 出口目标限制
+14) 最近来源 IP 观察
+15) BBR / Telegram 状态
+16) 测试转发规则连通性
+17) 一键更新本项目
+18) 卸载 / 清理本项目
 0) 退出
 ===================================="#
     );
@@ -738,6 +748,495 @@ fn show_recent_source_design() {
     println!("它不等同于白名单 / 黑名单管理，不会自动放行或封禁来源 IP。");
     println!("当前 CLI 不要求启用白名单或黑名单，也不会修改 access_control 配置。");
     println!("暂无来源 IP 记录。请从外部客户端访问转发端口后刷新。");
+}
+
+fn geoip_menu(config_path: &str) -> Result<(), io::Error> {
+    loop {
+        show_geoip_status(config_path);
+        println!(
+            r#"====================================
+GeoIP / CN IP 限制
+====================================
+1) 查看 GeoIP 状态
+2) 下载 / 更新 CN IP set
+3) 启用 / 禁用转发端口 CN 限制
+4) 启用 / 禁用 SSH CN 限制
+5) 设置 SSH 端口
+6) 设置 CN IP set 更新间隔
+0) 返回主菜单
+===================================="#
+        );
+        let choice = prompt("请选择操作: ")?;
+        match choice.trim() {
+            "1" => {
+                show_geoip_status(config_path);
+                wait_enter_to_return()?;
+            }
+            "2" => {
+                if let Err(e) = update_cn4_set_interactive(config_path) {
+                    println!("更新 CN IP set 失败: {e}");
+                }
+                wait_enter_to_return()?;
+            }
+            "3" => {
+                toggle_geoip_forward(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "4" => {
+                toggle_geoip_ssh(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "5" => {
+                set_geoip_ssh_port(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "6" => {
+                set_geoip_update_interval(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "0" | "q" | "quit" | "exit" => break,
+            value if is_menu_refresh_command(value) => break,
+            "" => continue,
+            _ => {
+                println!("未知选项: {}", choice.trim());
+                wait_enter_to_return()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn show_geoip_status(config_path: &str) {
+    let config = match load_toml_config(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("读取配置失败: {e}");
+            return;
+        }
+    };
+    let geoip = &config.geoip;
+    println!("====================================");
+    println!("GeoIP 状态");
+    println!("====================================");
+    println!(
+        "GeoIP 总开关：{}",
+        if geoip.enabled { "enabled" } else { "disabled" }
+    );
+    println!("provider：{}", geoip.provider);
+    println!("cn4_url：{}", geoip.cn4_url);
+    println!("cn4_file：{}", geoip.cn4_file);
+    match fs::metadata(&geoip.cn4_file) {
+        Ok(meta) => {
+            println!("CN IP set 文件：存在");
+            println!("CN IP set 大小：{} bytes", meta.len());
+            if let Ok(modified) = meta.modified() {
+                println!("CN IP set 更新时间：{}", format_system_time(modified));
+            }
+        }
+        Err(_) => {
+            println!("CN IP set 文件：不存在");
+            println!("提示：请先执行 '下载 / 更新 CN IP set'");
+        }
+    }
+    println!(
+        "转发端口 CN 限制：{}",
+        if geoip.forward.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "SSH CN 限制：{}",
+        if geoip.ssh.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!("SSH 端口：{}", geoip.ssh.port);
+    println!("允许 LAN：{}", geoip.allow_lan);
+    println!("LAN CIDR：{}", geoip.lan_cidrs.join(", "));
+    println!("更新间隔（小时）：{}", geoip.update_interval_hours);
+}
+
+fn format_system_time(time: std::time::SystemTime) -> String {
+    let dt: chrono::DateTime<Local> = time.into();
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+pub(crate) fn update_cn4_set_interactive(config_path: &str) -> Result<(), io::Error> {
+    let config = load_toml_config(config_path)?;
+    let geoip_config = &config.geoip;
+    println!(
+        "准备下载 {} 到 {}",
+        geoip_config.cn4_url, geoip_config.cn4_file
+    );
+    if !confirm("继续下载? [y/N]: ")? {
+        println!("已取消");
+        return Ok(());
+    }
+    let url = geoip_config.cn4_url.clone();
+    let path = geoip_config.cn4_file.clone();
+    let report = geoip::download_and_update_with(&url, &path, download_via_curl)?;
+    println!("CN IP set 已更新");
+    println!("文件路径：{}", report.path.display());
+    println!("文件大小：{} bytes", report.size_bytes);
+    println!("更新时间：{}", Local::now().format("%Y-%m-%d %H:%M:%S"));
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn download_via_curl(url: &str) -> Result<String, io::Error> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cn4_url 必须是 http(s):// 开头: {url}"),
+        ));
+    }
+    let output = Command::new("curl")
+        .arg("-fsSL")
+        .arg("--max-time")
+        .arg("60")
+        .arg(url)
+        .output()
+        .map_err(|e| io::Error::other(format!("执行 curl 失败: {e}")))?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "下载失败: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn toggle_geoip_forward(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    println!(
+        "当前转发端口 CN 限制：{}",
+        if config.geoip.forward.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if config.geoip.forward.enabled {
+        if !confirm("关闭转发端口 CN 限制? [y/N]: ")? {
+            println!("已取消");
+            return Ok(());
+        }
+        config.geoip.forward.enabled = false;
+    } else {
+        if !Path::new(&config.geoip.cn4_file).exists() {
+            println!(
+                "WARN: cn4_file {} 不存在。启用后核心服务会跳过 GeoIP 规则生成，请先执行 '下载 / 更新 CN IP set'。",
+                config.geoip.cn4_file
+            );
+        }
+        if !confirm("启用转发端口 CN 限制? [y/N]: ")? {
+            println!("已取消");
+            return Ok(());
+        }
+        config.geoip.enabled = true;
+        config.geoip.forward.enabled = true;
+    }
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    println!(
+        "转发端口 CN 限制已{}",
+        if config.geoip.forward.enabled {
+            "启用"
+        } else {
+            "禁用"
+        }
+    );
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn toggle_geoip_ssh(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    println!(
+        "当前 SSH CN 限制：{}",
+        if config.geoip.ssh.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if config.geoip.ssh.enabled {
+        if !confirm("关闭 SSH CN 限制? [y/N]: ")? {
+            println!("已取消");
+            return Ok(());
+        }
+        config.geoip.ssh.enabled = false;
+    } else {
+        println!("===== 安全警告 =====");
+        println!("开启 SSH GeoIP 限制可能导致无法远程登录。");
+        println!("规则仅允许：");
+        println!("  - 中国大陆 IPv4 来源（@cn4 set）");
+        if config.geoip.allow_lan && config.geoip.ssh.mode == "allow-cn-and-lan" {
+            println!("  - LAN CIDR: {}", config.geoip.lan_cidrs.join(", "));
+        }
+        println!(
+            "其他来源访问 SSH 端口 {} 将被 drop。",
+            config.geoip.ssh.port
+        );
+        println!("请确认当前来源 IP 属于允许范围！");
+        let confirm_text = prompt("如确认启用，请输入 CONFIRM: ")?;
+        if confirm_text != "CONFIRM" {
+            println!("确认文本不匹配，已取消启用。");
+            return Ok(());
+        }
+        if !Path::new(&config.geoip.cn4_file).exists() {
+            println!(
+                "WARN: cn4_file {} 不存在。启用后核心服务会跳过 GeoIP 规则生成，请先执行 '下载 / 更新 CN IP set'。",
+                config.geoip.cn4_file
+            );
+        }
+        config.geoip.enabled = true;
+        config.geoip.ssh.enabled = true;
+    }
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    println!(
+        "SSH CN 限制已{}",
+        if config.geoip.ssh.enabled {
+            "启用"
+        } else {
+            "禁用"
+        }
+    );
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn set_geoip_ssh_port(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    println!("当前 SSH 端口：{}", config.geoip.ssh.port);
+    let value = prompt("请输入新的 SSH 端口 (1-65535): ")?;
+    let port = parse_port(&value)?;
+    config.geoip.ssh.port = port;
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    println!("SSH 端口已保存为 {port}");
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn set_geoip_update_interval(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    println!(
+        "当前 CN IP set 更新间隔：{} 小时",
+        config.geoip.update_interval_hours
+    );
+    let value = prompt("请输入新的更新间隔（小时，最小 1）: ")?;
+    let hours = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "更新间隔必须是正整数"))?;
+    if hours == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "更新间隔不能为 0",
+        ));
+    }
+    config.geoip.update_interval_hours = hours;
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    println!("CN IP set 更新间隔已保存为 {hours} 小时");
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn egress_control_menu(config_path: &str) -> Result<(), io::Error> {
+    loop {
+        show_egress_status(config_path);
+        println!(
+            r#"====================================
+出口目标限制
+====================================
+1) 查看出口目标限制状态
+2) 启用 / 禁用出口目标限制
+3) 添加允许目标 IP / CIDR
+4) 删除允许目标 IP / CIDR
+5) 列出允许目标 IP / CIDR
+0) 返回主菜单
+
+提示：出口目标限制用于限制本机只能把转发流量转发到指定出口机或出口网段。
+它不是来源 IP 白名单。"#
+        );
+        let choice = prompt("请选择操作: ")?;
+        match choice.trim() {
+            "1" => {
+                show_egress_status(config_path);
+                wait_enter_to_return()?;
+            }
+            "2" => {
+                toggle_egress_control(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "3" => {
+                add_egress_target(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "4" => {
+                delete_egress_target(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "5" => {
+                list_egress_targets(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "0" | "q" | "quit" | "exit" => break,
+            value if is_menu_refresh_command(value) => break,
+            "" => continue,
+            _ => {
+                println!("未知选项: {}", choice.trim());
+                wait_enter_to_return()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn show_egress_status(config_path: &str) {
+    let config = match load_toml_config(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("读取配置失败: {e}");
+            return;
+        }
+    };
+    let egress = &config.egress_control;
+    println!("====================================");
+    println!("出口目标限制状态");
+    println!("====================================");
+    println!(
+        "出口目标限制：{}",
+        if egress.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!("模式：{}", egress.mode);
+    if egress.allowed_target_cidrs.is_empty() {
+        println!("允许目标：(空)");
+    } else {
+        println!("允许目标：");
+        for (idx, cidr) in egress.allowed_target_cidrs.iter().enumerate() {
+            println!("  {}) {cidr}", idx + 1);
+        }
+    }
+}
+
+fn toggle_egress_control(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    let now = config.egress_control.enabled;
+    if now {
+        if !confirm("关闭出口目标限制? [y/N]: ")? {
+            println!("已取消");
+            return Ok(());
+        }
+        config.egress_control.enabled = false;
+    } else {
+        if config.egress_control.allowed_target_cidrs.is_empty() {
+            println!("WARN: allowed_target_cidrs 为空。启用后所有转发规则将被跳过。");
+        }
+        if !confirm("启用出口目标限制? [y/N]: ")? {
+            println!("已取消");
+            return Ok(());
+        }
+        config.egress_control.enabled = true;
+    }
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    println!(
+        "出口目标限制已{}",
+        if config.egress_control.enabled {
+            "启用"
+        } else {
+            "禁用"
+        }
+    );
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn add_egress_target(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    let value = prompt("请输入 IP / CIDR: ")?;
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "目标不能为空"));
+    }
+    if value.parse::<std::net::IpAddr>().is_err() && value.parse::<ipnetwork::IpNetwork>().is_err()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "只接受合法 IP 或 CIDR",
+        ));
+    }
+    if !config.egress_control.allowed_target_cidrs.contains(&value) {
+        config
+            .egress_control
+            .allowed_target_cidrs
+            .push(value.clone());
+    }
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    println!("已添加 {value}");
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn delete_egress_target(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    if config.egress_control.allowed_target_cidrs.is_empty() {
+        println!("当前没有允许目标");
+        return Ok(());
+    }
+    for (idx, cidr) in config
+        .egress_control
+        .allowed_target_cidrs
+        .iter()
+        .enumerate()
+    {
+        println!("{}) {cidr}", idx + 1);
+    }
+    let value = prompt("请输入要删除的编号: ")?;
+    let num = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "编号必须是数字"))?;
+    if num == 0 || num > config.egress_control.allowed_target_cidrs.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "编号超出范围"));
+    }
+    let removed = config.egress_control.allowed_target_cidrs.remove(num - 1);
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    println!("已删除 {removed}");
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn list_egress_targets(config_path: &str) -> Result<(), io::Error> {
+    let config = load_toml_config(config_path)?;
+    if config.egress_control.allowed_target_cidrs.is_empty() {
+        println!("(空)");
+    } else {
+        for (idx, cidr) in config
+            .egress_control
+            .allowed_target_cidrs
+            .iter()
+            .enumerate()
+        {
+            println!("{}) {cidr}", idx + 1);
+        }
+    }
+    Ok(())
 }
 
 fn bbr_telegram_menu(config_path: &str) -> Result<(), io::Error> {
@@ -1891,6 +2390,8 @@ mod tests {
             stats: StatsConfig::default(),
             telegram: Default::default(),
             access_control: Default::default(),
+            geoip: Default::default(),
+            egress_control: Default::default(),
         };
         add_single_rule(
             &mut config,
@@ -1915,6 +2416,8 @@ mod tests {
             stats: StatsConfig::default(),
             telegram: Default::default(),
             access_control: Default::default(),
+            geoip: Default::default(),
+            egress_control: Default::default(),
         };
         add_range_rule(
             &mut config,

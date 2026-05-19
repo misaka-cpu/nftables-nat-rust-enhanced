@@ -6,6 +6,7 @@ use std::num::ParseIntError;
 use std::str::FromStr;
 
 pub mod forward_test;
+pub mod geoip;
 pub mod logger;
 pub mod stats;
 pub mod uninstall;
@@ -249,6 +250,10 @@ pub struct TomlConfig {
     pub telegram: TelegramConfig,
     #[serde(default)]
     pub access_control: AccessControlConfig,
+    #[serde(default)]
+    pub geoip: GeoIpConfig,
+    #[serde(default)]
+    pub egress_control: EgressControlConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,6 +461,237 @@ impl<'de> Deserialize<'de> for AccessControlMode {
             ))),
         }
     }
+}
+
+/// GeoIP / CN IP set 限制配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoIpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_geoip_provider")]
+    pub provider: String,
+    #[serde(default = "default_cn4_url")]
+    pub cn4_url: String,
+    #[serde(default = "default_cn4_file")]
+    pub cn4_file: String,
+    #[serde(default = "default_geoip_update_interval_hours")]
+    pub update_interval_hours: u64,
+    #[serde(default = "default_true")]
+    pub allow_lan: bool,
+    #[serde(default = "default_lan_cidrs")]
+    pub lan_cidrs: Vec<String>,
+    #[serde(default)]
+    pub forward: GeoIpForwardConfig,
+    #[serde(default)]
+    pub ssh: GeoIpSshConfig,
+}
+
+impl Default for GeoIpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_geoip_provider(),
+            cn4_url: default_cn4_url(),
+            cn4_file: default_cn4_file(),
+            update_interval_hours: default_geoip_update_interval_hours(),
+            allow_lan: true,
+            lan_cidrs: default_lan_cidrs(),
+            forward: GeoIpForwardConfig::default(),
+            ssh: GeoIpSshConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoIpForwardConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_geoip_forward_mode")]
+    pub mode: String,
+    #[serde(default = "default_geoip_apply_to_ports")]
+    pub apply_to_ports: String,
+}
+
+impl Default for GeoIpForwardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_geoip_forward_mode(),
+            apply_to_ports: default_geoip_apply_to_ports(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoIpSshConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    #[serde(default = "default_geoip_ssh_mode")]
+    pub mode: String,
+}
+
+impl Default for GeoIpSshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_ssh_port(),
+            mode: default_geoip_ssh_mode(),
+        }
+    }
+}
+
+/// 出口目标限制配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EgressControlConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_egress_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub allowed_target_cidrs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+impl Default for EgressControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_egress_mode(),
+            allowed_target_cidrs: Vec::new(),
+            comment: None,
+        }
+    }
+}
+
+impl EgressControlConfig {
+    /// 检查给定 IP 是否在 allowed_target_cidrs 中
+    /// 非法 CIDR 跳过；任意一个 CIDR 包含该 IP 即返回 true
+    pub fn allows_ip(&self, ip: &str) -> bool {
+        let Ok(parsed) = ip.parse::<IpAddr>() else {
+            return false;
+        };
+        self.allowed_target_cidrs
+            .iter()
+            .filter_map(|cidr| {
+                cidr.parse::<ipnetwork::IpNetwork>()
+                    .ok()
+                    .or_else(|| cidr.parse::<IpAddr>().ok().map(ipnetwork::IpNetwork::from))
+            })
+            .any(|network| network.contains(parsed))
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mode != "allow-targets" {
+            return Err(format!(
+                "egress_control.mode 当前仅支持 'allow-targets'，收到: {}",
+                self.mode
+            ));
+        }
+        for entry in &self.allowed_target_cidrs {
+            if entry.trim().is_empty() {
+                return Err("egress_control.allowed_target_cidrs 条目不能为空".to_string());
+            }
+            if entry.parse::<IpAddr>().is_err() && entry.parse::<ipnetwork::IpNetwork>().is_err() {
+                return Err(format!(
+                    "egress_control.allowed_target_cidrs 条目不是合法 IP/CIDR: {entry}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GeoIpConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.update_interval_hours == 0 {
+            return Err("geoip.update_interval_hours 不能为 0".to_string());
+        }
+        for cidr in &self.lan_cidrs {
+            if cidr.parse::<ipnetwork::IpNetwork>().is_err() && cidr.parse::<IpAddr>().is_err() {
+                return Err(format!("geoip.lan_cidrs 条目不是合法 CIDR: {cidr}"));
+            }
+        }
+        if self.ssh.port == 0 {
+            return Err("geoip.ssh.port 不能为 0".to_string());
+        }
+        if self.forward.mode != "allow-cn" {
+            return Err(format!(
+                "geoip.forward.mode 当前仅支持 'allow-cn'，收到: {}",
+                self.forward.mode
+            ));
+        }
+        if !matches!(self.ssh.mode.as_str(), "allow-cn-and-lan" | "allow-cn") {
+            return Err(format!(
+                "geoip.ssh.mode 当前仅支持 'allow-cn-and-lan' / 'allow-cn'，收到: {}",
+                self.ssh.mode
+            ));
+        }
+        Ok(())
+    }
+
+    /// 仅过滤出 IPv4 的 LAN CIDR；第一版仅支持 IPv4
+    pub fn lan_ipv4_cidrs(&self) -> Vec<String> {
+        self.lan_cidrs
+            .iter()
+            .filter(|entry| {
+                if let Ok(network) = entry.parse::<ipnetwork::IpNetwork>() {
+                    return network.is_ipv4();
+                }
+                if let Ok(IpAddr::V4(_)) = entry.parse::<IpAddr>() {
+                    return true;
+                }
+                false
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+fn default_geoip_provider() -> String {
+    "chnlist".to_string()
+}
+
+fn default_cn4_url() -> String {
+    "https://raw.githubusercontent.com/alecthw/chnlist/release/nftables/cn4.nft".to_string()
+}
+
+fn default_cn4_file() -> String {
+    "/etc/nftables-nat/sets/cn4.nft".to_string()
+}
+
+fn default_geoip_update_interval_hours() -> u64 {
+    168
+}
+
+fn default_lan_cidrs() -> Vec<String> {
+    vec![
+        "10.0.0.0/8".to_string(),
+        "172.16.0.0/12".to_string(),
+        "192.168.0.0/16".to_string(),
+    ]
+}
+
+fn default_geoip_forward_mode() -> String {
+    "allow-cn".to_string()
+}
+
+fn default_geoip_apply_to_ports() -> String {
+    "forward-rules".to_string()
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
+fn default_geoip_ssh_mode() -> String {
+    "allow-cn-and-lan".to_string()
+}
+
+fn default_egress_mode() -> String {
+    "allow-targets".to_string()
 }
 
 fn default_collect_interval_seconds() -> u64 {
@@ -671,6 +907,8 @@ impl TomlConfig {
     /// 验证配置是否合法
     pub fn validate(&self) -> Result<(), String> {
         self.access_control.validate()?;
+        self.geoip.validate()?;
+        self.egress_control.validate()?;
         for (idx, rule) in self.rules.iter().enumerate() {
             rule.validate()
                 .map_err(|e| format!("规则 {} 验证失败: {}", idx + 1, e))?;
@@ -1525,6 +1763,89 @@ entries = ["example.com"]
         assert!(result.is_err());
         let err_msg = result.unwrap_err();
         assert!(err_msg.contains("格式无效"));
+    }
+
+    #[test]
+    fn geoip_and_egress_default_disabled_when_missing() {
+        let config = TomlConfig::from_toml_str("rules = []").unwrap();
+        assert!(!config.geoip.enabled);
+        assert!(!config.geoip.forward.enabled);
+        assert!(!config.geoip.ssh.enabled);
+        assert_eq!(config.geoip.provider, "chnlist");
+        assert_eq!(
+            config.geoip.cn4_url,
+            "https://raw.githubusercontent.com/alecthw/chnlist/release/nftables/cn4.nft"
+        );
+        assert_eq!(config.geoip.cn4_file, "/etc/nftables-nat/sets/cn4.nft");
+        assert_eq!(config.geoip.update_interval_hours, 168);
+        assert!(config.geoip.allow_lan);
+        assert_eq!(config.geoip.ssh.port, 22);
+        assert!(!config.egress_control.enabled);
+        assert_eq!(config.egress_control.mode, "allow-targets");
+        assert!(config.egress_control.allowed_target_cidrs.is_empty());
+    }
+
+    #[test]
+    fn geoip_validates_mode_strings() {
+        let mut config = GeoIpConfig::default();
+        config.forward.mode = "deny-cn".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn egress_control_validates_mode_and_cidrs() {
+        let mut config = EgressControlConfig {
+            mode: "allow-targets".to_string(),
+            allowed_target_cidrs: vec!["10.0.0.0/8".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        config.allowed_target_cidrs.push("not-an-ip".to_string());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn egress_control_contains_matches_cidrs() {
+        let config = EgressControlConfig {
+            enabled: true,
+            mode: "allow-targets".to_string(),
+            allowed_target_cidrs: vec![
+                "10.100.0.10/32".to_string(),
+                "10.100.0.0/24".to_string(),
+                "172.31.8.0/24".to_string(),
+            ],
+            comment: None,
+        };
+        assert!(config.allows_ip("10.100.0.10"));
+        assert!(config.allows_ip("10.100.0.123"));
+        assert!(config.allows_ip("172.31.8.1"));
+        assert!(!config.allows_ip("8.8.8.8"));
+        assert!(!config.allows_ip("not-an-ip"));
+    }
+
+    #[test]
+    fn geoip_lan_ipv4_cidrs_only_returns_ipv4() {
+        let config = GeoIpConfig {
+            allow_lan: true,
+            lan_cidrs: vec![
+                "10.0.0.0/8".to_string(),
+                "fd00::/8".to_string(),
+                "192.168.0.0/16".to_string(),
+            ],
+            ..Default::default()
+        };
+        let v4 = config.lan_ipv4_cidrs();
+        assert_eq!(v4.len(), 2);
+        assert!(v4.contains(&"10.0.0.0/8".to_string()));
+        assert!(v4.contains(&"192.168.0.0/16".to_string()));
+    }
+
+    #[test]
+    fn geoip_default_ssh_port_is_22_and_default_interval_one_week() {
+        let g = GeoIpConfig::default();
+        assert_eq!(g.ssh.port, 22);
+        assert_eq!(g.update_interval_hours, 168);
+        assert_eq!(g.ssh.mode, "allow-cn-and-lan");
     }
 
     #[test]
