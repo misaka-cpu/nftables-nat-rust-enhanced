@@ -1,9 +1,16 @@
 use chrono::Local;
+use log::warn;
 use nat_common::{
-    AccessControlMode, Args, DdnsConfig, IpVersion, NftCell, Protocol, StatsConfig, TomlConfig,
-    TrafficMode, build_version, forward_test, geoip, stats as traffic_stats,
+    AccessControlMode, Args, AuditConfig, DdnsConfig, IpVersion, MSS_CLAMP_MAX, MSS_CLAMP_MIN,
+    MssClampConfig, NftCell, Protocol, QuotaPeriod, SnatConfig, SnatMode, StatsConfig, TomlConfig,
+    TrafficMode,
+    audit::{self, AuditResult},
+    build_version, forward_test, geoip,
+    last_good::{LastGoodState, ResolveSource},
+    quota, stats as traffic_stats,
     uninstall::{self, DataMode, UninstallTarget},
 };
+use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::os::unix::process::CommandExt;
@@ -49,9 +56,19 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
             "8" => {
                 refresh_ddns_interactive(config_path, &mut last_manual_refresh).map_err(Into::into)
             }
-            "9" => backup_config(config_path)
-                .map(|backup| println!("已备份: {}", backup.display()))
-                .map_err(Into::into),
+            "9" => match backup_config(config_path) {
+                Ok(backup) => {
+                    audit_cli(
+                        config_path,
+                        "backup.create",
+                        AuditResult::Ok,
+                        json!({"backup": backup.display().to_string(), "trigger": "manual"}),
+                    );
+                    println!("已备份: {}", backup.display());
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            },
             "10" => restore_config_interactive(config_path).map_err(Into::into),
             "11" => {
                 should_wait = false;
@@ -76,12 +93,17 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
             "16" => test_forward_interactive(config_path).map_err(Into::into),
             "17" => {
                 should_wait = false;
-                update_menu().map_err(Into::into)
+                update_menu(config_path).map_err(Into::into)
             }
             "18" => {
                 should_wait = false;
-                uninstall_menu().map_err(Into::into)
+                uninstall_menu(config_path).map_err(Into::into)
             }
+            "19" => {
+                should_wait = false;
+                advanced_network_menu(config_path).map_err(Into::into)
+            }
+            "20" => view_audit_log_interactive(config_path).map_err(Into::into),
             _ => {
                 println!("未知选项: {}", choice.trim());
                 Ok(())
@@ -138,6 +160,8 @@ nftables-nat-rust-enhanced 管理菜单
 16) 测试转发规则连通性
 17) 一键更新本项目
 18) 卸载 / 清理本项目
+19) 高级网络设置 (SNAT / MSS clamp)
+20) 查看审计日志
 0) 退出
 ===================================="#
     );
@@ -192,6 +216,16 @@ fn load_toml_config(path: &str) -> Result<TomlConfig, io::Error> {
     TomlConfig::from_toml_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// 从配置路径加载 AuditConfig；解析失败时回退到默认值（保证 audit 永不阻塞主流程）
+fn audit_config_from(path: &str) -> AuditConfig {
+    load_toml_config(path).map(|c| c.audit).unwrap_or_default()
+}
+
+/// 写一条 CLI 触发的 audit 事件；失败仅 WARN，不返回 Err
+fn audit_cli(path: &str, action: &str, result: AuditResult, detail: serde_json::Value) {
+    audit::log_event(&audit_config_from(path), action, result, detail);
+}
+
 fn save_toml_config(path: &str, config: &TomlConfig) -> Result<(), io::Error> {
     let content = config
         .to_toml_string()
@@ -203,10 +237,18 @@ fn show_rules(path: &str) -> Result<(), io::Error> {
     let config = load_toml_config(path)?;
     if config.rules.is_empty() {
         println!("当前没有转发规则");
-        return Ok(());
+    } else {
+        for (index, rule) in config.rules.iter().enumerate() {
+            println!("{index}) [{}] {}", rule_status(rule), format_rule(rule));
+        }
     }
-    for (index, rule) in config.rules.iter().enumerate() {
-        println!("{index}) [{}] {}", rule_status(rule), format_rule(rule));
+    println!();
+    for line in format_combined_policy_status(&config) {
+        println!("{line}");
+    }
+    println!();
+    for line in format_last_good_status(&config) {
+        println!("{line}");
     }
     Ok(())
 }
@@ -232,6 +274,18 @@ fn add_single_interactive(path: &str) -> Result<(), io::Error> {
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     backup_config(path)?;
     save_toml_config(path, &config)?;
+    audit_cli(
+        path,
+        "rule.add",
+        AuditResult::Ok,
+        json!({
+            "type": "single",
+            "sport": sport,
+            "dport": dport,
+            "protocol": protocol.to_string(),
+            "ip_version": ip_version.to_string(),
+        }),
+    );
     println!("已添加规则。");
     print_config_saved_hint(path);
     Ok(())
@@ -258,6 +312,18 @@ fn add_range_interactive(path: &str) -> Result<(), io::Error> {
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     backup_config(path)?;
     save_toml_config(path, &config)?;
+    audit_cli(
+        path,
+        "rule.add",
+        AuditResult::Ok,
+        json!({
+            "type": "range",
+            "port_start": port_start,
+            "port_end": port_end,
+            "protocol": protocol.to_string(),
+            "ip_version": ip_version.to_string(),
+        }),
+    );
     println!("已添加端口段规则。当前模型会转发到目标同端口段。");
     print_config_saved_hint(path);
     Ok(())
@@ -287,6 +353,12 @@ fn delete_rule_interactive(path: &str) -> Result<(), io::Error> {
     backup_config(path)?;
     delete_rule(&mut config, index).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     save_toml_config(path, &config)?;
+    audit_cli(
+        path,
+        "rule.delete",
+        AuditResult::Ok,
+        json!({"index": index}),
+    );
     println!("已删除规则。");
     print_config_saved_hint(path);
     Ok(())
@@ -321,6 +393,12 @@ fn refresh_ddns_interactive(
         compatible_config_file: None,
         toml: Some(path.to_string()),
     };
+    audit_cli(
+        path,
+        "ddns.refresh",
+        AuditResult::Info,
+        json!({"trigger": "cli"}),
+    );
     if let Err(e) = super::refresh_once(&args) {
         if e.to_string().contains("resolved fake-ip") {
             println!("解析结果为 fake-ip，已拒绝应用");
@@ -403,8 +481,10 @@ Stats 流量统计
 ====================================
 1) 刷新统计
 2) 切换统计口径
-3) 重置今日统计
-4) 重置本月统计
+3) 设置规则流量配额
+4) 查看规则配额状态
+5) 重置今日统计
+6) 重置本月统计
 0) 返回主菜单
 ===================================="#
         );
@@ -420,10 +500,18 @@ Stats 流量统计
                 }
             }
             "3" => {
-                reset_stats(config_path, true, false)?;
+                set_rule_quota_interactive(config_path)?;
                 wait_enter_to_return()?;
             }
             "4" => {
+                show_quota_status(config_path);
+                wait_enter_to_return()?;
+            }
+            "5" => {
+                reset_stats(config_path, true, false)?;
+                wait_enter_to_return()?;
+            }
+            "6" => {
                 reset_stats(config_path, false, true)?;
                 wait_enter_to_return()?;
             }
@@ -468,6 +556,203 @@ fn switch_traffic_mode(config_path: &str) -> Result<bool, io::Error> {
     println!("如需重新统计，请重置今日或本月统计。");
     print_config_saved_hint(config_path);
     Ok(true)
+}
+
+fn set_rule_quota_interactive(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    if config.rules.is_empty() {
+        println!("当前没有规则可配置 quota。");
+        return Ok(());
+    }
+    if !config.stats.enabled {
+        println!(
+            "提示：stats.enabled=false，quota 依赖 Stats 才能生效。建议先在 Stats 子菜单启用。"
+        );
+    }
+    let stats_state = traffic_stats::load_state(&config.stats.data_file);
+    for (idx, rule) in config.rules.iter().enumerate() {
+        let label = match rule {
+            NftCell::Drop { .. } => "[drop]".to_string(),
+            _ => format_rule(rule),
+        };
+        let quota_str = if !rule.quota_enabled() || rule.quota_bytes() == 0 {
+            "off".to_string()
+        } else {
+            format!(
+                "{} {}",
+                quota::format_bytes(rule.quota_bytes()),
+                rule.quota_period()
+            )
+        };
+        let used = match rule.quota_period() {
+            QuotaPeriod::Daily => stats_state
+                .per_rule_daily_bytes
+                .get(&format!("r{idx}"))
+                .copied()
+                .unwrap_or(0),
+            QuotaPeriod::Monthly => stats_state
+                .per_rule_monthly_bytes
+                .get(&format!("r{idx}"))
+                .copied()
+                .unwrap_or(0),
+            QuotaPeriod::Total => stats_state
+                .per_rule_total_bytes
+                .get(&format!("r{idx}"))
+                .copied()
+                .unwrap_or(0),
+        };
+        println!(
+            "{}) [{}] {label}  quota: {quota_str}  used: {}",
+            idx + 1,
+            rule_status(rule),
+            quota::format_bytes(used)
+        );
+    }
+    println!("0) 返回");
+    let index = parse_index(&prompt("请选择规则编号: ")?)?;
+    if index == 0 {
+        return Ok(());
+    }
+    let rule_idx = index - 1;
+    if rule_idx >= config.rules.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "规则编号超出范围",
+        ));
+    }
+    if matches!(config.rules[rule_idx], NftCell::Drop { .. }) {
+        println!("Drop 规则不支持 quota。");
+        return Ok(());
+    }
+    println!(
+        r#"
+1) 启用配额
+2) 禁用配额
+3) 设置配额大小
+4) 设置周期 daily/monthly/total
+0) 返回"#
+    );
+    let action = prompt("请选择: ")?;
+    match action.trim() {
+        "1" => {
+            if config.rules[rule_idx].quota_bytes() == 0 {
+                println!("警告：当前 quota_bytes=0，请先在 3) 设置配额大小。");
+            }
+            config.rules[rule_idx].set_quota_enabled(true);
+        }
+        "2" => {
+            config.rules[rule_idx].set_quota_enabled(false);
+        }
+        "3" => {
+            let raw = prompt("请输入配额，例如 100GB / 1TB / 500MiB / 107374182400: ")?;
+            let bytes = quota::parse_quota_bytes(&raw)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            config.rules[rule_idx].set_quota_bytes(bytes);
+        }
+        "4" => {
+            let raw = prompt("请输入周期 [daily/monthly/total]: ")?;
+            let period = match raw.trim().to_lowercase().as_str() {
+                "daily" => QuotaPeriod::Daily,
+                "monthly" => QuotaPeriod::Monthly,
+                "total" => QuotaPeriod::Total,
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("未知周期: {other}"),
+                    ));
+                }
+            };
+            config.rules[rule_idx].set_quota_period(period);
+        }
+        "0" => return Ok(()),
+        _ => {
+            println!("未知选项: {}", action.trim());
+            return Ok(());
+        }
+    }
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    let rule = &config.rules[rule_idx];
+    audit_cli(
+        config_path,
+        "quota.config.update",
+        AuditResult::Ok,
+        serde_json::json!({
+            "rule_id": format!("r{rule_idx}"),
+            "quota_enabled": rule.quota_enabled(),
+            "quota_bytes": rule.quota_bytes(),
+            "quota_period": rule.quota_period().to_string(),
+        }),
+    );
+    println!("已保存。");
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn show_quota_status(config_path: &str) {
+    let config = match load_toml_config(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("读取配置失败: {e}");
+            return;
+        }
+    };
+    println!("====================================");
+    println!("规则流量配额状态");
+    println!("====================================");
+    println!(
+        "全局开关：{} 检查间隔：{}s 超额通知：{}",
+        if config.quota.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        config.quota.check_interval_seconds,
+        if config.quota.notify_on_exceeded {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    println!("stats.enabled: {}", config.stats.enabled);
+    if !config.stats.enabled {
+        println!("提示：stats.enabled=false 时 quota 不会生效。");
+    }
+    let stats_state = traffic_stats::load_state(&config.stats.data_file);
+    let quota_state = quota::QuotaState::load(&config.quota.state_file);
+    let now = chrono::Utc::now();
+    let usages = quota::compute_usages(&config.rules, &stats_state, now);
+    if usages.is_empty() {
+        println!("当前没有启用 quota 的规则。");
+        return;
+    }
+    for usage in &usages {
+        let rule_idx: Option<usize> = usage.rule_id.strip_prefix('r').and_then(|s| s.parse().ok());
+        let rule_state = rule_idx
+            .and_then(|i| config.rules.get(i))
+            .map(|r| if r.enabled() { "enabled" } else { "disabled" })
+            .unwrap_or("?");
+        let remaining = usage.limit_bytes.saturating_sub(usage.used_bytes);
+        let last_notified = quota_state.notified.get(&usage.notify_key()).cloned();
+        println!(
+            "{} ({})  rule={}  period={} ({})",
+            usage.rule_id,
+            usage.label.as_deref().unwrap_or("-"),
+            rule_state,
+            usage.period,
+            usage.period_key
+        );
+        println!(
+            "  used={}  limit={}  remaining={}  exceeded={}",
+            quota::format_bytes(usage.used_bytes),
+            quota::format_bytes(usage.limit_bytes),
+            quota::format_bytes(remaining),
+            usage.exceeded()
+        );
+        if let Some(ts) = last_notified {
+            println!("  上次通知时间: {ts}");
+        }
+    }
 }
 
 fn reset_stats(config_path: &str, daily: bool, monthly: bool) -> Result<(), io::Error> {
@@ -599,6 +884,12 @@ fn restore_config_interactive(path: &str) -> Result<(), io::Error> {
     }
     backup_config(path)?;
     fs::copy(&backups[index], path)?;
+    audit_cli(
+        path,
+        "backup.restore",
+        AuditResult::Ok,
+        json!({"backup": backups[index].display().to_string()}),
+    );
     println!("已恢复配置: {}", backups[index].display());
     print_config_saved_hint(path);
     Ok(())
@@ -682,6 +973,15 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
                 backup_config(path)?;
                 save_toml_config(path, &config)?;
+                audit_cli(
+                    path,
+                    "access_control.update",
+                    AuditResult::Ok,
+                    json!({
+                        "mode": config.access_control.mode.to_string(),
+                        "entries": config.access_control.entries.len(),
+                    }),
+                );
                 println!("访问控制配置已保存。");
                 print_config_saved_hint(path);
                 wait_enter_to_return()?;
@@ -876,24 +1176,89 @@ pub(crate) fn format_combined_policy_status(config: &TomlConfig) -> Vec<String> 
     let ac_count = config.access_control.entries.len();
     let geoip_forward = config.geoip.enabled && config.geoip.forward.enabled;
     let geoip_ssh = config.geoip.enabled && config.geoip.ssh.enabled;
+    let egress_enabled = config.egress_control.enabled;
+    let egress_count = config.egress_control.allowed_target_cidrs.len();
 
     lines.push("------------------------------------".to_string());
-    lines.push("组合策略 (access_control + GeoIP)".to_string());
+    lines.push("组合策略 (access_control + GeoIP + egress + SNAT + MSS)".to_string());
     lines.push("------------------------------------".to_string());
-    lines.push(format!("access_control：模式={ac_mode} entries={ac_count}"));
     lines.push(format!(
-        "GeoIP 转发端口 CN 限制：{}",
-        enabled_label(geoip_forward)
+        "access_control（自定义来源 IP 限制）：模式={ac_mode} entries={ac_count}"
     ));
-    lines.push(format!("GeoIP SSH CN 限制：{}", enabled_label(geoip_ssh)));
+    lines.push(format!(
+        "GeoIP 来源限制（国家/地区 IP）：转发端口={} SSH={}",
+        enabled_label(geoip_forward),
+        enabled_label(geoip_ssh)
+    ));
+    lines.push(format!(
+        "egress_control（目标 IP / IP 段限制）：{} allowed_target_cidrs={}",
+        enabled_label(egress_enabled),
+        egress_count
+    ));
+    lines.push(format!(
+        "SNAT（源地址改写）：{}",
+        describe_snat_mode(&config.snat)
+    ));
+    lines.push(format!(
+        "MSS clamp（TCP MSS 调整）：{} size={}",
+        enabled_label(config.mss_clamp.enabled),
+        config.mss_clamp.size
+    ));
     lines.push("评估顺序：黑名单 > 白名单 > GeoIP（同时启用 = AND）".to_string());
     lines.push(combined_allow_summary(ac_mode, geoip_forward));
+    lines.push(combined_target_summary(egress_enabled, egress_count));
+    if config.snat.mode == SnatMode::Off {
+        lines.push(
+            "警告：未生成 SNAT，需自行保证回程路由。SNAT=off 不会生成 masquerade / snat 规则，转发可能不通；普通 VPS 推荐 masquerade。".to_string(),
+        );
+    }
+    if config.snat.mode == SnatMode::Fixed {
+        lines.push(
+            "提示：fixed SNAT 第一版仅支持 IPv4；IPv6 / NAT66 规则会回退到 masquerade。"
+                .to_string(),
+        );
+    }
+    if config.mss_clamp.enabled {
+        lines.push(
+            "提示：MSS clamp 仅作用于本项目转发相关 TCP 流量（按 DNAT 后目标端口匹配），不影响 UDP 或非本项目端口。".to_string(),
+        );
+    }
+    lines.push(
+        "说明：access_control 与 GeoIP 是来源 IP 限制；egress_control 是目标 IP 限制；SNAT 是源地址改写；MSS clamp 是 TCP MSS 调整。这些功能叠加生效，不是互相覆盖。".to_string(),
+    );
     lines.push("注意：黑名单/白名单不影响 SSH；GeoIP SSH 限制由 geoip.ssh 单独控制。".to_string());
     lines
 }
 
 fn enabled_label(flag: bool) -> &'static str {
     if flag { "enabled" } else { "disabled" }
+}
+
+fn describe_snat_mode(snat: &SnatConfig) -> String {
+    match snat.mode {
+        SnatMode::Masquerade => "masquerade".to_string(),
+        SnatMode::Off => "off（不生成 SNAT 规则）".to_string(),
+        SnatMode::Fixed => {
+            if snat.fixed_source_ip.trim().is_empty() {
+                "fixed（fixed_source_ip 未设置，将回退到 masquerade）".to_string()
+            } else {
+                format!("fixed snat to {}", snat.fixed_source_ip)
+            }
+        }
+    }
+}
+
+fn combined_target_summary(egress_enabled: bool, egress_count: usize) -> String {
+    if !egress_enabled {
+        "最终目标策略：未启用 egress_control，允许转发到任意目标 IP".to_string()
+    } else if egress_count == 0 {
+        "最终目标策略：egress_control 已启用但 allowed_target_cidrs 为空，所有转发规则都会被跳过"
+            .to_string()
+    } else {
+        format!(
+            "最终目标策略：仅允许转发到 allowed_target_cidrs 内的目标 IP（共 {egress_count} 条）"
+        )
+    }
 }
 
 fn combined_allow_summary(mode: &AccessControlMode, geoip_forward: bool) -> String {
@@ -990,6 +1355,15 @@ fn toggle_geoip_forward(config_path: &str) -> Result<(), io::Error> {
     }
     backup_config(config_path)?;
     save_toml_config(config_path, &config)?;
+    audit_cli(
+        config_path,
+        "geoip.update",
+        AuditResult::Ok,
+        json!({
+            "target": "forward",
+            "enabled": config.geoip.forward.enabled,
+        }),
+    );
     println!(
         "转发端口 CN 限制已{}",
         if config.geoip.forward.enabled {
@@ -1047,6 +1421,16 @@ fn toggle_geoip_ssh(config_path: &str) -> Result<(), io::Error> {
     }
     backup_config(config_path)?;
     save_toml_config(config_path, &config)?;
+    audit_cli(
+        config_path,
+        "geoip.update",
+        AuditResult::Ok,
+        json!({
+            "target": "ssh",
+            "enabled": config.geoip.ssh.enabled,
+            "port": config.geoip.ssh.port,
+        }),
+    );
     println!(
         "SSH CN 限制已{}",
         if config.geoip.ssh.enabled {
@@ -1177,6 +1561,10 @@ fn show_egress_status(config_path: &str) {
             println!("  {}) {cidr}", idx + 1);
         }
     }
+    println!();
+    for line in format_combined_policy_status(&config) {
+        println!("{line}");
+    }
 }
 
 fn toggle_egress_control(config_path: &str) -> Result<(), io::Error> {
@@ -1200,6 +1588,15 @@ fn toggle_egress_control(config_path: &str) -> Result<(), io::Error> {
     }
     backup_config(config_path)?;
     save_toml_config(config_path, &config)?;
+    audit_cli(
+        config_path,
+        "egress_control.update",
+        AuditResult::Ok,
+        json!({
+            "enabled": config.egress_control.enabled,
+            "allowed_target_cidrs": config.egress_control.allowed_target_cidrs.len(),
+        }),
+    );
     println!(
         "出口目标限制已{}",
         if config.egress_control.enabled {
@@ -1310,11 +1707,11 @@ BBR / Telegram 状态
                 wait_enter_to_return()?;
             }
             "2" => {
-                enable_bbr_interactive()?;
+                enable_bbr_interactive(config_path)?;
                 wait_enter_to_return()?;
             }
             "3" => {
-                disable_bbr_interactive()?;
+                disable_bbr_interactive(config_path)?;
                 wait_enter_to_return()?;
             }
             "4" => {
@@ -1391,7 +1788,7 @@ fn run_sysctl_set(key: &str, value: &str) -> Result<(), io::Error> {
     }
 }
 
-fn enable_bbr_interactive() -> Result<(), io::Error> {
+fn enable_bbr_interactive(config_path: &str) -> Result<(), io::Error> {
     if !confirm("开启 BBR？[y/N]: ")? {
         println!("已取消。");
         return Ok(());
@@ -1408,12 +1805,13 @@ fn enable_bbr_interactive() -> Result<(), io::Error> {
     )?;
     run_sysctl_set("net.core.default_qdisc", "fq")?;
     run_sysctl_set("net.ipv4.tcp_congestion_control", "bbr")?;
+    audit_cli(config_path, "bbr.enable", AuditResult::Ok, json!({}));
     println!("BBR 已开启。");
     show_bbr_status();
     Ok(())
 }
 
-fn disable_bbr_interactive() -> Result<(), io::Error> {
+fn disable_bbr_interactive(config_path: &str) -> Result<(), io::Error> {
     if !confirm("关闭 BBR？[y/N]: ")? {
         println!("已取消。");
         return Ok(());
@@ -1438,6 +1836,7 @@ fn disable_bbr_interactive() -> Result<(), io::Error> {
         "当前拥塞控制算法: {}",
         read_proc_value("/proc/sys/net/ipv4/tcp_congestion_control")
     );
+    audit_cli(config_path, "bbr.disable", AuditResult::Ok, json!({}));
     Ok(())
 }
 
@@ -1487,6 +1886,16 @@ fn configure_telegram(config_path: &str) -> Result<(), io::Error> {
     }
     backup_config(config_path)?;
     save_toml_config(config_path, &config)?;
+    audit_cli(
+        config_path,
+        "telegram.config.update",
+        AuditResult::Ok,
+        json!({
+            "bot_token": audit::mask_secret_str(&config.telegram.bot_token),
+            "chat_id": audit::mask_secret_str(&config.telegram.chat_id),
+            "enabled": config.telegram.enabled,
+        }),
+    );
     println!("Telegram 配置已保存，状态页默认不会明文显示 bot_token。");
     print_config_saved_hint(config_path);
     Ok(())
@@ -1598,7 +2007,8 @@ fn set_telegram_interval(config_path: &str) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn uninstall_menu() -> Result<(), io::Error> {
+fn uninstall_menu(config_path: &str) -> Result<(), io::Error> {
+    audit_cli(config_path, "uninstall.start", AuditResult::Info, json!({}));
     println!(
         r#"====================================
 卸载 / 清理 nftables-nat-rust-enhanced
@@ -1800,7 +2210,7 @@ fn print_uninstall_report(report: &UninstallReport) {
     println!("后续如需重新安装，请参考 README 的一键安装命令。");
 }
 
-fn update_menu() -> Result<(), io::Error> {
+fn update_menu(config_path: &str) -> Result<(), io::Error> {
     println!(
         r#"====================================
 一键更新 nftables-nat-rust-enhanced
@@ -1859,14 +2269,32 @@ fn update_menu() -> Result<(), io::Error> {
         "curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- {}",
         args.join(" ")
     );
+    audit_cli(
+        config_path,
+        "update.start",
+        AuditResult::Info,
+        json!({"version": version}),
+    );
     println!("开始更新，install.sh 会负责备份、重启和失败回滚。");
     let status = Command::new("sh").arg("-c").arg(command_line).status()?;
     if !status.success() {
+        audit_cli(
+            config_path,
+            "update.fail",
+            AuditResult::Fail,
+            json!({"version": version, "exit_status": status.to_string()}),
+        );
         println!("更新命令执行失败。install.sh 会保留旧二进制并在可能时回滚，请查看输出和服务日志");
         wait_enter_to_return()?;
         return Ok(());
     }
 
+    audit_cli(
+        config_path,
+        "update.success",
+        AuditResult::Ok,
+        json!({"version": version}),
+    );
     println!("更新完成，正在重新载入新版 CLI 菜单...");
     match installed_nat_version() {
         Some(v) => println!("已安装版本: {v}"),
@@ -1928,6 +2356,353 @@ fn tty_available() -> bool {
 
 fn reexec_menu(bin: &str) -> io::Error {
     Command::new(bin).arg("--menu").exec()
+}
+
+/// 查看最近 50 行 audit 日志
+fn view_audit_log_interactive(config_path: &str) -> Result<(), io::Error> {
+    let audit_cfg = audit_config_from(config_path);
+    println!("====================================");
+    println!("审计日志（最近 50 行）");
+    println!("====================================");
+    println!("audit.enabled: {}", audit_cfg.enabled);
+    println!("audit.file: {}", audit_cfg.file);
+    if !audit_cfg.enabled {
+        println!("提示：audit.enabled = false，CLI 操作不会写入审计日志。");
+    }
+    let lines = audit::read_tail(&audit_cfg.file, 50);
+    if lines.is_empty() {
+        println!("（无日志或文件不存在）");
+    } else {
+        for line in lines {
+            println!("{line}");
+        }
+    }
+    println!();
+    println!(
+        "提示：每条审计日志为一行 JSON，便于 grep。完整文件位于 {}",
+        audit_cfg.file
+    );
+    wait_enter_to_return()?;
+    Ok(())
+}
+
+/// 把 last-good 缓存状态摘要追加到状态展示页
+pub(crate) fn format_last_good_status(config: &TomlConfig) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("------------------------------------".to_string());
+    lines.push("last-good 状态缓存".to_string());
+    lines.push("------------------------------------".to_string());
+    lines.push(format!(
+        "enabled: {} use_last_good_on_dns_failure: {}",
+        config.last_good.enabled, config.last_good.use_last_good_on_dns_failure
+    ));
+    lines.push(format!("file: {}", config.last_good.file));
+    let state = LastGoodState::load(&config.last_good.file);
+    lines.push(format!("规则缓存数量: {}", state.rules.len()));
+    match state.last_success_at {
+        Some(ts) => lines.push(format!("最近成功应用时间: {}", ts.to_rfc3339())),
+        None => lines.push("最近成功应用时间: (无)".to_string()),
+    }
+    for rule in &state.rules {
+        let comment = rule.comment.clone().unwrap_or_else(|| "-".to_string());
+        lines.push(format!(
+            "  {} ({}) domain={} last_good_ip={} resolved_at={} egress={} status={}",
+            rule.rule_id,
+            comment,
+            rule.domain,
+            rule.last_good_ip,
+            rule.last_resolved_at.to_rfc3339(),
+            rule.egress_allowed,
+            rule.last_apply_status,
+        ));
+    }
+    lines
+}
+
+fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
+    loop {
+        let config = match load_toml_config(config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("读取配置失败: {e}");
+                wait_enter_to_return()?;
+                return Ok(());
+            }
+        };
+        print_advanced_network_status(&config);
+        println!(
+            r#"====================================
+高级网络设置 (SNAT / MSS clamp)
+====================================
+1) 查看 SNAT / MSS 状态
+2) 设置 SNAT 模式
+3) 设置 fixed SNAT 源 IP
+4) 启用 / 禁用 MSS clamp
+5) 设置 MSS clamp size
+0) 返回主菜单
+===================================="#
+        );
+        let choice = prompt("请选择操作: ")?;
+        match choice.trim() {
+            "1" => {
+                // status already printed above; let user confirm
+                wait_enter_to_return()?;
+            }
+            "2" => {
+                set_snat_mode_interactive(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "3" => {
+                set_snat_fixed_source_ip_interactive(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "4" => {
+                toggle_mss_clamp_interactive(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "5" => {
+                set_mss_clamp_size_interactive(config_path)?;
+                wait_enter_to_return()?;
+            }
+            "0" => break,
+            value if is_menu_refresh_command(value) => break,
+            "" => continue,
+            _ => {
+                println!("未知选项: {}", choice.trim());
+                wait_enter_to_return()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_advanced_network_status(config: &TomlConfig) {
+    let snat = &config.snat;
+    let mss = &config.mss_clamp;
+    println!("====================================");
+    println!("SNAT / MSS clamp 状态");
+    println!("====================================");
+    println!("SNAT 模式：{}", snat.mode);
+    let ip = if snat.fixed_source_ip.trim().is_empty() {
+        "未设置".to_string()
+    } else {
+        snat.fixed_source_ip.clone()
+    };
+    println!("fixed_source_ip：{ip}");
+    println!("MSS clamp：{}", enabled_label(mss.enabled));
+    println!("MSS size：{}", mss.size);
+    println!();
+    for line in format_combined_policy_status(config) {
+        println!("{line}");
+    }
+}
+
+fn set_snat_mode_interactive(config_path: &str) -> Result<(), io::Error> {
+    println!(
+        r#"请选择 SNAT 模式：
+1) masquerade，默认推荐
+2) fixed，固定 SNAT 到指定源 IP（第一版仅 IPv4）
+3) off，不生成 SNAT 规则（高级用户）
+0) 取消"#
+    );
+    let choice = prompt("请选择 [0/1/2/3]: ")?;
+    let mode = match choice.trim() {
+        "1" => SnatMode::Masquerade,
+        "2" => SnatMode::Fixed,
+        "3" => SnatMode::Off,
+        "0" => {
+            println!("已取消");
+            return Ok(());
+        }
+        _ => {
+            println!("未知选项: {}", choice.trim());
+            return Ok(());
+        }
+    };
+    if mode == SnatMode::Off {
+        println!(
+            "警告：SNAT=off 不会生成 masquerade / snat 规则，必须由用户自行保证回程路由，否则转发可能不通。普通 VPS 推荐 masquerade。"
+        );
+        if !confirm("仍要切换到 off？[y/N]: ")? {
+            println!("已取消");
+            return Ok(());
+        }
+    }
+    if mode == SnatMode::Fixed {
+        println!("提示：fixed SNAT 第一版仅支持 IPv4；IPv6 / NAT66 规则会回退到 masquerade。");
+    }
+    let mut config = load_toml_config(config_path)?;
+    config.snat.mode = mode;
+    if mode == SnatMode::Fixed && config.snat.fixed_source_ip.trim().is_empty() {
+        let entry = prompt("请输入 fixed_source_ip，例如 10.100.0.10: ")?;
+        validate_fixed_source_ip(&entry)?;
+        config.snat.fixed_source_ip = entry;
+    }
+    config
+        .snat
+        .validate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    audit_cli(
+        config_path,
+        "snat.update",
+        AuditResult::Ok,
+        json!({
+            "mode": config.snat.mode.to_string(),
+            "fixed_source_ip_set": !config.snat.fixed_source_ip.trim().is_empty(),
+        }),
+    );
+    println!("SNAT 模式已设为 {}。", config.snat.mode);
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn set_snat_fixed_source_ip_interactive(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    println!(
+        "当前 fixed_source_ip：{}",
+        if config.snat.fixed_source_ip.trim().is_empty() {
+            "未设置"
+        } else {
+            &config.snat.fixed_source_ip
+        }
+    );
+    let entry = prompt("请输入 fixed_source_ip，例如 10.100.0.10（留空清除）: ")?;
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        if config.snat.mode == SnatMode::Fixed {
+            println!("WARN: 当前 snat.mode=fixed，清空 fixed_source_ip 会导致配置校验失败，已取消");
+            return Ok(());
+        }
+        config.snat.fixed_source_ip = String::new();
+    } else {
+        validate_fixed_source_ip(trimmed)?;
+        config.snat.fixed_source_ip = trimmed.to_string();
+    }
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    audit_cli(
+        config_path,
+        "snat.update",
+        AuditResult::Ok,
+        json!({
+            "mode": config.snat.mode.to_string(),
+            "fixed_source_ip_set": !config.snat.fixed_source_ip.trim().is_empty(),
+        }),
+    );
+    println!(
+        "fixed_source_ip 已设为 {}。",
+        if config.snat.fixed_source_ip.is_empty() {
+            "(空)"
+        } else {
+            &config.snat.fixed_source_ip
+        }
+    );
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+pub(crate) fn validate_fixed_source_ip(value: &str) -> Result<(), io::Error> {
+    let probe = SnatConfig {
+        mode: SnatMode::Fixed,
+        fixed_source_ip: value.to_string(),
+    };
+    probe
+        .validate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+}
+
+fn toggle_mss_clamp_interactive(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    println!(
+        "当前 MSS clamp：{}（size={}）",
+        enabled_label(config.mss_clamp.enabled),
+        config.mss_clamp.size
+    );
+    if config.mss_clamp.enabled {
+        if !confirm("关闭 MSS clamp? [y/N]: ")? {
+            println!("已取消");
+            return Ok(());
+        }
+        config.mss_clamp.enabled = false;
+    } else {
+        println!(
+            "提示：MSS clamp 适合多跳 / 隧道 / po0 / MTU 异常场景；不懂 MTU/MSS 时不建议随意开启。"
+        );
+        if !confirm("启用 MSS clamp? [y/N]: ")? {
+            println!("已取消");
+            return Ok(());
+        }
+        config.mss_clamp.enabled = true;
+    }
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    audit_cli(
+        config_path,
+        "mss_clamp.update",
+        AuditResult::Ok,
+        json!({
+            "enabled": config.mss_clamp.enabled,
+            "size": config.mss_clamp.size,
+        }),
+    );
+    println!(
+        "MSS clamp 已{}",
+        if config.mss_clamp.enabled {
+            "启用"
+        } else {
+            "禁用"
+        }
+    );
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+fn set_mss_clamp_size_interactive(config_path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    println!("当前 MSS size：{}", config.mss_clamp.size);
+    let entry = prompt(&format!(
+        "请输入 MSS size，范围 {MSS_CLAMP_MIN}-{MSS_CLAMP_MAX}，推荐 1452: "
+    ))?;
+    let size = parse_mss_size(&entry)?;
+    config.mss_clamp.size = size;
+    config
+        .mss_clamp
+        .validate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    backup_config(config_path)?;
+    save_toml_config(config_path, &config)?;
+    audit_cli(
+        config_path,
+        "mss_clamp.update",
+        AuditResult::Ok,
+        json!({
+            "enabled": config.mss_clamp.enabled,
+            "size": size,
+        }),
+    );
+    println!("MSS size 已设为 {size}。");
+    print_config_saved_hint(config_path);
+    Ok(())
+}
+
+pub(crate) fn parse_mss_size(value: &str) -> Result<u16, io::Error> {
+    let trimmed = value.trim();
+    let size: u16 = trimmed.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("MSS size 必须是数字: {trimmed}"),
+        )
+    })?;
+    let probe = MssClampConfig {
+        enabled: false,
+        size,
+    };
+    probe
+        .validate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    Ok(size)
 }
 
 fn current_version_for_update() -> String {
@@ -2010,6 +2785,68 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
         "  resolved ip: {}",
         rule.resolved_ip.as_deref().unwrap_or("解析失败或暂不可用")
     );
+    let rule_id = format!("r{}", rule.index);
+    let last_good_state = LastGoodState::load(&config.last_good.file);
+    let cached = last_good_state.lookup(&rule_id);
+    match (rule.resolved_ip.as_deref(), cached) {
+        (Some(ip), Some(cached)) if ip == cached.last_good_ip => {
+            println!(
+                "  解析来源: {} (与 last-good 缓存一致)",
+                ResolveSource::Live.as_str()
+            );
+            println!(
+                "  上次成功解析时间: {}",
+                cached.last_resolved_at.to_rfc3339()
+            );
+        }
+        (Some(_), Some(cached)) => {
+            println!(
+                "  解析来源: {} (实时解析，缓存中的旧 IP 为 {})",
+                ResolveSource::Live.as_str(),
+                cached.last_good_ip
+            );
+            println!(
+                "  上次成功解析时间: {}",
+                cached.last_resolved_at.to_rfc3339()
+            );
+        }
+        (Some(_), None) => {
+            println!(
+                "  解析来源: {} (last-good 缓存中无此规则记录)",
+                ResolveSource::Live.as_str()
+            );
+        }
+        (None, Some(cached)) => {
+            println!(
+                "  解析来源: 当前实时解析失败；若 last_good.enabled=true 会回退到 last-good IP {}",
+                cached.last_good_ip
+            );
+            println!(
+                "  last-good 上次成功解析时间: {}",
+                cached.last_resolved_at.to_rfc3339()
+            );
+            println!(
+                "  egress_control 判断: {}",
+                if cached.egress_allowed {
+                    "allowed"
+                } else {
+                    "blocked"
+                }
+            );
+        }
+        (None, None) => {
+            println!("  解析来源: 当前实时解析失败，且 last-good 缓存无记录，规则会被跳过");
+        }
+    }
+    if config.egress_control.enabled
+        && let Some(ip) = rule.resolved_ip.as_deref()
+    {
+        let allowed = config.egress_control.allows_ip(ip);
+        println!(
+            "  egress_control 判断: {} (live IP)",
+            if allowed { "allowed" } else { "blocked" }
+        );
+    }
     println!("  dport: {}", rule.dport);
     println!("  protocol: {}", rule.protocol);
     println!("  ip_version: {}", rule.ip_version);
@@ -2085,6 +2922,14 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
         rule.sport
     );
     println!("如果测试后 counter 有变化，可回到 CLI 查看 Stats 流量统计。");
+    println!();
+    for line in format_combined_policy_status(&config) {
+        println!("{line}");
+    }
+    println!();
+    for line in format_last_good_status(&config) {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -2129,6 +2974,10 @@ pub(crate) fn add_single_rule(
         protocol,
         ip_version,
         comment,
+        quota_enabled: false,
+        quota_bytes: 0,
+        quota_period: nat_common::QuotaPeriod::default(),
+        quota_action: nat_common::QuotaAction::default(),
     };
     rule.validate()?;
     config.rules.push(rule);
@@ -2152,6 +3001,10 @@ pub(crate) fn add_range_rule(
         protocol,
         ip_version,
         comment,
+        quota_enabled: false,
+        quota_bytes: 0,
+        quota_period: nat_common::QuotaPeriod::default(),
+        quota_action: nat_common::QuotaAction::default(),
     };
     rule.validate()?;
     config.rules.push(rule);
@@ -2205,7 +3058,50 @@ fn toggle_rule_interactive(path: &str) -> Result<(), io::Error> {
     println!("0) 返回");
     let action = prompt("请选择操作: ")?;
     match action.trim() {
-        "1" => config.rules[rule_index].set_enabled(true),
+        "1" => {
+            // 启用前：若该规则启用了 quota 且当前周期已用流量仍超过配额，警告用户
+            // 下一轮 quota 检查会再次自动禁用，并清除该规则的 notified 标记以便重新通知
+            if config.rules[rule_index].quota_enabled()
+                && config.rules[rule_index].quota_bytes() > 0
+            {
+                let rule_id = format!("r{rule_index}");
+                let stats_state = traffic_stats::load_state(&config.stats.data_file);
+                let used = match config.rules[rule_index].quota_period() {
+                    QuotaPeriod::Daily => stats_state
+                        .per_rule_daily_bytes
+                        .get(&rule_id)
+                        .copied()
+                        .unwrap_or(0),
+                    QuotaPeriod::Monthly => stats_state
+                        .per_rule_monthly_bytes
+                        .get(&rule_id)
+                        .copied()
+                        .unwrap_or(0),
+                    QuotaPeriod::Total => stats_state
+                        .per_rule_total_bytes
+                        .get(&rule_id)
+                        .copied()
+                        .unwrap_or(0),
+                };
+                let limit = config.rules[rule_index].quota_bytes();
+                if used >= limit {
+                    println!(
+                        "当前周期已用流量仍超过配额（{} >= {}），重新启用后可能再次自动禁用。",
+                        quota::format_bytes(used),
+                        quota::format_bytes(limit)
+                    );
+                }
+                let mut quota_state = quota::QuotaState::load(&config.quota.state_file);
+                quota_state.clear_for_rule(&rule_id);
+                if let Err(e) = quota_state.save(&config.quota.state_file) {
+                    warn!(
+                        "重置 quota 通知去重状态失败 ({}): {e}",
+                        config.quota.state_file
+                    );
+                }
+            }
+            config.rules[rule_index].set_enabled(true);
+        }
         "2" => config.rules[rule_index].set_enabled(false),
         "0" => return Ok(()),
         _ => {
@@ -2217,14 +3113,18 @@ fn toggle_rule_interactive(path: &str) -> Result<(), io::Error> {
 
     backup_config(path)?;
     save_toml_config(path, &config)?;
-    println!(
-        "规则已{}。",
-        if config.rules[rule_index].enabled() {
-            "启用"
+    let now_enabled = config.rules[rule_index].enabled();
+    audit_cli(
+        path,
+        if now_enabled {
+            "rule.enable"
         } else {
-            "禁用"
-        }
+            "rule.disable"
+        },
+        AuditResult::Ok,
+        json!({"index": rule_index}),
     );
+    println!("规则已{}。", if now_enabled { "启用" } else { "禁用" });
     print_config_saved_hint(path);
     wait_enter_to_return()?;
     Ok(())
@@ -2496,6 +3396,11 @@ mod tests {
             access_control: Default::default(),
             geoip: Default::default(),
             egress_control: Default::default(),
+            snat: Default::default(),
+            mss_clamp: Default::default(),
+            last_good: Default::default(),
+            audit: Default::default(),
+            quota: Default::default(),
         };
         add_single_rule(
             &mut config,
@@ -2522,6 +3427,11 @@ mod tests {
             access_control: Default::default(),
             geoip: Default::default(),
             egress_control: Default::default(),
+            snat: Default::default(),
+            mss_clamp: Default::default(),
+            last_good: Default::default(),
+            audit: Default::default(),
+            quota: Default::default(),
         };
         add_range_rule(
             &mut config,
@@ -2763,8 +3673,8 @@ domain = "example.com"
             false,
         );
         let lines = format_combined_policy_status(&cfg).join("\n");
-        assert!(lines.contains("access_control：模式=blacklist entries=1"));
-        assert!(lines.contains("GeoIP 转发端口 CN 限制：enabled"));
+        assert!(lines.contains("access_control（自定义来源 IP 限制）：模式=blacklist entries=1"));
+        assert!(lines.contains("GeoIP 来源限制（国家/地区 IP）：转发端口=enabled SSH=disabled"));
         assert!(lines.contains("评估顺序：黑名单 > 白名单 > GeoIP（同时启用 = AND）"));
         assert!(lines.contains("允许 = 不在黑名单 AND 属于 CN/LAN"));
     }
@@ -2779,7 +3689,7 @@ domain = "example.com"
             false,
         );
         let lines = format_combined_policy_status(&cfg).join("\n");
-        assert!(lines.contains("access_control：模式=whitelist entries=2"));
+        assert!(lines.contains("access_control（自定义来源 IP 限制）：模式=whitelist entries=2"));
         assert!(lines.contains("允许 = 在白名单 AND 属于 CN/LAN"));
     }
 
@@ -2807,9 +3717,362 @@ domain = "example.com"
             true,
         );
         let lines = format_combined_policy_status(&cfg).join("\n");
-        assert!(lines.contains("GeoIP 转发端口 CN 限制：disabled"));
+        assert!(lines.contains("GeoIP 来源限制（国家/地区 IP）：转发端口=disabled SSH=enabled"));
         assert!(lines.contains("允许 = 不在黑名单"));
         assert!(!lines.contains("AND 属于 CN/LAN"));
+    }
+
+    #[test]
+    fn combined_policy_includes_egress_snat_mss() {
+        let mut cfg = make_config(AccessControlMode::Off, &[], false, false, false);
+        cfg.egress_control.enabled = true;
+        cfg.egress_control.allowed_target_cidrs = vec!["10.100.0.0/24".to_string()];
+        cfg.snat.mode = SnatMode::Fixed;
+        cfg.snat.fixed_source_ip = "10.100.0.10".to_string();
+        cfg.mss_clamp.enabled = true;
+        cfg.mss_clamp.size = 1452;
+        let lines = format_combined_policy_status(&cfg).join("\n");
+        assert!(
+            lines.contains("egress_control（目标 IP / IP 段限制）：enabled allowed_target_cidrs=1")
+        );
+        assert!(lines.contains("SNAT（源地址改写）：fixed snat to 10.100.0.10"));
+        assert!(lines.contains("MSS clamp（TCP MSS 调整）：enabled size=1452"));
+        assert!(lines.contains("最终目标策略：仅允许转发到 allowed_target_cidrs 内的目标 IP"));
+        assert!(lines.contains(
+            "说明：access_control 与 GeoIP 是来源 IP 限制；egress_control 是目标 IP 限制；SNAT 是源地址改写；MSS clamp 是 TCP MSS 调整。"
+        ));
+    }
+
+    #[test]
+    fn combined_policy_describes_snat_off_and_empty_egress() {
+        let mut cfg = make_config(AccessControlMode::Off, &[], false, false, false);
+        cfg.snat.mode = SnatMode::Off;
+        cfg.egress_control.enabled = true;
+        cfg.egress_control.allowed_target_cidrs = Vec::new();
+        let lines = format_combined_policy_status(&cfg).join("\n");
+        assert!(lines.contains("SNAT（源地址改写）：off（不生成 SNAT 规则）"));
+        assert!(lines.contains(
+            "最终目标策略：egress_control 已启用但 allowed_target_cidrs 为空，所有转发规则都会被跳过"
+        ));
+    }
+
+    #[test]
+    fn combined_policy_emits_off_route_warning_for_snat_off() {
+        let mut cfg = make_config(AccessControlMode::Off, &[], false, false, false);
+        cfg.snat.mode = SnatMode::Off;
+        let lines = format_combined_policy_status(&cfg).join("\n");
+        assert!(
+            lines.contains("警告：未生成 SNAT，需自行保证回程路由"),
+            "SNAT=off must trigger return-route warning in CLI status"
+        );
+        assert!(
+            lines.contains("普通 VPS 推荐 masquerade"),
+            "warning should also suggest masquerade for ordinary VPS"
+        );
+    }
+
+    #[test]
+    fn combined_policy_emits_ipv4_only_hint_for_snat_fixed() {
+        let mut cfg = make_config(AccessControlMode::Off, &[], false, false, false);
+        cfg.snat.mode = SnatMode::Fixed;
+        cfg.snat.fixed_source_ip = "10.100.0.10".to_string();
+        let lines = format_combined_policy_status(&cfg).join("\n");
+        assert!(
+            lines.contains("fixed SNAT 第一版仅支持 IPv4"),
+            "fixed SNAT should advertise its IPv4-only limitation"
+        );
+    }
+
+    #[test]
+    fn combined_policy_emits_mss_scope_hint_when_enabled() {
+        let mut cfg = make_config(AccessControlMode::Off, &[], false, false, false);
+        cfg.mss_clamp.enabled = true;
+        let lines = format_combined_policy_status(&cfg).join("\n");
+        assert!(
+            lines.contains("MSS clamp 仅作用于本项目转发相关 TCP 流量"),
+            "enabled MSS clamp should advertise its scope"
+        );
+        assert!(
+            lines.contains("不影响 UDP 或非本项目端口"),
+            "enabled MSS clamp should clarify it does not touch UDP / other ports"
+        );
+    }
+
+    #[test]
+    fn combined_policy_no_off_warning_when_snat_masquerade_or_fixed() {
+        let cfg_masq = make_config(AccessControlMode::Off, &[], false, false, false);
+        let lines_masq = format_combined_policy_status(&cfg_masq).join("\n");
+        assert!(!lines_masq.contains("警告：未生成 SNAT"));
+
+        let mut cfg_fixed = make_config(AccessControlMode::Off, &[], false, false, false);
+        cfg_fixed.snat.mode = SnatMode::Fixed;
+        cfg_fixed.snat.fixed_source_ip = "10.100.0.10".to_string();
+        let lines_fixed = format_combined_policy_status(&cfg_fixed).join("\n");
+        assert!(!lines_fixed.contains("警告：未生成 SNAT"));
+    }
+
+    #[test]
+    fn validate_fixed_source_ip_accepts_ipv4() {
+        assert!(validate_fixed_source_ip("10.100.0.10").is_ok());
+    }
+
+    #[test]
+    fn validate_fixed_source_ip_rejects_empty_and_ipv6_and_invalid() {
+        assert!(validate_fixed_source_ip("").is_err());
+        assert!(validate_fixed_source_ip("2001:db8::1").is_err());
+        assert!(validate_fixed_source_ip("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn parse_mss_size_accepts_boundary_values() {
+        assert_eq!(parse_mss_size("536").unwrap(), 536);
+        assert_eq!(parse_mss_size("1460").unwrap(), 1460);
+        assert_eq!(parse_mss_size(" 1452 ").unwrap(), 1452);
+    }
+
+    #[test]
+    fn parse_mss_size_rejects_out_of_range_and_non_numeric() {
+        assert!(parse_mss_size("535").is_err());
+        assert!(parse_mss_size("1461").is_err());
+        assert!(parse_mss_size("abc").is_err());
+    }
+
+    #[test]
+    fn readme_documents_snat_mss_combined_policy() {
+        let readme = include_str!("../../README.md");
+        assert!(
+            readme.contains("### SNAT 模式"),
+            "README should document SNAT modes"
+        );
+        assert!(
+            readme.contains("mode = \"fixed\""),
+            "README should show fixed example"
+        );
+        assert!(
+            readme.contains("### MSS clamp"),
+            "README should document MSS clamp"
+        );
+        assert!(
+            readme.contains("size = 1452"),
+            "README should mention default MSS size"
+        );
+        assert!(
+            readme.contains("### 组合策略说明"),
+            "README should have combined policy section"
+        );
+        assert!(
+            readme.contains("`access_control`") && readme.contains("来源 IP / CIDR"),
+            "README combined-policy section should label access_control as source IP restriction"
+        );
+        assert!(
+            readme.contains("`egress_control`") && readme.contains("目标 IP / CIDR"),
+            "README combined-policy section should label egress_control as target IP restriction"
+        );
+        assert!(
+            readme.contains("`snat`") && readme.contains("源地址改写"),
+            "README combined-policy section should label snat as source rewrite"
+        );
+        assert!(
+            readme.contains("`mss_clamp`") && readme.contains("TCP MSS 调整"),
+            "README combined-policy section should label mss_clamp as TCP MSS adjustment"
+        );
+        assert!(
+            readme.contains("多个来源限制同时开启时采用叠加限制（AND），不是 OR 放行"),
+            "README should state AND semantics, not OR"
+        );
+    }
+
+    #[test]
+    fn cli_audit_helpers_emit_one_json_line_per_action() {
+        let dir = std::env::temp_dir().join(format!(
+            "nat-menu-audit-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.log");
+        let config_path = dir.join("nat.toml");
+        let toml = format!(
+            "rules = []\n\n[audit]\nenabled = true\nfile = \"{}\"\n",
+            audit_path.to_string_lossy()
+        );
+        std::fs::write(&config_path, toml).unwrap();
+        audit_cli(
+            config_path.to_str().unwrap(),
+            "rule.add",
+            AuditResult::Ok,
+            json!({"sport": 30080}),
+        );
+        audit_cli(
+            config_path.to_str().unwrap(),
+            "telegram.config.update",
+            AuditResult::Ok,
+            json!({"bot_token": "1234567890:ABCDEFGH", "chat_id": "12345"}),
+        );
+        let lines = audit::read_tail(&audit_path.to_string_lossy(), 50);
+        assert_eq!(lines.len(), 2);
+        let l0: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let l1: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(l0["action"], "rule.add");
+        assert_eq!(l1["action"], "telegram.config.update");
+        let token_str = l1["detail"]["bot_token"].as_str().unwrap();
+        assert!(
+            !token_str.contains("ABCDEFGH"),
+            "CLI must hand audit module a pre-masked or recognized-secret bot_token: {token_str}"
+        );
+        assert!(token_str.contains("***"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_audit_disabled_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "nat-menu-audit-off-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.log");
+        let config_path = dir.join("nat.toml");
+        let toml = format!(
+            "rules = []\n\n[audit]\nenabled = false\nfile = \"{}\"\n",
+            audit_path.to_string_lossy()
+        );
+        std::fs::write(&config_path, toml).unwrap();
+        audit_cli(
+            config_path.to_str().unwrap(),
+            "rule.add",
+            AuditResult::Ok,
+            json!({}),
+        );
+        assert!(audit::read_tail(&audit_path.to_string_lossy(), 50).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_audit_failure_does_not_break_main_flow() {
+        // audit.file 指向不可写路径，主流程不应 panic
+        let dir = std::env::temp_dir().join(format!(
+            "nat-menu-audit-fail-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("nat.toml");
+        let toml =
+            "rules = []\n\n[audit]\nenabled = true\nfile = \"/proc/cannot/write/here/audit.log\"\n";
+        std::fs::write(&config_path, toml).unwrap();
+        audit_cli(
+            config_path.to_str().unwrap(),
+            "apply.fail",
+            AuditResult::Fail,
+            json!({"reason": "x"}),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_audit_does_not_log_raw_bot_token() {
+        // 直接断言 mask_secret_str 的行为以及 audit.log_event 兜底 redaction
+        let dir = std::env::temp_dir().join(format!(
+            "nat-menu-redact-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.log").to_string_lossy().to_string();
+        let audit_cfg = AuditConfig {
+            enabled: true,
+            file: audit_path.clone(),
+        };
+        // 即使调用方意外把原始 token 塞进 detail，audit 模块也会兜底 redact
+        audit::log_event(
+            &audit_cfg,
+            "telegram.config.update",
+            AuditResult::Ok,
+            json!({"bot_token": "1234567890:LEAKME_PLEASE", "chat_id": "99999"}),
+        );
+        let lines = audit::read_tail(&audit_path, 50);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            !lines[0].contains("LEAKME_PLEASE"),
+            "audit log must never contain raw bot_token: {}",
+            lines[0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_good_status_includes_summary_lines() {
+        let mut cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        cfg.last_good = nat_common::LastGoodConfig {
+            enabled: true,
+            file: "/tmp/this-file-may-not-exist-for-test".to_string(),
+            use_last_good_on_dns_failure: true,
+        };
+        let lines = format_last_good_status(&cfg).join("\n");
+        assert!(lines.contains("last-good 状态缓存"));
+        assert!(lines.contains("enabled: true"));
+        assert!(lines.contains("use_last_good_on_dns_failure: true"));
+        assert!(lines.contains("file: /tmp/this-file-may-not-exist-for-test"));
+    }
+
+    #[test]
+    fn readme_documents_quota() {
+        let readme = include_str!("../../README.md");
+        assert!(
+            readme.contains("### 规则级流量配额 quota"),
+            "README should document quota"
+        );
+        assert!(readme.contains("[quota]"));
+        assert!(readme.contains("quota_enabled"));
+        assert!(readme.contains("quota_period"));
+        assert!(
+            readme.contains("100GB") && readme.contains("MiB"),
+            "README should document size formats"
+        );
+        assert!(
+            readme.contains("Stats 流量统计")
+                && (readme.contains("不另起一套") || readme.contains("基于现有")),
+            "README should explain quota uses existing Stats"
+        );
+        assert!(
+            readme.contains("自动禁用"),
+            "README should explain auto-disable"
+        );
+        assert!(
+            readme.contains("不直接执行 `nft -f`") || readme.contains("不直接执行 nft -f"),
+            "README must state quota does not directly run nft"
+        );
+        assert!(
+            readme.contains("每个 period 内通知") && readme.contains("一次"),
+            "README should describe notification dedup"
+        );
+    }
+
+    #[test]
+    fn readme_documents_last_good_and_audit() {
+        let readme = include_str!("../../README.md");
+        assert!(
+            readme.contains("### last-good 状态缓存"),
+            "README should document last-good"
+        );
+        assert!(
+            readme.contains("### audit 审计日志"),
+            "README should document audit"
+        );
+        assert!(
+            readme.contains("[last_good]") && readme.contains("[audit]"),
+            "README should show TOML sections"
+        );
+        assert!(
+            readme.contains("Telegram") && readme.contains("脱敏"),
+            "README should mention Telegram bot_token redaction"
+        );
+        assert!(
+            readme.contains("不绕过 `egress_control`"),
+            "README should explain last-good does not bypass egress_control"
+        );
     }
 
     #[test]

@@ -35,6 +35,9 @@ pub struct StatsState {
     pub per_rule_daily_bytes: HashMap<String, u64>,
     #[serde(default)]
     pub per_rule_monthly_bytes: HashMap<String, u64>,
+    /// 累计字节数（不随 day/month 滚动重置）。第一次出现时缺省为 0。
+    #[serde(default)]
+    pub per_rule_total_bytes: HashMap<String, u64>,
     #[serde(default)]
     pub rule_labels: HashMap<String, String>,
     #[serde(default)]
@@ -56,6 +59,7 @@ impl Default for StatsState {
             monthly_total_bytes: 0,
             per_rule_daily_bytes: HashMap::new(),
             per_rule_monthly_bytes: HashMap::new(),
+            per_rule_total_bytes: HashMap::new(),
             rule_labels: HashMap::new(),
             rules: Vec::new(),
             last_day: now.format("%Y-%m-%d").to_string(),
@@ -377,6 +381,10 @@ pub fn apply_counter_snapshot_with_mode(
             .or_default() += delta;
         *state
             .per_rule_monthly_bytes
+            .entry(rule.id.clone())
+            .or_default() += delta;
+        *state
+            .per_rule_total_bytes
             .entry(rule.id.clone())
             .or_default() += delta;
         state.rule_labels.insert(

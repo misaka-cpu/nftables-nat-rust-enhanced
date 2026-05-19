@@ -4,7 +4,9 @@ use ipnetwork::IpNetwork;
 use log::{info, warn};
 use nat_common::{
     AccessControlConfig, AccessControlMode, Chain, DdnsConfig, DnsConfig, EgressControlConfig,
-    IpVersion, NftCell, ParseError, Protocol, StatsConfig, TelegramConfig, TomlConfig,
+    IpVersion, LastGoodConfig, NftCell, ParseError, Protocol, SnatConfig, SnatMode, StatsConfig,
+    TelegramConfig, TomlConfig,
+    last_good::{self, LastGoodState, ResolutionEvent, ResolutionLog, ResolveSource},
 };
 use std::env;
 use std::fmt::Display;
@@ -49,12 +51,17 @@ impl ProtocolExt for Protocol {
 
 /// NftCell构建扩展trait，提供nftables规则构建方法
 pub trait NftCellBuilder {
+    #[allow(clippy::too_many_arguments)]
     fn build_with_rule_index(
         &self,
         rule_index: Option<usize>,
         dns_config: &DnsConfig,
         access_config: &AccessControlConfig,
         egress_config: &EgressControlConfig,
+        snat_config: &SnatConfig,
+        last_good_config: &LastGoodConfig,
+        last_good_state: &LastGoodState,
+        resolution_log: &ResolutionLog,
     ) -> Result<String, io::Error>;
 }
 
@@ -65,36 +72,96 @@ impl NftCellBuilder for NftCell {
         dns_config: &DnsConfig,
         access_config: &AccessControlConfig,
         egress_config: &EgressControlConfig,
+        snat_config: &SnatConfig,
+        last_good_config: &LastGoodConfig,
+        last_good_state: &LastGoodState,
+        resolution_log: &ResolutionLog,
     ) -> Result<String, io::Error> {
         match self {
             NftCell::Drop { .. } => build_drop_rule(self),
             _ => {
-                let (domain, ip_version) = match &self {
+                let (domain, ip_version, user_comment) = match &self {
                     NftCell::Single {
-                        domain, ip_version, ..
-                    } => (domain, ip_version),
+                        domain,
+                        ip_version,
+                        comment,
+                        ..
+                    } => (domain, ip_version, comment.clone()),
                     NftCell::Range {
-                        domain, ip_version, ..
-                    } => (domain, ip_version),
+                        domain,
+                        ip_version,
+                        comment,
+                        ..
+                    } => (domain, ip_version, comment.clone()),
                     NftCell::Redirect { ip_version, .. } => {
-                        // Redirect 是本机重定向，不受 egress_control 约束
+                        // Redirect 是本机重定向，不受 egress_control / snat / last-good 约束
                         return build_redirect_rules(self, ip_version, rule_index, access_config);
                     }
                     NftCell::Drop { .. } => unreachable!(),
                 };
 
-                // 根据配置的IP版本解析目标IP
-                let dst_ip = ip::remote_ip_with_dns(domain, ip_version, dns_config)?;
+                let id_str = rule_index
+                    .map(|i| format!("r{i}"))
+                    .unwrap_or_else(|| "unknown".to_string());
 
-                // egress_control 检查：目标 IP 必须在允许 CIDR 列表中
+                // 域名解析：先 live；失败时按配置回退到 last-good 缓存
+                let (dst_ip, source) = match ip::remote_ip_with_dns(domain, ip_version, dns_config)
+                {
+                    Ok(ip) => {
+                        resolution_log.record(ResolutionEvent::LiveResolved {
+                            rule_id: id_str.clone(),
+                            comment: user_comment.clone(),
+                            domain: domain.clone(),
+                            ip: ip.clone(),
+                        });
+                        (ip, ResolveSource::Live)
+                    }
+                    Err(e) => {
+                        match last_good::fallback_ip(last_good_config, last_good_state, &id_str) {
+                            Some(cached)
+                                if matches_ip_version(&cached.last_good_ip, ip_version) =>
+                            {
+                                warn!(
+                                    "domain resolve failed for rule id={id_str} ({domain}): {e}; using last-good IP {}",
+                                    cached.last_good_ip
+                                );
+                                resolution_log.record(ResolutionEvent::LastGoodUsed {
+                                    rule_id: id_str.clone(),
+                                    comment: user_comment.clone(),
+                                    domain: domain.clone(),
+                                    ip: cached.last_good_ip.clone(),
+                                    original_error: e.to_string(),
+                                });
+                                (cached.last_good_ip.clone(), ResolveSource::LastGood)
+                            }
+                            _ => {
+                                warn!(
+                                    "domain resolve failed for rule id={id_str} ({domain}): {e}; no usable last-good cache, skipping rule"
+                                );
+                                resolution_log.record(ResolutionEvent::ResolveFailedNoCache {
+                                    rule_id: id_str.clone(),
+                                    comment: user_comment.clone(),
+                                    domain: domain.clone(),
+                                    original_error: e.to_string(),
+                                });
+                                return Ok(String::new());
+                            }
+                        }
+                    }
+                };
+
+                // egress_control 检查：目标 IP 必须在允许 CIDR 列表中（last-good IP 同样要检查）
                 if egress_config.enabled && !egress_config.allows_ip(&dst_ip) {
                     warn!(
-                        "egress_control 跳过规则 id={} 目标 {} 不在 allowed_target_cidrs",
-                        rule_index
-                            .map(|i| format!("r{i}"))
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        dst_ip
+                        "egress_control 跳过规则 id={id_str} 目标 {dst_ip} 不在 allowed_target_cidrs (source={})",
+                        source.as_str()
                     );
+                    resolution_log.record(ResolutionEvent::EgressSkipped {
+                        rule_id: id_str.clone(),
+                        comment: user_comment.clone(),
+                        ip: dst_ip.clone(),
+                        source,
+                    });
                     return Ok(String::new());
                 }
 
@@ -117,6 +184,7 @@ impl NftCellBuilder for NftCell {
                             &IpVersion::V4,
                             rule_index,
                             access_config,
+                            snat_config,
                         )?;
                     }
                     IpVersion::V6 => {
@@ -132,6 +200,7 @@ impl NftCellBuilder for NftCell {
                             &IpVersion::V6,
                             rule_index,
                             access_config,
+                            snat_config,
                         )?;
                     }
                     IpVersion::All => {
@@ -142,6 +211,7 @@ impl NftCellBuilder for NftCell {
                                 &IpVersion::V6,
                                 rule_index,
                                 access_config,
+                                snat_config,
                             )?;
                         } else {
                             result += &build_nat_rules(
@@ -150,6 +220,7 @@ impl NftCellBuilder for NftCell {
                                 &IpVersion::V4,
                                 rule_index,
                                 access_config,
+                                snat_config,
                             )?;
                         }
                     }
@@ -162,19 +233,44 @@ impl NftCellBuilder for NftCell {
 }
 
 impl RuntimeCell {
+    #[allow(clippy::too_many_arguments)]
     pub fn build_with_rule_index(
         &self,
         rule_index: Option<usize>,
         dns_config: &DnsConfig,
         access_config: &AccessControlConfig,
         egress_config: &EgressControlConfig,
+        snat_config: &SnatConfig,
+        last_good_config: &LastGoodConfig,
+        last_good_state: &LastGoodState,
+        resolution_log: &ResolutionLog,
     ) -> Result<String, io::Error> {
         match self {
-            RuntimeCell::Rule(cell) => {
-                cell.build_with_rule_index(rule_index, dns_config, access_config, egress_config)
-            }
+            RuntimeCell::Rule(cell) => cell.build_with_rule_index(
+                rule_index,
+                dns_config,
+                access_config,
+                egress_config,
+                snat_config,
+                last_good_config,
+                last_good_state,
+                resolution_log,
+            ),
             RuntimeCell::Comment(content) => Ok(content.clone() + "\n"),
         }
+    }
+}
+
+/// 检查给定 IP 字符串是否与期望的 ip_version 兼容（用于校验 last-good 缓存里的 IP）
+fn matches_ip_version(ip: &str, ip_version: &IpVersion) -> bool {
+    let parsed = match ip.parse::<std::net::IpAddr>() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    match ip_version {
+        IpVersion::V4 => parsed.is_ipv4(),
+        IpVersion::V6 => parsed.is_ipv6(),
+        IpVersion::All => true,
     }
 }
 
@@ -324,12 +420,43 @@ fn build_drop_rule_for_family(
     Ok(rule)
 }
 
+/// 解析 SNAT 动作字符串
+/// 返回 None 表示不生成 POSTROUTING SNAT 规则；
+/// Some("masquerade") 或 Some("snat to <ip>") 对应具体动作。
+/// IPv6 暂不支持 fixed_source_ip（仅 IPv4），回退到 masquerade，并保留 env-var legacy 路径。
+pub(crate) fn resolve_snat_action(
+    snat_config: &SnatConfig,
+    ip_version: &IpVersion,
+    legacy_env_var: &str,
+) -> Option<String> {
+    match snat_config.mode {
+        SnatMode::Off => None,
+        SnatMode::Fixed => {
+            let ip = snat_config.fixed_source_ip.trim();
+            // 验证已经在 SnatConfig::validate() 中完成；这里仅保险地回退到 masquerade
+            match ip_version {
+                IpVersion::V4 if !ip.is_empty() => Some(format!("snat to {ip}")),
+                _ => Some("masquerade".to_string()),
+            }
+        }
+        SnatMode::Masquerade => {
+            // legacy 环境变量回退路径：保留旧用户的兼容性
+            if let Ok(ip) = env::var(legacy_env_var) {
+                Some(format!("snat to {ip}"))
+            } else {
+                Some("masquerade".to_string())
+            }
+        }
+    }
+}
+
 fn build_nat_rules(
     cell: &NftCell,
     dst_ip: &str,
     ip_version: &IpVersion,
     rule_index: Option<usize>,
     access_config: &AccessControlConfig,
+    snat_config: &SnatConfig,
 ) -> Result<String, io::Error> {
     let (family, env_var, localhost_addr, fmt_ip) = match ip_version {
         IpVersion::V4 => ("ip", "nat_local_ip", "127.0.0.1", dst_ip.to_string()),
@@ -342,10 +469,7 @@ fn build_nat_rules(
         }
     };
 
-    let snat_to_part = match env::var(env_var) {
-        Ok(ip) => "snat to ".to_owned() + &ip,
-        Err(_) => "masquerade".to_owned(),
-    };
+    let snat_action = resolve_snat_action(snat_config, ip_version, env_var);
 
     match cell {
         NftCell::Range {
@@ -378,9 +502,15 @@ fn build_nat_rules(
                 protocol,
                 comment.as_deref(),
             );
+            let postrouting = match &snat_action {
+                Some(action) => format!(
+                    "add rule {family} self-nat POSTROUTING ct state new {family} daddr {dst_ip} {proto} dport {port_start}-{port_end} counter {action} comment \"{cell}\"\n"
+                ),
+                None => String::new(),
+            };
             let res = format!(
                 "{blacklist_drop}add rule {family} self-nat PREROUTING ct state new {access_condition}{proto} dport {port_start}-{port_end} counter dnat to {fmt_ip}:{port_start}-{port_end} comment \"{stats_comment}\"\n\
-                add rule {family} self-nat POSTROUTING ct state new {family} daddr {dst_ip} {proto} dport {port_start}-{port_end} counter {snat_to_part} comment \"{cell}\"\n\n\
+                {postrouting}\n\
                 {}\
                 ",
                 build_traffic_counter_rules(
@@ -433,9 +563,15 @@ fn build_nat_rules(
                 Ok(res)
             } else {
                 // 转发到其他机器
+                let postrouting = match &snat_action {
+                    Some(action) => format!(
+                        "add rule {family} self-nat POSTROUTING ct state new {family} daddr {dst_ip} {proto} dport {dport} counter {action} comment \"{cell}\"\n"
+                    ),
+                    None => String::new(),
+                };
                 let res = format!(
                     "{blacklist_drop}add rule {family} self-nat PREROUTING ct state new {access_condition}{proto} dport {sport} counter dnat to {fmt_ip}:{dport}  comment \"{stats_comment}\"\n\
-                    add rule {family} self-nat POSTROUTING ct state new {family} daddr {dst_ip} {proto} dport {dport} counter {snat_to_part} comment \"{cell}\"\n\n\
+                    {postrouting}\n\
                     {}\
                     ",
                     build_traffic_counter_rules(
@@ -754,6 +890,10 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
                 protocol: Protocol::All,
                 ip_version: IpVersion::V4,
                 comment: Some("百度HTTPS服务转发示例".to_string()),
+                quota_enabled: false,
+                quota_bytes: 0,
+                quota_period: nat_common::QuotaPeriod::default(),
+                quota_action: nat_common::QuotaAction::default(),
             },
             NftCell::Range {
                 enabled: true,
@@ -763,6 +903,10 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
                 protocol: Protocol::Tcp,
                 ip_version: IpVersion::V4,
                 comment: Some("端口范围转发示例".to_string()),
+                quota_enabled: false,
+                quota_bytes: 0,
+                quota_period: nat_common::QuotaPeriod::default(),
+                quota_action: nat_common::QuotaAction::default(),
             },
             NftCell::Redirect {
                 enabled: true,
@@ -772,6 +916,10 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
                 protocol: Protocol::All,
                 ip_version: IpVersion::V4,
                 comment: Some("单端口重定向到本机示例".to_string()),
+                quota_enabled: false,
+                quota_bytes: 0,
+                quota_period: nat_common::QuotaPeriod::default(),
+                quota_action: nat_common::QuotaAction::default(),
             },
             NftCell::Redirect {
                 enabled: true,
@@ -781,6 +929,10 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
                 protocol: Protocol::Tcp,
                 ip_version: IpVersion::V4,
                 comment: Some("端口范围重定向到本机示例".to_string()),
+                quota_enabled: false,
+                quota_bytes: 0,
+                quota_period: nat_common::QuotaPeriod::default(),
+                quota_action: nat_common::QuotaAction::default(),
             },
             NftCell::Drop {
                 chain: Chain::Input,
@@ -823,6 +975,11 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
         access_control: AccessControlConfig::default(),
         geoip: Default::default(),
         egress_control: Default::default(),
+        snat: Default::default(),
+        mss_clamp: Default::default(),
+        last_good: Default::default(),
+        audit: Default::default(),
+        quota: Default::default(),
     };
 
     let toml_str = example_config
@@ -940,6 +1097,10 @@ mod redirect_build_tests {
             protocol: Protocol::All,
             ip_version: IpVersion::V4,
             comment: Some(long_comment.clone()),
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
         };
         let access = AccessControlConfig {
             mode: AccessControlMode::Blacklist,
@@ -947,7 +1108,16 @@ mod redirect_build_tests {
         };
 
         let result = cell
-            .build_with_rule_index(Some(0), &DnsConfig::default(), &access, &Default::default())
+            .build_with_rule_index(
+                Some(0),
+                &DnsConfig::default(),
+                &access,
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &ResolutionLog::new(),
+            )
             .unwrap();
         let comments = nft_comment_values(&result);
 
@@ -970,6 +1140,10 @@ mod redirect_build_tests {
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
             comment: Some(long_chinese_comment.clone()),
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
         };
 
         let result = cell
@@ -978,6 +1152,10 @@ mod redirect_build_tests {
                 &DnsConfig::default(),
                 &Default::default(),
                 &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &ResolutionLog::new(),
             )
             .unwrap();
         let comments = nft_comment_values(&result);
@@ -1022,6 +1200,10 @@ mod redirect_build_tests {
             protocol: Protocol::All,
             ip_version: IpVersion::V4,
             comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
         };
 
         let result = cell
@@ -1030,6 +1212,10 @@ mod redirect_build_tests {
                 &DnsConfig::default(),
                 &Default::default(),
                 &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &ResolutionLog::new(),
             )
             .unwrap();
         // all协议使用th dport匹配所有传输层协议
@@ -1047,6 +1233,10 @@ mod redirect_build_tests {
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
             comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
         };
 
         let result = cell
@@ -1055,6 +1245,10 @@ mod redirect_build_tests {
                 &DnsConfig::default(),
                 &Default::default(),
                 &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &ResolutionLog::new(),
             )
             .unwrap();
         // tcp协议只生成tcp规则
@@ -1075,6 +1269,10 @@ mod redirect_build_tests {
             protocol: Protocol::All,
             ip_version: IpVersion::All,
             comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
         };
 
         let result = cell
@@ -1083,6 +1281,10 @@ mod redirect_build_tests {
                 &DnsConfig::default(),
                 &Default::default(),
                 &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &ResolutionLog::new(),
             )
             .unwrap();
         // all协议应该使用th dport，同时包含IPv4和IPv6

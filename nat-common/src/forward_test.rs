@@ -375,6 +375,10 @@ mod tests {
                 protocol: Protocol::Tcp,
                 ip_version: IpVersion::V4,
                 comment: Some("test".to_string()),
+                quota_enabled: false,
+                quota_bytes: 0,
+                quota_period: crate::QuotaPeriod::default(),
+                quota_action: crate::QuotaAction::default(),
             }],
             ..Default::default()
         };

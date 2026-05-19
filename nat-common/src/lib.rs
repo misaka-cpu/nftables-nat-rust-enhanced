@@ -5,9 +5,12 @@ use std::net::IpAddr;
 use std::num::ParseIntError;
 use std::str::FromStr;
 
+pub mod audit;
 pub mod forward_test;
 pub mod geoip;
+pub mod last_good;
 pub mod logger;
+pub mod quota;
 pub mod stats;
 pub mod uninstall;
 
@@ -254,6 +257,16 @@ pub struct TomlConfig {
     pub geoip: GeoIpConfig,
     #[serde(default)]
     pub egress_control: EgressControlConfig,
+    #[serde(default)]
+    pub snat: SnatConfig,
+    #[serde(default)]
+    pub mss_clamp: MssClampConfig,
+    #[serde(default)]
+    pub last_good: LastGoodConfig,
+    #[serde(default)]
+    pub audit: AuditConfig,
+    #[serde(default)]
+    pub quota: QuotaConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -604,6 +617,320 @@ impl EgressControlConfig {
     }
 }
 
+/// SNAT 源地址改写配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnatConfig {
+    #[serde(default)]
+    pub mode: SnatMode,
+    #[serde(default)]
+    pub fixed_source_ip: String,
+}
+
+impl Default for SnatConfig {
+    fn default() -> Self {
+        Self {
+            mode: SnatMode::Masquerade,
+            fixed_source_ip: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnatMode {
+    #[default]
+    Masquerade,
+    Fixed,
+    Off,
+}
+
+impl Display for SnatMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnatMode::Masquerade => write!(f, "masquerade"),
+            SnatMode::Fixed => write!(f, "fixed"),
+            SnatMode::Off => write!(f, "off"),
+        }
+    }
+}
+
+impl Serialize for SnatMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for SnatMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "masquerade" => Ok(SnatMode::Masquerade),
+            "fixed" => Ok(SnatMode::Fixed),
+            "off" => Ok(SnatMode::Off),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid snat.mode: {other}，只支持 masquerade / fixed / off"
+            ))),
+        }
+    }
+}
+
+impl SnatConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        match self.mode {
+            SnatMode::Masquerade | SnatMode::Off => Ok(()),
+            SnatMode::Fixed => {
+                let ip = self.fixed_source_ip.trim();
+                if ip.is_empty() {
+                    return Err(
+                        "snat.mode=fixed 时 fixed_source_ip 不能为空，请填写合法 IPv4 地址"
+                            .to_string(),
+                    );
+                }
+                match ip.parse::<IpAddr>() {
+                    Ok(IpAddr::V4(_)) => Ok(()),
+                    Ok(IpAddr::V6(_)) => {
+                        Err(format!("snat.fixed_source_ip 当前仅支持 IPv4，收到: {ip}"))
+                    }
+                    Err(_) => Err(format!("snat.fixed_source_ip 不是合法 IPv4 地址: {ip}")),
+                }
+            }
+        }
+    }
+}
+
+/// TCP MSS clamp 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MssClampConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_mss_clamp_size")]
+    pub size: u16,
+}
+
+impl Default for MssClampConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            size: default_mss_clamp_size(),
+        }
+    }
+}
+
+pub const MSS_CLAMP_MIN: u16 = 536;
+pub const MSS_CLAMP_MAX: u16 = 1460;
+
+impl MssClampConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(MSS_CLAMP_MIN..=MSS_CLAMP_MAX).contains(&self.size) {
+            return Err(format!(
+                "mss_clamp.size 必须在 {MSS_CLAMP_MIN}-{MSS_CLAMP_MAX} 之间，收到: {}",
+                self.size
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_mss_clamp_size() -> u16 {
+    1452
+}
+
+/// last-good 状态缓存配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastGoodConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_last_good_file")]
+    pub file: String,
+    #[serde(default = "default_true")]
+    pub use_last_good_on_dns_failure: bool,
+}
+
+impl Default for LastGoodConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            file: default_last_good_file(),
+            use_last_good_on_dns_failure: true,
+        }
+    }
+}
+
+impl LastGoodConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.file.trim().is_empty() {
+            return Err("last_good.file 不能为空".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn default_last_good_file() -> String {
+    "/var/lib/nftables-nat-rust/last-good-state.json".to_string()
+}
+
+/// audit log 审计日志配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_audit_file")]
+    pub file: String,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            file: default_audit_file(),
+        }
+    }
+}
+
+impl AuditConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.file.trim().is_empty() {
+            return Err("audit.file 不能为空".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn default_audit_file() -> String {
+    "/var/log/nftables-nat-rust-audit.log".to_string()
+}
+
+/// 规则级流量配额全局配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_quota_check_interval_seconds")]
+    pub check_interval_seconds: u64,
+    #[serde(default = "default_true")]
+    pub notify_on_exceeded: bool,
+    #[serde(default = "default_quota_state_file")]
+    pub state_file: String,
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_interval_seconds: default_quota_check_interval_seconds(),
+            notify_on_exceeded: true,
+            state_file: default_quota_state_file(),
+        }
+    }
+}
+
+impl QuotaConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.check_interval_seconds == 0 {
+            return Err("quota.check_interval_seconds 不能为 0".to_string());
+        }
+        if self.state_file.trim().is_empty() {
+            return Err("quota.state_file 不能为空".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn default_quota_check_interval_seconds() -> u64 {
+    60
+}
+
+fn default_quota_state_file() -> String {
+    "/var/lib/nftables-nat-rust/quota-state.json".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuotaPeriod {
+    Daily,
+    #[default]
+    Monthly,
+    Total,
+}
+
+impl Display for QuotaPeriod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuotaPeriod::Daily => write!(f, "daily"),
+            QuotaPeriod::Monthly => write!(f, "monthly"),
+            QuotaPeriod::Total => write!(f, "total"),
+        }
+    }
+}
+
+impl Serialize for QuotaPeriod {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for QuotaPeriod {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "daily" => Ok(QuotaPeriod::Daily),
+            "monthly" => Ok(QuotaPeriod::Monthly),
+            "total" => Ok(QuotaPeriod::Total),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid quota_period: {other}, 只支持 daily / monthly / total"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuotaAction {
+    #[default]
+    Disable,
+}
+
+impl Display for QuotaAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuotaAction::Disable => write!(f, "disable"),
+        }
+    }
+}
+
+impl Serialize for QuotaAction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for QuotaAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "disable" => Ok(QuotaAction::Disable),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid quota_action: {other}, 第一版仅支持 disable"
+            ))),
+        }
+    }
+}
+
 impl GeoIpConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.update_interval_hours == 0 {
@@ -745,6 +1072,14 @@ pub enum NftCell {
         ip_version: IpVersion,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         comment: Option<String>,
+        #[serde(default)]
+        quota_enabled: bool,
+        #[serde(default)]
+        quota_bytes: u64,
+        #[serde(default)]
+        quota_period: QuotaPeriod,
+        #[serde(default)]
+        quota_action: QuotaAction,
     },
     #[serde(rename = "range")]
     Range {
@@ -762,6 +1097,14 @@ pub enum NftCell {
         ip_version: IpVersion,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         comment: Option<String>,
+        #[serde(default)]
+        quota_enabled: bool,
+        #[serde(default)]
+        quota_bytes: u64,
+        #[serde(default)]
+        quota_period: QuotaPeriod,
+        #[serde(default)]
+        quota_action: QuotaAction,
     },
     #[serde(rename = "redirect")]
     Redirect {
@@ -779,6 +1122,14 @@ pub enum NftCell {
         ip_version: IpVersion,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         comment: Option<String>,
+        #[serde(default)]
+        quota_enabled: bool,
+        #[serde(default)]
+        quota_bytes: u64,
+        #[serde(default)]
+        quota_period: QuotaPeriod,
+        #[serde(default)]
+        quota_action: QuotaAction,
     },
     #[serde(rename = "drop")]
     Drop {
@@ -901,6 +1252,69 @@ impl NftCell {
             NftCell::Drop { .. } => {}
         }
     }
+
+    pub fn quota_enabled(&self) -> bool {
+        match self {
+            NftCell::Single { quota_enabled, .. }
+            | NftCell::Range { quota_enabled, .. }
+            | NftCell::Redirect { quota_enabled, .. } => *quota_enabled,
+            NftCell::Drop { .. } => false,
+        }
+    }
+
+    pub fn quota_bytes(&self) -> u64 {
+        match self {
+            NftCell::Single { quota_bytes, .. }
+            | NftCell::Range { quota_bytes, .. }
+            | NftCell::Redirect { quota_bytes, .. } => *quota_bytes,
+            NftCell::Drop { .. } => 0,
+        }
+    }
+
+    pub fn quota_period(&self) -> QuotaPeriod {
+        match self {
+            NftCell::Single { quota_period, .. }
+            | NftCell::Range { quota_period, .. }
+            | NftCell::Redirect { quota_period, .. } => *quota_period,
+            NftCell::Drop { .. } => QuotaPeriod::Monthly,
+        }
+    }
+
+    pub fn quota_action(&self) -> QuotaAction {
+        match self {
+            NftCell::Single { quota_action, .. }
+            | NftCell::Range { quota_action, .. }
+            | NftCell::Redirect { quota_action, .. } => *quota_action,
+            NftCell::Drop { .. } => QuotaAction::Disable,
+        }
+    }
+
+    pub fn set_quota_enabled(&mut self, value: bool) {
+        match self {
+            NftCell::Single { quota_enabled, .. }
+            | NftCell::Range { quota_enabled, .. }
+            | NftCell::Redirect { quota_enabled, .. } => *quota_enabled = value,
+            NftCell::Drop { .. } => {}
+        }
+    }
+
+    pub fn set_quota_bytes(&mut self, value: u64) {
+        match self {
+            NftCell::Single { quota_bytes, .. }
+            | NftCell::Range { quota_bytes, .. }
+            | NftCell::Redirect { quota_bytes, .. } => *quota_bytes = value,
+            NftCell::Drop { .. } => {}
+        }
+    }
+
+    pub fn set_quota_period(&mut self, value: QuotaPeriod) {
+        match self {
+            NftCell::Single { quota_period, .. }
+            | NftCell::Range { quota_period, .. }
+            | NftCell::Redirect { quota_period, .. } => *quota_period = value,
+            NftCell::Drop { .. } => {}
+        }
+    }
 }
 
 impl TomlConfig {
@@ -909,6 +1323,11 @@ impl TomlConfig {
         self.access_control.validate()?;
         self.geoip.validate()?;
         self.egress_control.validate()?;
+        self.snat.validate()?;
+        self.mss_clamp.validate()?;
+        self.last_good.validate()?;
+        self.audit.validate()?;
+        self.quota.validate()?;
         for (idx, rule) in self.rules.iter().enumerate() {
             rule.validate()
                 .map_err(|e| format!("规则 {} 验证失败: {}", idx + 1, e))?;
@@ -1117,6 +1536,10 @@ impl TryFrom<&str> for NftCell {
                     protocol,
                     ip_version,
                     comment: None,
+                    quota_enabled: false,
+                    quota_bytes: 0,
+                    quota_period: QuotaPeriod::default(),
+                    quota_action: QuotaAction::default(),
                 })
             }
             "SINGLE" => {
@@ -1131,6 +1554,10 @@ impl TryFrom<&str> for NftCell {
                     protocol,
                     ip_version,
                     comment: None,
+                    quota_enabled: false,
+                    quota_bytes: 0,
+                    quota_period: QuotaPeriod::default(),
+                    quota_action: QuotaAction::default(),
                 })
             }
             "REDIRECT" => {
@@ -1159,6 +1586,10 @@ impl TryFrom<&str> for NftCell {
                     protocol,
                     ip_version,
                     comment: None,
+                    quota_enabled: false,
+                    quota_bytes: 0,
+                    quota_period: QuotaPeriod::default(),
+                    quota_action: QuotaAction::default(),
                 })
             }
             _ => Err(ParseError::InvalidFormat(format!(
@@ -1325,6 +1756,10 @@ mod tests {
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
             comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: QuotaPeriod::default(),
+            quota_action: QuotaAction::default(),
         };
         assert!(rule.validate().is_ok());
     }
@@ -1339,6 +1774,10 @@ mod tests {
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
             comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: QuotaPeriod::default(),
+            quota_action: QuotaAction::default(),
         };
         assert!(rule.validate().is_err());
     }
@@ -1353,6 +1792,10 @@ mod tests {
             protocol: Protocol::Tcp,
             ip_version: IpVersion::All,
             comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: QuotaPeriod::default(),
+            quota_action: QuotaAction::default(),
         };
         assert!(rule.validate().is_ok());
     }
@@ -1367,6 +1810,10 @@ mod tests {
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
             comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: QuotaPeriod::default(),
+            quota_action: QuotaAction::default(),
         };
         assert!(rule.validate().is_err());
     }
@@ -1483,6 +1930,215 @@ entries = ["example.com"]
     }
 
     #[test]
+    fn snat_defaults_to_masquerade_when_section_missing() {
+        let cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        assert_eq!(cfg.snat.mode, SnatMode::Masquerade);
+        assert!(cfg.snat.fixed_source_ip.is_empty());
+    }
+
+    #[test]
+    fn snat_accepts_masquerade_fixed_off_modes() {
+        for mode in ["masquerade", "fixed", "off"] {
+            let body = if mode == "fixed" {
+                format!(
+                    "rules = []\n\n[snat]\nmode = \"{mode}\"\nfixed_source_ip = \"10.100.0.10\"\n"
+                )
+            } else {
+                format!("rules = []\n\n[snat]\nmode = \"{mode}\"\n")
+            };
+            let cfg = TomlConfig::from_toml_str(&body)
+                .unwrap_or_else(|e| panic!("mode={mode} should parse, got: {e}"));
+            assert_eq!(cfg.snat.mode.to_string(), mode);
+        }
+    }
+
+    #[test]
+    fn snat_rejects_unknown_mode() {
+        let err =
+            TomlConfig::from_toml_str("rules = []\n\n[snat]\nmode = \"bogus\"\n").unwrap_err();
+        assert!(err.contains("invalid snat.mode"));
+    }
+
+    #[test]
+    fn snat_fixed_requires_non_empty_ip() {
+        let err = TomlConfig::from_toml_str(
+            "rules = []\n\n[snat]\nmode = \"fixed\"\nfixed_source_ip = \"\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("fixed_source_ip 不能为空"));
+    }
+
+    #[test]
+    fn snat_fixed_rejects_ipv6_address() {
+        let err = TomlConfig::from_toml_str(
+            "rules = []\n\n[snat]\nmode = \"fixed\"\nfixed_source_ip = \"2001:db8::1\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("仅支持 IPv4"));
+    }
+
+    #[test]
+    fn snat_fixed_rejects_invalid_ip_literal() {
+        let err = TomlConfig::from_toml_str(
+            "rules = []\n\n[snat]\nmode = \"fixed\"\nfixed_source_ip = \"not-an-ip\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("不是合法 IPv4 地址"));
+    }
+
+    #[test]
+    fn mss_clamp_defaults_disabled_with_1452() {
+        let cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        assert!(!cfg.mss_clamp.enabled);
+        assert_eq!(cfg.mss_clamp.size, 1452);
+    }
+
+    #[test]
+    fn mss_clamp_rejects_size_too_small() {
+        let err =
+            TomlConfig::from_toml_str("rules = []\n\n[mss_clamp]\nenabled = true\nsize = 535\n")
+                .unwrap_err();
+        assert!(err.contains("536-1460"));
+    }
+
+    #[test]
+    fn mss_clamp_rejects_size_too_large() {
+        let err =
+            TomlConfig::from_toml_str("rules = []\n\n[mss_clamp]\nenabled = true\nsize = 1461\n")
+                .unwrap_err();
+        assert!(err.contains("536-1460"));
+    }
+
+    #[test]
+    fn last_good_defaults_when_section_missing() {
+        let cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        assert!(cfg.last_good.enabled);
+        assert!(cfg.last_good.use_last_good_on_dns_failure);
+        assert_eq!(
+            cfg.last_good.file,
+            "/var/lib/nftables-nat-rust/last-good-state.json"
+        );
+    }
+
+    #[test]
+    fn audit_defaults_when_section_missing() {
+        let cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        assert!(cfg.audit.enabled);
+        assert_eq!(cfg.audit.file, "/var/log/nftables-nat-rust-audit.log");
+    }
+
+    #[test]
+    fn last_good_validates_empty_file() {
+        let err = TomlConfig::from_toml_str("rules = []\n[last_good]\nfile = \"\"\n").unwrap_err();
+        assert!(err.contains("last_good.file"));
+    }
+
+    #[test]
+    fn audit_validates_empty_file() {
+        let err = TomlConfig::from_toml_str("rules = []\n[audit]\nfile = \"\"\n").unwrap_err();
+        assert!(err.contains("audit.file"));
+    }
+
+    #[test]
+    fn quota_defaults_when_section_missing() {
+        let cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        assert!(cfg.quota.enabled);
+        assert_eq!(cfg.quota.check_interval_seconds, 60);
+        assert!(cfg.quota.notify_on_exceeded);
+        assert_eq!(
+            cfg.quota.state_file,
+            "/var/lib/nftables-nat-rust/quota-state.json"
+        );
+    }
+
+    #[test]
+    fn quota_validates_zero_check_interval() {
+        let err = TomlConfig::from_toml_str("rules = []\n[quota]\ncheck_interval_seconds = 0\n")
+            .unwrap_err();
+        assert!(err.contains("check_interval_seconds"));
+    }
+
+    #[test]
+    fn rule_quota_fields_default_when_missing() {
+        let toml = r#"
+[[rules]]
+type = "single"
+sport = 30080
+dport = 80
+domain = "example.com"
+protocol = "tcp"
+ip_version = "ipv4"
+comment = "no-quota"
+enabled = true
+"#;
+        let cfg = TomlConfig::from_toml_str(toml).unwrap();
+        let rule = &cfg.rules[0];
+        assert!(!rule.quota_enabled());
+        assert_eq!(rule.quota_bytes(), 0);
+        assert_eq!(rule.quota_period(), QuotaPeriod::Monthly);
+        assert_eq!(rule.quota_action(), QuotaAction::Disable);
+    }
+
+    #[test]
+    fn rule_quota_fields_parse_and_serde() {
+        let toml = r#"
+[[rules]]
+type = "single"
+sport = 30080
+dport = 80
+domain = "example.com"
+protocol = "tcp"
+ip_version = "ipv4"
+comment = "hk-out"
+enabled = true
+quota_enabled = true
+quota_bytes = 107374182400
+quota_period = "monthly"
+quota_action = "disable"
+"#;
+        let cfg = TomlConfig::from_toml_str(toml).unwrap();
+        let rule = &cfg.rules[0];
+        assert!(rule.quota_enabled());
+        assert_eq!(rule.quota_bytes(), 107_374_182_400);
+        assert_eq!(rule.quota_period(), QuotaPeriod::Monthly);
+        assert_eq!(rule.quota_action(), QuotaAction::Disable);
+        // 序列化往返
+        let roundtrip = cfg.to_toml_string().unwrap();
+        assert!(roundtrip.contains("quota_enabled = true"));
+        assert!(roundtrip.contains("quota_period = \"monthly\""));
+    }
+
+    #[test]
+    fn rule_quota_period_rejects_invalid_value() {
+        let err = TomlConfig::from_toml_str(
+            "[[rules]]\ntype=\"single\"\nsport=1\ndport=1\ndomain=\"x\"\nquota_period=\"yearly\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("quota_period"));
+    }
+
+    #[test]
+    fn rule_quota_action_rejects_invalid_value() {
+        let err = TomlConfig::from_toml_str(
+            "[[rules]]\ntype=\"single\"\nsport=1\ndport=1\ndomain=\"x\"\nquota_action=\"throttle\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("quota_action"));
+    }
+
+    #[test]
+    fn mss_clamp_accepts_boundary_values() {
+        let lo =
+            TomlConfig::from_toml_str("rules = []\n\n[mss_clamp]\nenabled = true\nsize = 536\n")
+                .unwrap();
+        let hi =
+            TomlConfig::from_toml_str("rules = []\n\n[mss_clamp]\nenabled = true\nsize = 1460\n")
+                .unwrap();
+        assert_eq!(lo.mss_clamp.size, 536);
+        assert_eq!(hi.mss_clamp.size, 1460);
+    }
+
+    #[test]
     fn test_ip_version_serde() {
         assert_eq!(IpVersion::from("ipv4"), IpVersion::V4);
         assert_eq!(IpVersion::from("ipv6"), IpVersion::V6);
@@ -1508,6 +2164,10 @@ entries = ["example.com"]
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
             comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: QuotaPeriod::default(),
+            quota_action: QuotaAction::default(),
         };
         assert_eq!(cell.to_string(), "SINGLE,10000,443,example.com,tcp,ipv4");
 
@@ -1519,6 +2179,10 @@ entries = ["example.com"]
             protocol: Protocol::All,
             ip_version: IpVersion::All,
             comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: QuotaPeriod::default(),
+            quota_action: QuotaAction::default(),
         };
         assert_eq!(cell.to_string(), "REDIRECT,8000-9000,3128,all,all");
     }
