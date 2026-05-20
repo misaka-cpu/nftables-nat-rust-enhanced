@@ -283,9 +283,7 @@ fn show_rules(path: &str) -> Result<(), io::Error> {
         println!("{line}");
     }
     println!();
-    println!(
-        "提示：输入 d 查看详细诊断 / l 查看 last-good 详情 / p 查看组合策略详情 / 按 Enter 返回主菜单"
-    );
+    println!("提示：输入 d 查看详细诊断 / 按 Enter 返回主菜单");
     loop {
         let choice = prompt("> ")?;
         match choice.trim() {
@@ -294,36 +292,25 @@ fn show_rules(path: &str) -> Result<(), io::Error> {
             value if is_menu_refresh_command(value) => return Ok(()),
             "d" | "D" => {
                 println!();
-                for line in format_combined_policy_status(&config) {
-                    println!("{line}");
-                }
-                println!();
-                for line in format_last_good_status(&config) {
-                    println!("{line}");
-                }
-                println!();
-            }
-            "l" | "L" => {
-                println!();
-                for line in format_last_good_status(&config) {
-                    println!("{line}");
-                }
-                println!();
-            }
-            "p" | "P" => {
-                println!();
-                for line in format_combined_policy_status(&config) {
+                for line in render_global_diagnostics_lines(&config) {
                     println!("{line}");
                 }
                 println!();
             }
             other => {
-                println!(
-                    "未识别的输入 {other:?}。请输入 d / l / p 查看详情，或按 Enter 返回主菜单。"
-                );
+                println!("未识别的输入 {other:?}。请输入 d 查看详细诊断，或按 Enter 返回主菜单。");
             }
         }
     }
+}
+
+/// 「全局诊断状态」聚合页：完整组合策略 + 完整 last-good 状态缓存。
+/// 共用给「查看当前转发规则 → d」和「高级网络设置 → 查看全局诊断状态」。
+pub(crate) fn render_global_diagnostics_lines(config: &TomlConfig) -> Vec<String> {
+    let mut lines = format_combined_policy_status(config);
+    lines.push(String::new());
+    lines.extend(format_last_good_status(config));
+    lines
 }
 
 /// 渲染「查看当前转发规则」默认页面：每条规则的核心字段 + 一行组合策略摘要 + 一行 last-good 摘要。
@@ -2897,8 +2884,7 @@ fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
 4) 启用 / 禁用 MSS clamp
 5) 设置 MSS clamp size
 6) 时间 / NTP 状态检查
-7) 查看组合策略详情
-8) 查看 last-good 状态缓存
+7) 查看全局诊断状态
 0) 返回主菜单
 ===================================="#
         );
@@ -2930,14 +2916,7 @@ fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
             }
             "7" => {
                 println!();
-                for line in format_combined_policy_status(&config) {
-                    println!("{line}");
-                }
-                wait_enter_to_return()?;
-            }
-            "8" => {
-                println!();
-                for line in format_last_good_status(&config) {
+                for line in render_global_diagnostics_lines(&config) {
                     println!("{line}");
                 }
                 wait_enter_to_return()?;
@@ -5898,30 +5877,90 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
         );
     }
 
-    #[test]
-    fn advanced_network_menu_exposes_policy_and_last_good_entries() {
-        // 高级网络设置子菜单提供「7) 查看组合策略详情」和「8) 查看 last-good 状态缓存」入口
+    /// 截取 menu.rs 源中 `#[cfg(test)]` 之前的非测试部分，避免测试断言里包含的
+    /// 「禁用文案」被自身误命中。
+    fn menu_src_non_test() -> &'static str {
         let menu_src = include_str!("menu.rs");
+        match menu_src.find("#[cfg(test)]") {
+            Some(idx) => &menu_src[..idx],
+            None => menu_src,
+        }
+    }
+
+    #[test]
+    fn advanced_network_menu_exposes_single_global_diagnostics_entry() {
+        // v0.5.x 起：高级网络设置只暴露一个「7) 查看全局诊断状态」入口，
+        // 不再同时显示分立的「组合策略详情 / last-good 状态缓存」两个重复入口。
+        let src = menu_src_non_test();
         assert!(
-            menu_src.contains("7) 查看组合策略详情"),
-            "高级网络菜单应有「查看组合策略详情」"
+            src.contains("7) 查看全局诊断状态"),
+            "高级网络菜单应有「查看全局诊断状态」单一入口"
+        );
+        // 旧的并列项：编号 7 不应再绑到「组合策略详情」、编号 8 不应再绑到「last-good 状态缓存」
+        assert!(
+            !src.contains("7) 查看组合策略详情"),
+            "高级网络菜单不应再单独列出「查看组合策略详情」"
         );
         assert!(
-            menu_src.contains("8) 查看 last-good 状态缓存"),
-            "高级网络菜单应有「查看 last-good 状态缓存」"
+            !src.contains("8) 查看 last-good 状态缓存"),
+            "高级网络菜单不应再单独列出「查看 last-good 状态缓存」"
         );
     }
 
     #[test]
-    fn show_rules_page_advertises_detail_entries() {
-        // 「查看当前转发规则」提示用户可以通过 d / l / p 跳详情
-        let menu_src = include_str!("menu.rs");
+    fn show_rules_page_advertises_only_d_and_enter() {
+        // v0.5.x 起：提示文案只展示 d 与 Enter，不再宣传 l / p 入口
+        let src = menu_src_non_test();
         assert!(
-            menu_src.contains("输入 d 查看详细诊断")
-                && menu_src.contains("l 查看 last-good 详情")
-                && menu_src.contains("p 查看组合策略详情"),
-            "show_rules 应提示 d/l/p 详情入口"
+            src.contains("提示：输入 d 查看详细诊断 / 按 Enter 返回主菜单"),
+            "show_rules 提示文案应仅包含 d 与 Enter"
         );
+        // 旧文案：提示行不应同时罗列 l / p
+        assert!(
+            !src.contains("l 查看 last-good 详情"),
+            "show_rules 提示文案不应再展示 l 入口"
+        );
+        assert!(
+            !src.contains("p 查看组合策略详情"),
+            "show_rules 提示文案不应再展示 p 入口"
+        );
+    }
+
+    #[test]
+    fn global_diagnostics_renders_policy_and_last_good() {
+        // 「查看当前转发规则 → d」与「高级网络设置 → 查看全局诊断状态」共用此聚合页：
+        // 必须同时包含完整组合策略标题块和完整 last-good 标题块。
+        let cfg = sample_single_rule_config("93.184.216.34");
+        let blob = render_global_diagnostics_lines(&cfg).join("\n");
+        assert!(
+            blob.contains("组合策略 (access_control + GeoIP + egress + SNAT + MSS)"),
+            "全局诊断状态应含完整组合策略详情:\n{blob}"
+        );
+        assert!(
+            blob.contains("last-good 状态缓存"),
+            "全局诊断状态应含完整 last-good 详情:\n{blob}"
+        );
+        assert!(
+            blob.contains("SNAT") && blob.contains("MSS clamp"),
+            "全局诊断状态应含 SNAT / MSS clamp 段落:\n{blob}"
+        );
+        assert!(
+            blob.contains("use_last_good_on_dns_failure"),
+            "全局诊断状态应展开 last-good 完整字段:\n{blob}"
+        );
+    }
+
+    #[test]
+    fn default_rules_summaries_still_render_after_simplification() {
+        // 入口简化不应回归默认页面：每条规则两行 + 一行组合策略摘要 + 一行 last-good 摘要仍要存在。
+        let cfg = sample_single_rule_config("93.184.216.34");
+        let stats = StatsState::default();
+        let last_good = LastGoodState::default();
+        let resolutions = vec![Some("93.184.216.34".to_string())];
+        let lines = render_rules_default_lines(&cfg, &resolutions, &stats, &last_good).join("\n");
+        assert!(lines.contains("0) [启用] type=single"));
+        assert!(lines.contains("组合策略：access_control="));
+        assert!(lines.contains("last-good：") && lines.contains("缓存 0 条"));
     }
 
     #[test]
