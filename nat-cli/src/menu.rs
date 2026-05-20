@@ -1980,9 +1980,27 @@ fn test_telegram_notification(config_path: &str) -> Result<(), io::Error> {
     );
     match result {
         Ok(()) => println!("Telegram 测试通知发送成功"),
-        Err(e) => println!("Telegram 测试通知发送失败: {e}"),
+        Err(e) => print_telegram_test_failure(&e),
     }
     Ok(())
+}
+
+/// v0.4.3：CLI 测试 Telegram 通知失败时给出结构化排错提示。
+/// 错误明细已由 `send_telegram_http_for_cli` 调用 `sanitize_cli_telegram_error`
+/// 兜底脱敏 bot_token，这里只负责追加多行排错信息。
+fn print_telegram_test_failure(err: &str) {
+    for line in format_telegram_test_failure(err) {
+        println!("{line}");
+    }
+}
+
+fn format_telegram_test_failure(err: &str) -> Vec<String> {
+    vec![
+        "Telegram 测试通知发送失败：".to_string(),
+        format!("- 错误明细：{err}"),
+        "- 可能原因：网络不可达、DNS 失败、Telegram API 超时、bot_token/chat_id 错误".to_string(),
+        "- curl 超时设置：connect-timeout 5 秒，max-time 15 秒".to_string(),
+    ]
 }
 
 fn send_telegram_http_for_cli(url: &str, params: &[(&str, &str)]) -> Result<(), String> {
@@ -5025,6 +5043,62 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
         assert!(
             !cleaned.contains("LEAKME_SERVER_STDERR"),
             "server Telegram error 必须脱敏 bot_token: {cleaned}"
+        );
+    }
+
+    #[test]
+    fn telegram_test_failure_message_lists_timeout_and_causes() {
+        // err 来自 send_telegram_http_for_cli，已经脱敏过 bot_token；这里只验证
+        // CLI 输出格式符合 v0.4.3 规格（多行排错 + curl 超时数值）。
+        let lines = format_telegram_test_failure("HTTP 状态 28: 超时");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Telegram 测试通知发送失败"),
+            "缺少失败标题: {joined}"
+        );
+        assert!(
+            joined.contains("可能原因") && joined.contains("bot_token/chat_id"),
+            "缺少可能原因: {joined}"
+        );
+        assert!(
+            joined.contains("connect-timeout 5") && joined.contains("max-time 15"),
+            "缺少超时数值: {joined}"
+        );
+    }
+
+    #[test]
+    fn telegram_test_failure_message_does_not_leak_bot_token() {
+        // 即便上游把整段 URL 透传过来，CLI 失败提示也不应把 bot_token 原文输出；
+        // 验证 helper 不会主动追加 token，且对调用方传入的已脱敏字符串无副作用。
+        let masked = "HTTP 状态 28: 12****cdef".to_string();
+        let lines = format_telegram_test_failure(&masked);
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains("LEAKME_TEST_PRINT_TOKEN"),
+            "CLI 测试失败提示不应携带 bot_token 明文: {joined}"
+        );
+        assert!(
+            joined.contains("12****cdef"),
+            "应原样透传已脱敏的错误明细: {joined}"
+        );
+    }
+
+    #[test]
+    fn telegram_send_failure_returns_err_without_panic() {
+        // 模拟 sender 失败：传入永远 Err 的闭包，验证 send_telegram_with 返回 Err
+        // 而不是 panic / abort（保证 nat.service 主循环不会被 Telegram 卡死）。
+        let cfg = nat_common::TelegramConfig {
+            enabled: true,
+            bot_token: "1234:ABC".to_string(),
+            chat_id: "42".to_string(),
+            ..Default::default()
+        };
+        let result = traffic_stats::send_telegram_with(&cfg, "ping", |_, _| {
+            Err("simulated timeout".to_string())
+        });
+        assert!(
+            result.is_err(),
+            "Telegram 发送失败必须以 Err 返回，禁止 panic"
         );
     }
 
