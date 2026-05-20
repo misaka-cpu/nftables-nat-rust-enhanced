@@ -40,7 +40,10 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
         }
         let mut should_wait = true;
         let result: Result<(), Box<dyn std::error::Error>> = match choice.trim() {
-            "1" => show_rules(config_path).map_err(Into::into),
+            "1" => {
+                should_wait = false;
+                show_rules(config_path).map_err(Into::into)
+            }
             "2" => add_single_interactive(config_path).map_err(Into::into),
             "3" => add_range_interactive(config_path).map_err(Into::into),
             "4" => delete_rule_interactive(config_path).map_err(Into::into),
@@ -90,7 +93,10 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
                 should_wait = false;
                 bbr_telegram_menu(config_path).map_err(Into::into)
             }
-            "16" => test_forward_interactive(config_path).map_err(Into::into),
+            "16" => {
+                should_wait = false;
+                test_forward_interactive(config_path).map_err(Into::into)
+            }
             "17" => {
                 should_wait = false;
                 update_menu(config_path).map_err(Into::into)
@@ -263,22 +269,291 @@ fn save_toml_config(path: &str, config: &TomlConfig) -> Result<(), io::Error> {
 
 fn show_rules(path: &str) -> Result<(), io::Error> {
     let config = load_toml_config(path)?;
-    if config.rules.is_empty() {
-        println!("当前没有转发规则");
-    } else {
-        for (index, rule) in config.rules.iter().enumerate() {
-            println!("{index}) [{}] {}", rule_status(rule), format_rule(rule));
+    let stats_state = traffic_stats::load_state(&config.stats.data_file);
+    let last_good_state = LastGoodState::load(&config.last_good.file);
+    let resolutions: Vec<Option<String>> = config
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(idx, rule)| {
+            forward_test::rule_to_testable_rule(idx, rule).and_then(|t| t.resolved_ip)
+        })
+        .collect();
+    for line in render_rules_default_lines(&config, &resolutions, &stats_state, &last_good_state) {
+        println!("{line}");
+    }
+    println!();
+    println!(
+        "提示：输入 d 查看详细诊断 / l 查看 last-good 详情 / p 查看组合策略详情 / 按 Enter 返回主菜单"
+    );
+    loop {
+        let choice = prompt("> ")?;
+        match choice.trim() {
+            "" => return Ok(()),
+            "0" => return Ok(()),
+            value if is_menu_refresh_command(value) => return Ok(()),
+            "d" | "D" => {
+                println!();
+                for line in format_combined_policy_status(&config) {
+                    println!("{line}");
+                }
+                println!();
+                for line in format_last_good_status(&config) {
+                    println!("{line}");
+                }
+                println!();
+            }
+            "l" | "L" => {
+                println!();
+                for line in format_last_good_status(&config) {
+                    println!("{line}");
+                }
+                println!();
+            }
+            "p" | "P" => {
+                println!();
+                for line in format_combined_policy_status(&config) {
+                    println!("{line}");
+                }
+                println!();
+            }
+            other => {
+                println!(
+                    "未识别的输入 {other:?}。请输入 d / l / p 查看详情，或按 Enter 返回主菜单。"
+                );
+            }
         }
     }
-    println!();
-    for line in format_combined_policy_status(&config) {
-        println!("{line}");
+}
+
+/// 渲染「查看当前转发规则」默认页面：每条规则的核心字段 + 一行组合策略摘要 + 一行 last-good 摘要。
+/// 不包含完整组合策略说明、也不展开 last-good 每条规则，这些通过 d/l/p 二级入口或高级菜单查看。
+pub(crate) fn render_rules_default_lines(
+    config: &TomlConfig,
+    resolutions: &[Option<String>],
+    stats_state: &nat_common::stats::StatsState,
+    last_good_state: &LastGoodState,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if config.rules.is_empty() {
+        lines.push("当前没有转发规则".to_string());
+    } else {
+        for (index, rule) in config.rules.iter().enumerate() {
+            let resolved = resolutions.get(index).and_then(|x| x.as_deref());
+            let rule_lines = format_rule_core_lines(index, rule, resolved, config, stats_state);
+            for line in rule_lines {
+                lines.push(line);
+            }
+        }
     }
-    println!();
-    for line in format_last_good_status(&config) {
-        println!("{line}");
+    lines.push(String::new());
+    lines.push(combined_policy_summary(config));
+    lines.push(last_good_summary(config, last_good_state));
+    lines
+}
+
+/// 单条规则的核心信息：第一行包含 index / 状态 / type / sport / target / resolved_ip / dport /
+/// protocol / ip_version；第二行附加 access_control / quota / egress 命中（按需）。
+fn format_rule_core_lines(
+    index: usize,
+    rule: &NftCell,
+    resolved: Option<&str>,
+    config: &TomlConfig,
+    stats_state: &nat_common::stats::StatsState,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let status = rule_status(rule);
+    match rule {
+        NftCell::Single {
+            sport,
+            dport,
+            domain,
+            protocol,
+            ip_version,
+            ..
+        } => {
+            let resolved_str = resolved_display(domain, resolved);
+            out.push(format!(
+                "{index}) [{status}] type=single sport={sport} target={domain} (resolved={resolved_str}) dport={dport} protocol={protocol} ip_version={ip_version}"
+            ));
+        }
+        NftCell::Range {
+            port_start,
+            port_end,
+            domain,
+            protocol,
+            ip_version,
+            ..
+        } => {
+            let resolved_str = resolved_display(domain, resolved);
+            out.push(format!(
+                "{index}) [{status}] type=range sport={port_start}-{port_end} target={domain} (resolved={resolved_str}) dport={port_start}-{port_end} protocol={protocol} ip_version={ip_version}"
+            ));
+        }
+        NftCell::Redirect {
+            src_port,
+            src_port_end,
+            dst_port,
+            protocol,
+            ip_version,
+            ..
+        } => {
+            let sport = src_port_end
+                .map(|end| format!("{src_port}-{end}"))
+                .unwrap_or_else(|| src_port.to_string());
+            out.push(format!(
+                "{index}) [{status}] type=redirect sport={sport} target=localhost dport={dst_port} protocol={protocol} ip_version={ip_version}"
+            ));
+        }
+        NftCell::Drop { comment, .. } => {
+            let c = comment.as_deref().unwrap_or("-");
+            out.push(format!("{index}) [{status}] type=drop comment={c}"));
+            return out;
+        }
     }
-    Ok(())
+
+    let mut extras: Vec<String> = Vec::new();
+    extras.push(format!("access_control={}", config.access_control.mode));
+    extras.push(format!("quota={}", quota_brief(index, rule, stats_state)));
+    if let Some(label) = egress_brief(rule, resolved, config) {
+        extras.push(label);
+    }
+    out.push(format!("   {}", extras.join("  ")));
+    out
+}
+
+fn resolved_display(target: &str, resolved: Option<&str>) -> String {
+    match resolved {
+        Some(ip) => ip.to_string(),
+        None => {
+            if target.parse::<std::net::IpAddr>().is_ok() {
+                target.to_string()
+            } else {
+                "解析失败或暂不可用".to_string()
+            }
+        }
+    }
+}
+
+fn quota_brief(
+    index: usize,
+    rule: &NftCell,
+    stats_state: &nat_common::stats::StatsState,
+) -> String {
+    if !rule.quota_enabled() || rule.quota_bytes() == 0 {
+        return "off".to_string();
+    }
+    let limit = rule.quota_bytes();
+    let used = match rule.quota_period() {
+        QuotaPeriod::Daily => stats_state
+            .per_rule_daily_bytes
+            .get(&format!("r{index}"))
+            .copied()
+            .unwrap_or(0),
+        QuotaPeriod::Monthly => stats_state
+            .per_rule_monthly_bytes
+            .get(&format!("r{index}"))
+            .copied()
+            .unwrap_or(0),
+        QuotaPeriod::Total => stats_state
+            .per_rule_total_bytes
+            .get(&format!("r{index}"))
+            .copied()
+            .unwrap_or(0),
+    };
+    format!(
+        "{}/{} {}",
+        quota::format_bytes(used),
+        quota::format_bytes(limit),
+        rule.quota_period()
+    )
+}
+
+fn egress_brief(rule: &NftCell, resolved: Option<&str>, config: &TomlConfig) -> Option<String> {
+    if !config.egress_control.enabled {
+        return None;
+    }
+    if matches!(rule, NftCell::Drop { .. } | NftCell::Redirect { .. }) {
+        return None;
+    }
+    match resolved {
+        Some(ip) => {
+            let allowed = config.egress_control.allows_ip(ip);
+            Some(format!(
+                "egress={}",
+                if allowed { "allowed" } else { "blocked" }
+            ))
+        }
+        None => Some("egress=unknown(未解析)".to_string()),
+    }
+}
+
+/// 单行组合策略摘要：access_control / GeoIP / egress / SNAT / MSS 各自一个键值，便于扫读。
+pub(crate) fn combined_policy_summary(config: &TomlConfig) -> String {
+    let ac = match &config.access_control.mode {
+        AccessControlMode::Off => "off".to_string(),
+        AccessControlMode::Whitelist => {
+            format!("whitelist({})", config.access_control.entries.len())
+        }
+        AccessControlMode::Blacklist => {
+            format!("blacklist({})", config.access_control.entries.len())
+        }
+    };
+    let geoip =
+        if config.geoip.enabled && (config.geoip.forward.enabled || config.geoip.ssh.enabled) {
+            let mut parts = Vec::new();
+            if config.geoip.forward.enabled {
+                parts.push("forward");
+            }
+            if config.geoip.ssh.enabled {
+                parts.push("ssh");
+            }
+            format!("on({})", parts.join("+"))
+        } else {
+            "off".to_string()
+        };
+    let egress = if config.egress_control.enabled {
+        format!(
+            "on({}cidr)",
+            config.egress_control.allowed_target_cidrs.len()
+        )
+    } else {
+        "off".to_string()
+    };
+    let snat = match config.snat.mode {
+        SnatMode::Masquerade => "masquerade".to_string(),
+        SnatMode::Off => "off".to_string(),
+        SnatMode::Fixed => {
+            if config.snat.fixed_source_ip.trim().is_empty() {
+                "fixed(回退 masquerade)".to_string()
+            } else {
+                format!("fixed({})", config.snat.fixed_source_ip)
+            }
+        }
+    };
+    let mss = if config.mss_clamp.enabled {
+        format!("on({})", config.mss_clamp.size)
+    } else {
+        "off".to_string()
+    };
+    format!("组合策略：access_control={ac}, GeoIP={geoip}, egress={egress}, SNAT={snat}, MSS={mss}")
+}
+
+/// 单行 last-good 摘要：enabled / 缓存条数 / 最近成功时间。完整每条规则缓存通过 l 入口查看。
+pub(crate) fn last_good_summary(config: &TomlConfig, state: &LastGoodState) -> String {
+    let cached = state.rules.len();
+    let last = match state.last_success_at {
+        Some(ts) => format_cli_time_with(ts, &config.ui),
+        None => "(无)".to_string(),
+    };
+    format!(
+        "last-good：{}，缓存 {cached} 条，最近成功 {last}",
+        if config.last_good.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    )
 }
 
 fn add_single_interactive(path: &str) -> Result<(), io::Error> {
@@ -2622,6 +2897,8 @@ fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
 4) 启用 / 禁用 MSS clamp
 5) 设置 MSS clamp size
 6) 时间 / NTP 状态检查
+7) 查看组合策略详情
+8) 查看 last-good 状态缓存
 0) 返回主菜单
 ===================================="#
         );
@@ -2650,6 +2927,20 @@ fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
             "6" => {
                 // 自管 wait：函数内部完成 wait_enter_to_return；不再叠加。
                 time_status_interactive(config_path)?;
+            }
+            "7" => {
+                println!();
+                for line in format_combined_policy_status(&config) {
+                    println!("{line}");
+                }
+                wait_enter_to_return()?;
+            }
+            "8" => {
+                println!();
+                for line in format_last_good_status(&config) {
+                    println!("{line}");
+                }
+                wait_enter_to_return()?;
             }
             "0" => break,
             value if is_menu_refresh_command(value) => break,
@@ -3181,6 +3472,7 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
         } else {
             println!("当前没有可测试的转发规则");
         }
+        wait_enter_to_return()?;
         return Ok(());
     }
     for rule in &rules {
@@ -3188,10 +3480,9 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
     }
     let index = parse_index(&prompt("请选择要测试的规则 index: ")?)?;
     let Some(rule) = rules.iter().find(|rule| rule.index == index) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "规则 index 超出范围",
-        ));
+        println!("规则 index 超出范围");
+        wait_enter_to_return()?;
+        return Ok(());
     };
 
     println!("规则详情：");
@@ -3344,25 +3635,87 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
         None => println!("目标 TCP: UDP/all 场景无法完全可靠判断，请结合外部访问和 counter。"),
     }
 
-    let examples = forward_test::external_examples(rule);
-    println!("\n请在另一台机器执行下面命令测试外部访问，然后回到 CLI 观察 stats/counter：");
-    println!("HTTP 示例: {}", examples.http);
-    println!("TCP 示例: {}", examples.tcp);
-    println!("HTTPS/SNI 示例: {}", examples.https_sni);
-    println!(
-        "注意：本机 curl 127.0.0.1:{} 通常不能完整验证 DNAT PREROUTING。",
-        rule.sport
-    );
-    println!("如果测试后 counter 有变化，可回到 CLI 查看 Stats 流量统计。");
     println!();
-    for line in format_combined_policy_status(&config) {
+    for line in external_test_brief_lines(rule) {
         println!("{line}");
     }
-    println!();
-    for line in format_last_good_status(&config) {
-        println!("{line}");
+    let choice = prompt("> ")?;
+    if matches!(choice.trim(), "h" | "H") {
+        println!();
+        for line in external_test_detailed_lines(rule) {
+            println!("{line}");
+        }
+        wait_enter_to_return()?;
+    } else {
+        clear_screen();
     }
     Ok(())
+}
+
+/// 「测试转发规则连通性」结果页的简短外部访问提示。默认只显示必要信息，不再大段列出
+/// HTTP/TCP/HTTPS/SNI 示例；用户输入 h 后再展示完整命令。
+pub(crate) fn external_test_brief_lines(rule: &forward_test::TestableRule) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("外部访问测试：".to_string());
+    lines.push("请在另一台机器访问：".to_string());
+    lines.push(format!("  SERVER_IP:{}", rule.sport));
+    lines.push(format!(
+        "注意：本机 curl 127.0.0.1:{} 通常不能完整验证 DNAT PREROUTING。",
+        rule.sport
+    ));
+    let proto_hint = match rule.protocol.as_str() {
+        "tcp" => "本规则 protocol=tcp，可用 nc / curl 等 TCP 客户端验证。".to_string(),
+        "udp" => "本规则 protocol=udp，建议用业务客户端验证；nc -vzu 仅作连通性参考。".to_string(),
+        _ => "本规则 protocol=all，TCP / UDP 都会被转发。".to_string(),
+    };
+    lines.push(proto_hint);
+    lines.push("输入 h 查看详细测试命令示例，按 Enter 返回。".to_string());
+    lines
+}
+
+/// 「测试转发规则连通性」h 入口的完整外部测试命令。按协议、目标是否为域名分支：
+/// - protocol=udp：仅列 UDP 示例，提示 nc -vzu 局限性
+/// - protocol=tcp / all：列 TCP nc 示例
+/// - target 是域名：HTTP / HTTPS+SNI 示例都带 Host / --connect-to
+/// - target 是 IP：只列普通 TCP / HTTP 示例，不附 Host header
+pub(crate) fn external_test_detailed_lines(rule: &forward_test::TestableRule) -> Vec<String> {
+    let mut lines = Vec::new();
+    let examples = forward_test::external_examples(rule);
+    let target_is_domain = rule.target.parse::<std::net::IpAddr>().is_err();
+    lines.push("详细外部测试命令：".to_string());
+    match rule.protocol.as_str() {
+        "udp" => {
+            lines.push(format!("UDP 示例: nc -vzu SERVER_IP {}", rule.sport));
+            lines.push("提示：nc -vzu 只能验证端口是否对 UDP 探测有回应；UDP 真实可达性请用业务客户端验证。".to_string());
+        }
+        _ => {
+            lines.push(format!("TCP 示例: {}", examples.tcp));
+            if target_is_domain {
+                lines.push(format!("HTTP 示例: {}", examples.http));
+                lines.push(format!("HTTPS/SNI 示例: {}", examples.https_sni));
+                lines.push(
+                    "提示：目标是域名时建议带 Host header / SNI，以匹配后端虚拟主机。".to_string(),
+                );
+            } else {
+                lines.push(format!(
+                    "HTTP 示例: curl -v http://SERVER_IP:{}/",
+                    rule.sport
+                ));
+                lines.push("提示：目标是 IP，无需特别指定 Host header / SNI。".to_string());
+            }
+            if rule.protocol.as_str() == "all" {
+                lines.push(format!(
+                    "（protocol=all 还可使用 UDP 客户端测试 SERVER_IP:{} 的 UDP 路径）",
+                    rule.sport
+                ));
+            }
+        }
+    }
+    lines.push("如果测试后 counter 有变化，可回到 CLI 查看 Stats 流量统计。".to_string());
+    lines.push(
+        "注意：这些命令只用于外部连通性测试，与 GeoIP / last-good / egress_control 等准入功能是不同模块。".to_string(),
+    );
+    lines
 }
 
 /// 把 v0.4.2 的 nft 规则检测结果打印成结构化区块。
@@ -5235,5 +5588,348 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
         );
         // 仍保留原本的"不会自动放行或封禁来源 IP"承诺
         assert!(menu_src.contains("不会自动放行或封禁来源 IP"));
+    }
+
+    fn sample_single_rule_config(target: &str) -> TomlConfig {
+        let mut cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        cfg.rules.push(NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: target.to_string(),
+            protocol: Protocol::Tcp,
+            ip_version: IpVersion::V4,
+            comment: Some("demo".to_string()),
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
+        });
+        cfg
+    }
+
+    #[test]
+    fn show_rules_default_omits_full_policy_block() {
+        // 默认页面不应整段重复"组合策略 (access_control + GeoIP + egress + SNAT + MSS)"标题块
+        let cfg = sample_single_rule_config("93.184.216.34");
+        let stats = StatsState::default();
+        let last_good = LastGoodState::default();
+        let resolutions = vec![Some("93.184.216.34".to_string())];
+        let lines = render_rules_default_lines(&cfg, &resolutions, &stats, &last_good).join("\n");
+        assert!(
+            !lines.contains("组合策略 (access_control + GeoIP + egress + SNAT + MSS)"),
+            "默认页面不应包含完整组合策略详情:\n{lines}"
+        );
+    }
+
+    #[test]
+    fn show_rules_default_omits_full_last_good_block() {
+        // 默认页面不应展开"last-good 状态缓存"完整每条规则
+        let cfg = sample_single_rule_config("93.184.216.34");
+        let stats = StatsState::default();
+        let last_good = LastGoodState::default();
+        let resolutions = vec![Some("93.184.216.34".to_string())];
+        let lines = render_rules_default_lines(&cfg, &resolutions, &stats, &last_good).join("\n");
+        assert!(
+            !lines.contains("last-good 状态缓存"),
+            "默认页面不应包含完整 last-good 标题块:\n{lines}"
+        );
+        // 默认页面也不应输出"file:"等完整 last-good 详情字段
+        assert!(
+            !lines.contains("use_last_good_on_dns_failure"),
+            "默认页面不应展开 last-good 完整字段:\n{lines}"
+        );
+    }
+
+    #[test]
+    fn show_rules_default_includes_summary_one_liners() {
+        // 默认页面必须显示一行组合策略摘要 + 一行 last-good 摘要
+        let cfg = sample_single_rule_config("93.184.216.34");
+        let stats = StatsState::default();
+        let last_good = LastGoodState::default();
+        let resolutions = vec![Some("93.184.216.34".to_string())];
+        let lines = render_rules_default_lines(&cfg, &resolutions, &stats, &last_good).join("\n");
+        assert!(
+            lines.contains("组合策略：access_control=off"),
+            "默认页面应显示组合策略摘要:\n{lines}"
+        );
+        assert!(
+            lines.contains("GeoIP=") && lines.contains("egress=") && lines.contains("SNAT="),
+            "组合策略摘要应包含 GeoIP/egress/SNAT 各项:\n{lines}"
+        );
+        assert!(
+            lines.contains("last-good：") && lines.contains("缓存 0 条"),
+            "默认页面应显示 last-good 摘要:\n{lines}"
+        );
+    }
+
+    #[test]
+    fn show_rules_default_per_rule_includes_core_fields() {
+        // 每条规则默认行应包含 index / 状态 / type / sport / target / resolved / dport / protocol / ip_version
+        let cfg = sample_single_rule_config("93.184.216.34");
+        let stats = StatsState::default();
+        let last_good = LastGoodState::default();
+        let resolutions = vec![Some("93.184.216.34".to_string())];
+        let lines = render_rules_default_lines(&cfg, &resolutions, &stats, &last_good).join("\n");
+        assert!(lines.contains("0) [启用]"), "缺少 index/状态 前缀: {lines}");
+        assert!(lines.contains("type=single"), "缺少 type=single: {lines}");
+        assert!(lines.contains("sport=30080"), "缺少 sport: {lines}");
+        assert!(
+            lines.contains("target=93.184.216.34"),
+            "缺少 target: {lines}"
+        );
+        assert!(
+            lines.contains("(resolved=93.184.216.34)"),
+            "缺少 resolved 字段: {lines}"
+        );
+        assert!(lines.contains("dport=80"), "缺少 dport: {lines}");
+        assert!(lines.contains("protocol=tcp"), "缺少 protocol: {lines}");
+        assert!(
+            lines.contains("ip_version=ipv4"),
+            "缺少 ip_version: {lines}"
+        );
+        assert!(
+            lines.contains("access_control=off"),
+            "缺少 access_control 状态: {lines}"
+        );
+    }
+
+    #[test]
+    fn show_rules_default_shows_quota_brief_when_enabled() {
+        // quota 启用时每条规则应显示简要 used/limit；未启用时显示 quota=off
+        let mut cfg = sample_single_rule_config("93.184.216.34");
+        if let NftCell::Single {
+            quota_enabled,
+            quota_bytes,
+            ..
+        } = &mut cfg.rules[0]
+        {
+            *quota_enabled = true;
+            *quota_bytes = 10 * 1024 * 1024 * 1024;
+        }
+        let mut stats = StatsState::default();
+        stats
+            .per_rule_monthly_bytes
+            .insert("r0".to_string(), 5 * 1024 * 1024 * 1024);
+        let last_good = LastGoodState::default();
+        let resolutions = vec![Some("93.184.216.34".to_string())];
+        let lines = render_rules_default_lines(&cfg, &resolutions, &stats, &last_good).join("\n");
+        assert!(
+            lines.contains("quota=") && lines.contains("/10.00 GB"),
+            "应显示 quota used/limit: {lines}"
+        );
+    }
+
+    #[test]
+    fn show_rules_default_marks_egress_when_enabled() {
+        // egress_control 启用时每条规则应附带 egress=allowed/blocked
+        let mut cfg = sample_single_rule_config("93.184.216.34");
+        cfg.egress_control = nat_common::EgressControlConfig {
+            enabled: true,
+            mode: "allow".to_string(),
+            allowed_target_cidrs: vec!["10.0.0.0/8".to_string()],
+            comment: None,
+        };
+        let stats = StatsState::default();
+        let last_good = LastGoodState::default();
+        let resolutions = vec![Some("93.184.216.34".to_string())];
+        let lines = render_rules_default_lines(&cfg, &resolutions, &stats, &last_good).join("\n");
+        assert!(
+            lines.contains("egress=blocked"),
+            "公网 IP 不在 10.0.0.0/8 时应显示 egress=blocked: {lines}"
+        );
+    }
+
+    #[test]
+    fn combined_policy_summary_is_single_line() {
+        let cfg = sample_single_rule_config("93.184.216.34");
+        let line = combined_policy_summary(&cfg);
+        assert_eq!(line.lines().count(), 1, "组合策略摘要必须是单行: {line}");
+        assert!(line.contains("access_control="));
+        assert!(line.contains("MSS="));
+    }
+
+    #[test]
+    fn last_good_summary_is_single_line() {
+        let cfg = sample_single_rule_config("93.184.216.34");
+        let state = LastGoodState::default();
+        let line = last_good_summary(&cfg, &state);
+        assert_eq!(line.lines().count(), 1, "last-good 摘要必须是单行: {line}");
+        assert!(line.contains("缓存"));
+        assert!(line.contains("最近成功"));
+    }
+
+    #[test]
+    fn combined_policy_details_still_available_via_format_combined_policy_status() {
+        // 入口仍保留：format_combined_policy_status 返回的完整内容应包含 SNAT / MSS 等子项
+        let cfg = sample_single_rule_config("93.184.216.34");
+        let detail = format_combined_policy_status(&cfg).join("\n");
+        assert!(detail.contains("组合策略 (access_control + GeoIP + egress + SNAT + MSS)"));
+        assert!(detail.contains("最终来源策略") || detail.contains("允许 = "));
+        assert!(detail.contains("SNAT"));
+        assert!(detail.contains("MSS clamp"));
+    }
+
+    #[test]
+    fn last_good_details_still_available_via_format_last_good_status() {
+        // 入口仍保留：format_last_good_status 返回的完整内容应包含 file / 规则缓存数量 等字段
+        let cfg = sample_single_rule_config("93.184.216.34");
+        let detail = format_last_good_status(&cfg).join("\n");
+        assert!(detail.contains("last-good 状态缓存"));
+        assert!(detail.contains("enabled:") && detail.contains("use_last_good_on_dns_failure"));
+        assert!(detail.contains("file:"));
+        assert!(detail.contains("规则缓存数量"));
+    }
+
+    fn sample_testable_rule(
+        target: &str,
+        protocol: &str,
+    ) -> nat_common::forward_test::TestableRule {
+        nat_common::forward_test::TestableRule {
+            index: 0,
+            id: "r0".to_string(),
+            label: format!("demo: 30080 -> {target}:80/{protocol}"),
+            r#type: "single".to_string(),
+            sport: 30080,
+            target: target.to_string(),
+            resolved_ip: Some(target.to_string()),
+            dport: 80,
+            protocol: protocol.to_string(),
+            ip_version: "ipv4".to_string(),
+        }
+    }
+
+    #[test]
+    fn external_test_brief_is_short_and_omits_detailed_examples() {
+        // 默认外部测试提示只展示 SERVER_IP / 注意事项 / h 提示，不直接列 curl / nc 示例
+        let rule = sample_testable_rule("93.184.216.34", "tcp");
+        let lines = external_test_brief_lines(&rule).join("\n");
+        assert!(lines.contains("SERVER_IP:30080"));
+        assert!(lines.contains("外部访问测试："));
+        assert!(lines.contains("输入 h 查看详细测试命令示例"));
+        assert!(
+            !lines.contains("curl -v"),
+            "brief 不应直接输出 curl 命令: {lines}"
+        );
+        assert!(
+            !lines.contains("nc -vz "),
+            "brief 不应直接输出 nc 命令: {lines}"
+        );
+        assert!(
+            !lines.contains("HTTPS/SNI 示例:"),
+            "brief 不应输出 HTTPS/SNI 示例: {lines}"
+        );
+    }
+
+    #[test]
+    fn external_test_brief_uses_protocol_hint_for_udp() {
+        let rule = sample_testable_rule("93.184.216.34", "udp");
+        let lines = external_test_brief_lines(&rule).join("\n");
+        assert!(
+            lines.contains("protocol=udp") && lines.contains("nc -vzu"),
+            "udp brief 应提示 UDP 客户端 / nc -vzu: {lines}"
+        );
+    }
+
+    #[test]
+    fn external_test_detailed_tcp_ip_target_omits_host_header() {
+        // 详细命令：TCP + IP 目标，应给出 TCP nc + 普通 HTTP，不要带 Host header / SNI
+        let rule = sample_testable_rule("93.184.216.34", "tcp");
+        let lines = external_test_detailed_lines(&rule).join("\n");
+        assert!(
+            lines.contains("TCP 示例: nc -vz SERVER_IP 30080"),
+            "应有 TCP 示例: {lines}"
+        );
+        assert!(
+            lines.contains("HTTP 示例: curl -v http://SERVER_IP:30080/"),
+            "应有不带 Host 的 HTTP 示例: {lines}"
+        );
+        assert!(
+            !lines.contains("-H \"Host:"),
+            "IP 目标不应附 Host header: {lines}"
+        );
+        assert!(
+            !lines.contains("HTTPS/SNI"),
+            "IP 目标不应附 SNI 示例: {lines}"
+        );
+    }
+
+    #[test]
+    fn external_test_detailed_tcp_domain_target_includes_host_and_sni() {
+        // 域名目标的详细命令应包含 Host header HTTP 示例和 HTTPS/SNI 示例
+        let rule = sample_testable_rule("example.com", "tcp");
+        let lines = external_test_detailed_lines(&rule).join("\n");
+        assert!(
+            lines.contains("HTTP 示例:") && lines.contains("-H \"Host: example.com\""),
+            "域名目标应附 Host header: {lines}"
+        );
+        assert!(
+            lines.contains("HTTPS/SNI 示例:") && lines.contains("--connect-to example.com:"),
+            "域名目标应附 HTTPS/SNI 示例: {lines}"
+        );
+    }
+
+    #[test]
+    fn external_test_detailed_udp_only_shows_udp_block() {
+        let rule = sample_testable_rule("example.com", "udp");
+        let lines = external_test_detailed_lines(&rule).join("\n");
+        assert!(
+            lines.contains("UDP 示例: nc -vzu SERVER_IP 30080"),
+            "udp 详细应给出 UDP 示例: {lines}"
+        );
+        assert!(
+            !lines.contains("HTTP 示例:"),
+            "udp 详细不应输出 HTTP 示例: {lines}"
+        );
+        assert!(
+            !lines.contains("HTTPS/SNI"),
+            "udp 详细不应输出 HTTPS/SNI 示例: {lines}"
+        );
+    }
+
+    #[test]
+    fn external_test_detailed_distinguishes_from_geoip_egress_last_good() {
+        // 防止用户误以为这些命令和 GeoIP / last-good / egress_control 是同一个功能
+        let rule = sample_testable_rule("example.com", "tcp");
+        let lines = external_test_detailed_lines(&rule).join("\n");
+        assert!(
+            lines.contains("与 GeoIP / last-good / egress_control"),
+            "详细命令应有功能边界说明: {lines}"
+        );
+    }
+
+    #[test]
+    fn advanced_network_menu_exposes_policy_and_last_good_entries() {
+        // 高级网络设置子菜单提供「7) 查看组合策略详情」和「8) 查看 last-good 状态缓存」入口
+        let menu_src = include_str!("menu.rs");
+        assert!(
+            menu_src.contains("7) 查看组合策略详情"),
+            "高级网络菜单应有「查看组合策略详情」"
+        );
+        assert!(
+            menu_src.contains("8) 查看 last-good 状态缓存"),
+            "高级网络菜单应有「查看 last-good 状态缓存」"
+        );
+    }
+
+    #[test]
+    fn show_rules_page_advertises_detail_entries() {
+        // 「查看当前转发规则」提示用户可以通过 d / l / p 跳详情
+        let menu_src = include_str!("menu.rs");
+        assert!(
+            menu_src.contains("输入 d 查看详细诊断")
+                && menu_src.contains("l 查看 last-good 详情")
+                && menu_src.contains("p 查看组合策略详情"),
+            "show_rules 应提示 d/l/p 详情入口"
+        );
+    }
+
+    #[test]
+    fn readme_documents_short_external_test_hint() {
+        let readme = include_str!("../../README.md");
+        assert!(
+            readme.contains("CLI 默认只展示简短测试提示") && readme.contains("输入 h 查看"),
+            "README 应说明默认简短测试提示与 h 入口"
+        );
     }
 }

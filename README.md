@@ -224,7 +224,7 @@ size = 1452
 
 SNAT 与 MSS clamp 不参与来源 / 目标 IP 准入判断，它们改变的是数据面的源地址写入方式和 TCP MSS。但它们的当前值仍会在 CLI 状态页显示，避免和上述准入功能混淆。
 
-CLI 的「查看当前转发规则」、「GeoIP / CN IP 限制」、「出口目标限制」、「高级网络设置」、「测试转发规则连通性」结果页都会显示完整的组合策略摘要。
+CLI 的「GeoIP / CN IP 限制」、「出口目标限制」、「高级网络设置」结果页会显示完整的组合策略详情；「查看当前转发规则」默认只展示一行组合策略摘要，输入 `d` 或 `p` 可展开完整内容。「测试转发规则连通性」聚焦于具体规则的连通性诊断，不再默认重复完整组合策略，详细策略可在「高级网络设置 → 查看组合策略详情」查看。
 
 ### last-good 状态缓存
 
@@ -563,7 +563,9 @@ nft-nat-rust v0.4.2
 0) 退出
 ```
 
-`高级网络设置` 子菜单：查看 SNAT / MSS 状态、设置 SNAT 模式（masquerade / fixed / off）、设置 fixed SNAT 源 IP、启用 / 禁用 MSS clamp、设置 MSS clamp size、**时间 / NTP 状态检查**（v0.4.2 起为子菜单，参见 [时间显示与 NTP](#时间显示与-ntp)）。
+`高级网络设置` 子菜单：查看 SNAT / MSS 状态、设置 SNAT 模式（masquerade / fixed / off）、设置 fixed SNAT 源 IP、启用 / 禁用 MSS clamp、设置 MSS clamp size、**时间 / NTP 状态检查**（v0.4.2 起为子菜单，参见 [时间显示与 NTP](#时间显示与-ntp)）、**查看组合策略详情**（access_control / GeoIP / egress / SNAT / MSS 完整说明）、**查看 last-good 状态缓存**（每条规则的缓存 IP / 解析时间 / egress 判断）。
+
+`查看当前转发规则` 默认只展示每条规则的核心字段（index / 状态 / type / sport / target / resolved / dport / protocol / ip_version / access_control / quota / egress），以及一行组合策略摘要和一行 last-good 摘要。可在页面尾部输入 `d` 查看详细诊断、`l` 查看 last-good 详情、`p` 查看组合策略详情；按 Enter 直接返回主菜单。
 
 `查看审计日志` 显示最近 50 行 audit 事件。默认以 CLI 友好格式（按 Asia/Shanghai / `[ui].timezone` 展示时间），可在子菜单切换查看原始 JSON。文件路径默认 `audit.file = /var/log/nftables-nat-rust-audit.log`，可用 `tail -F` / `grep` 直接查看。
 
@@ -575,6 +577,12 @@ nft-nat-rust v0.4.2
 - 结论分四档：`已应用` / `部分匹配` / `未确认` / `未应用`
 - 若检测器未找到，但 `nat.service` 仍 active 且最近一次 `apply.success`，会显示 `未确认` 而不是 `未应用`，并提示用户手动查看：`nft list table ip self-nat` / `journalctl -u nat -n 120 --no-pager`
 - 不会因检测未确认就自动重启 nat、也不会绕过 safe apply 直接 `nft -f`
+
+CLI 默认只展示简短测试提示（`SERVER_IP:入口端口` + 协议提示），详细 `curl` / `nc` / SNI 示例可在测试页面**输入 h 查看**。详细命令会按规则的 `protocol` 与 `target` 分支：
+- `protocol=tcp` 显示 TCP `nc` 与 `curl`，IP 目标不附 `Host` header；
+- `protocol=udp` 仅显示 UDP `nc -vzu` 提示，并提醒最终需用业务客户端验证；
+- 目标是域名时附 `Host` header 与 `--connect-to ... SNI` 示例。
+这些命令只用于外部连通性测试，与 GeoIP / last-good / egress_control 等准入功能是不同模块。
 
 `GeoIP / CN IP 限制` 子菜单包含：查看状态、下载 / 更新 CN IP set、启用或禁用转发端口 CN 限制、启用或禁用 SSH CN 限制（需要输入 `CONFIRM`）、设置 SSH 端口、设置更新间隔。
 
