@@ -623,6 +623,10 @@ systemctl restart nat
 - 临时文件 / rename 失败 → 旧 `/etc/nat.toml` 保持不变，写 `config.write.fail`（`stage=write_or_rename`）audit
 - audit detail 不写入 `bot_token` / `chat_id` / 任何 secret key（沿用 `redact` 兜底）
 
+v0.6.1：保存提示按 reason 分流——
+- 影响 nft 规则的 reason（`rule.*` / `access_control.*` / `geoip.*` / `egress*` / `snat.*` / `mss_clamp.*` / `backup.restore` / `quota.auto_disable` / `quota.config.update` / `stats.mode.update`）继续显示完整 `nat.service` 自动应用 + `systemctl restart nat` / `nft list table` / `journalctl` 排查命令。
+- 不影响 nft 规则的 reason（`telegram.*` / `ui.*` / `audit.*`）只显示简短提示：「配置已安全保存…该配置不会改变 nft 转发规则，无需等待 nft 应用。」
+
 `启用 / 禁用规则` 会列出所有规则，选择某一条后再启用或禁用。旧配置缺少 `enabled` 字段时默认视为 `true`；`enabled = false` 的规则会保留在 `/etc/nat.toml`，但不会生成到 nft 规则，也不会进入默认连通性测试列表。
 
 `最近来源 IP 观察（手动排查）` v0.4.3 起明确为**手动排查辅助入口**，**不自动采集**最近来源 IP，也不依赖白名单 / 黑名单。页面会打印 `conntrack -L` / `nft list table ip self-nat` / `nft list table ip self-filter` / `journalctl -u nat -n 120 --no-pager` 等命令，供用户在 shell 中手动观察。本项目不会自动安装 conntrack，也不会自动放行或封禁来源 IP，也不会修改访问控制配置。
@@ -784,6 +788,15 @@ nat --menu
 如果旧版本的 CLI 一键更新没有可靠生效，可直接使用上面的 release 更新命令。新版 CLI 可通过 `nat --menu` -> `一键更新本项目` 更新核心 `nat`。
 
 失败时会尝试回滚。
+
+#### v0.6.1：safe apply 用 hash 判断脚本是否变化
+
+nat.service 主循环以前用「`script != latest_script` 整字符串比较」判断是否要重新跑一次 safe apply。v0.6.1 起改用稳定 FNV-1a 64-bit hash（`nat_common::stable_script_hash`）：
+
+- 相同输入 → 相同 hash，不会 apply；hash 变化 → 走原有 safe apply 流程
+- hash 跨进程稳定（不依赖 `DefaultHasher` 的随机种子），可在 audit / 日志里以 `0x<16hex>` 形式记录
+- audit 事件 `apply.success` / `apply.fail` 现在带 `script_hash` 字段，便于排查"刚刚应用的是哪一版规则"
+- 不改变 apply 触发条件、不改变 nft 脚本内容、不改变 last-good / stats / quota 任何语义
 
 ## 卸载
 

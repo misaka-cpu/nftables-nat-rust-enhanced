@@ -9,11 +9,14 @@ pub mod atomic;
 pub mod audit;
 pub mod forward_test;
 pub mod geoip;
+pub mod hash;
 pub mod last_good;
 pub mod logger;
 pub mod quota;
 pub mod stats;
 pub mod uninstall;
+
+pub use hash::stable_script_hash;
 
 pub fn build_version() -> &'static str {
     // release CI 注入 NAT_BUILD_VERSION=<tag>；源码编译没有注入时回退 Cargo 包版本。

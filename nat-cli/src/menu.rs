@@ -1,11 +1,15 @@
+mod audit_view;
+mod backup;
+mod update;
+
 use chrono::Local;
 use log::warn;
 use nat_common::{
     AccessControlMode, Args, AuditConfig, DdnsConfig, IpVersion, MSS_CLAMP_MAX, MSS_CLAMP_MIN,
     MssClampConfig, NftCell, Protocol, QuotaPeriod, SnatConfig, SnatMode, StatsConfig, TomlConfig,
-    TrafficMode, atomic,
+    TrafficMode,
     audit::{self, AuditResult},
-    build_version, format_cli_time_from_rfc3339_with, format_cli_time_with, forward_test, geoip,
+    format_cli_time_from_rfc3339_with, format_cli_time_with, forward_test, geoip,
     last_good::{LastGoodState, ResolveSource},
     quota, stats as traffic_stats,
     uninstall::{self, DataMode, UninstallTarget},
@@ -13,8 +17,7 @@ use nat_common::{
 use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 const NAT_BIN_PATH: &str = "/usr/local/bin/nat";
@@ -260,147 +263,11 @@ fn audit_cli(path: &str, action: &str, result: AuditResult, detail: serde_json::
     audit::log_event(&audit_config_from(path), action, result, detail);
 }
 
-/// v0.6.0：所有写 /etc/nat.toml 的生产路径统一走这里。
-/// 流程：备份当前文件（按 reason 命名）→ 临时文件 + fsync + rename → 写 audit。
-/// 任何步骤失败：保留旧配置不动，写 `config.write.fail` audit，并返回 Err。
-fn save_toml_config(path: &str, config: &TomlConfig, reason: &str) -> Result<PathBuf, io::Error> {
-    let content = config
-        .to_toml_string()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    safe_write_config(path, &content, reason)
-}
-
-/// 从已知字符串内容安全地覆盖 TOML 配置。备份恢复路径用得上：
-/// 备份文件已经在磁盘上，调用方只想原子地"恢复"到目标 path。
-fn save_toml_config_from_string(
-    path: &str,
-    content: &str,
-    reason: &str,
-) -> Result<PathBuf, io::Error> {
-    safe_write_config(path, content, reason)
-}
-
-/// 安全写 TOML 配置：备份 → tmp+fsync+rename → audit。
-/// 备份目录使用 [`CONFIG_BACKUP_DIR`]；audit 从 `path` 解析 [`AuditConfig`]。
-pub(crate) fn safe_write_config(
-    path: &str,
-    content: &str,
-    reason: &str,
-) -> Result<PathBuf, io::Error> {
-    let audit_cfg = audit_config_from(path);
-    safe_write_config_to(
-        Path::new(CONFIG_BACKUP_DIR),
-        &audit_cfg,
-        path,
-        content,
-        reason,
-    )
-}
-
-/// 可注入备份目录与 audit 配置的 safe_write 内核；测试与 quota 自动禁用复用。
-///
-/// - 备份失败 → 返回 Err，不覆盖旧文件，写 `config.write.fail` audit。
-/// - 临时文件写入或 rename 失败 → 返回 Err，旧文件保持不变，写 `config.write.fail` audit。
-///   - rename 失败时 [`atomic::write_atomic`] 会清理 .tmp。
-/// - 成功 → 写 `config.write.success` audit，返回备份路径。
-///
-/// audit detail 不包含 TOML 内容本身、不包含 bot_token；只包含 reason / path / backup / error。
-pub(crate) fn safe_write_config_to(
-    backup_dir: &Path,
-    audit_cfg: &AuditConfig,
-    path: &str,
-    content: &str,
-    reason: &str,
-) -> Result<PathBuf, io::Error> {
-    let backup_path = match backup_config_to(backup_dir, path, reason) {
-        Ok(p) => p,
-        Err(e) => {
-            audit::log_event(
-                audit_cfg,
-                "config.write.fail",
-                AuditResult::Fail,
-                json!({
-                    "reason": reason,
-                    "path": path,
-                    "stage": "backup",
-                    "error": e.to_string(),
-                }),
-            );
-            return Err(e);
-        }
-    };
-    if let Err(e) = atomic::write_atomic(path, content) {
-        audit::log_event(
-            audit_cfg,
-            "config.write.fail",
-            AuditResult::Fail,
-            json!({
-                "reason": reason,
-                "path": path,
-                "stage": "write_or_rename",
-                "backup": backup_path.display().to_string(),
-                "error": e.to_string(),
-            }),
-        );
-        return Err(e);
-    }
-    audit::log_event(
-        audit_cfg,
-        "config.write.success",
-        AuditResult::Ok,
-        json!({
-            "reason": reason,
-            "path": path,
-            "backup": backup_path.display().to_string(),
-        }),
-    );
-    Ok(backup_path)
-}
-
-/// `backup_config_to`：按 reason 命名备份并设 0600 权限。
-/// 备份文件名形如 `nat.toml.<reason>-YYYYmmdd-HHMMSS.bak`，与 `quota.backup.create` 的命名风格一致。
-pub(crate) fn backup_config_to(
-    backup_dir: &Path,
-    source_path: &str,
-    reason: &str,
-) -> Result<PathBuf, io::Error> {
-    fs::create_dir_all(backup_dir)?;
-    let source = Path::new(source_path);
-    let stem = source
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("nat.toml");
-    let safe_reason = sanitize_backup_reason(reason);
-    let backup_path = backup_dir.join(format!(
-        "{stem}.{safe_reason}-{}.bak",
-        Local::now().format("%Y%m%d-%H%M%S")
-    ));
-    fs::copy(source, &backup_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(backup_path)
-}
-
-/// reason 在文件名里的字符约束：保留 ASCII 字母/数字/下划线/短横线/点；其余替换为 `-`。
-fn sanitize_backup_reason(reason: &str) -> String {
-    let trimmed = reason.trim();
-    if trimmed.is_empty() {
-        return "config-write".to_string();
-    }
-    trimmed
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
+// v0.6.1：safe_write_config / save_toml_config / backup_config / sanitize_backup_reason /
+// restore_config_interactive / backup_filename / list_config_backups 已搬到 `menu/backup.rs`。
+// `safe_write_config_to` 也要给 main.rs 的 quota_loop 用，因此向外 re-export。
+pub(crate) use backup::safe_write_config_to;
+use backup::{backup_config, restore_config_interactive, save_toml_config};
 
 fn show_rules(path: &str) -> Result<(), io::Error> {
     let config = load_toml_config(path)?;
@@ -711,7 +578,7 @@ fn add_single_interactive(path: &str) -> Result<(), io::Error> {
         }),
     );
     println!("已添加规则。");
-    print_config_saved_hint(path);
+    print_config_saved_hint(path, "rule.add.single");
     Ok(())
 }
 
@@ -748,7 +615,7 @@ fn add_range_interactive(path: &str) -> Result<(), io::Error> {
         }),
     );
     println!("已添加端口段规则。当前模型会转发到目标同端口段。");
-    print_config_saved_hint(path);
+    print_config_saved_hint(path, "rule.add.range");
     Ok(())
 }
 
@@ -782,37 +649,120 @@ fn delete_rule_interactive(path: &str) -> Result<(), io::Error> {
         json!({"index": index}),
     );
     println!("已删除规则。");
-    print_config_saved_hint(path);
+    print_config_saved_hint(path, "rule.delete");
     Ok(())
 }
 
-fn print_config_saved_hint(path: &str) {
-    println!("已安全保存配置到 {path}（备份 → 临时文件 + fsync → rename）。");
-    println!("备份目录：{CONFIG_BACKUP_DIR}/（按 reason 命名，权限 0600）。");
-    println!("nat.service 通常会自动检测配置变化，并通过安全流程应用规则。");
-    println!("安全流程包括：nft -c 检查、备份当前规则、应用失败自动回滚。");
-    println!("本工具不会直接绕过安全流程执行 nft -f。");
-    // 显示当前 ddns.refresh_interval_seconds 作为「检测周期」参考值；读不到就退回默认提示
+/// 配置保存后的提示。
+/// - 影响 nft 规则的 reason（rule.* / access_control.* / geoip.* / egress.* / snat.* / mss_clamp.* / backup.restore / quota.auto_disable）
+///   显示完整 nft 自动应用提示 + systemctl restart / nft list / journalctl 排查命令。
+/// - 不影响 nft 的 reason（telegram.* / ui.* / audit.*）只显示安全写入摘要，明确说明
+///   "无需等待 nft 应用"，避免误导用户。
+fn print_config_saved_hint(path: &str, reason: &str) {
+    if reason_affects_nft(reason) {
+        print_nft_affecting_save_hint(path);
+    } else {
+        print_non_nft_save_hint(path, reason);
+    }
+}
+
+/// 哪些 reason 会改变 nft 规则。命中列表里的 reason → 显示 nft 自动应用提示；
+/// 不命中（例如 telegram.* / ui.* / audit.*）→ 显示简短提示，不引导用户去 restart nat。
+pub(crate) fn reason_affects_nft(reason: &str) -> bool {
+    matches!(
+        reason,
+        "rule.add.single"
+            | "rule.add.range"
+            | "rule.delete"
+            | "rule.toggle"
+            | "access_control.update"
+            | "geoip.forward.update"
+            | "geoip.ssh.update"
+            | "geoip.ssh.port.update"
+            | "geoip.update_interval.update"
+            | "egress_control.update"
+            | "egress.add"
+            | "egress.delete"
+            | "snat.mode.update"
+            | "snat.fixed_source_ip.update"
+            | "mss_clamp.toggle"
+            | "mss_clamp.size.update"
+            | "backup.restore"
+            | "quota.auto_disable"
+            | "quota.config.update"
+            | "stats.mode.update"
+    )
+}
+
+fn print_nft_affecting_save_hint(path: &str) {
+    for line in format_nft_affecting_save_hint_lines(path) {
+        println!("{line}");
+    }
+}
+
+fn print_non_nft_save_hint(path: &str, reason: &str) {
+    for line in format_non_nft_save_hint_lines(path, reason) {
+        println!("{line}");
+    }
+}
+
+/// 影响 nft 规则的保存提示文本（按行返回，便于单元测试断言）。
+pub(crate) fn format_nft_affecting_save_hint_lines(path: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "已安全保存配置到 {path}（备份 → 临时文件 + fsync → rename）。"
+    ));
+    lines.push(format!(
+        "备份目录：{CONFIG_BACKUP_DIR}/（按 reason 命名，权限 0600）。"
+    ));
+    lines.push("nat.service 通常会自动检测配置变化，并通过安全流程应用规则。".to_string());
+    lines.push("安全流程包括：nft -c 检查、备份当前规则、应用失败自动回滚。".to_string());
+    lines.push("本工具不会直接绕过安全流程执行 nft -f。".to_string());
     let interval_secs = load_toml_config(path)
         .ok()
         .map(|c| c.ddns.refresh_interval_seconds);
     match interval_secs {
         Some(secs) => {
-            println!("当前自动检测 / 刷新间隔：{secs} 秒（ddns.refresh_interval_seconds）。");
+            lines.push(format!(
+                "当前自动检测 / 刷新间隔：{secs} 秒（ddns.refresh_interval_seconds）。"
+            ));
         }
         None => {
-            println!(
+            lines.push(
                 "当前自动检测 / 刷新间隔：默认 300 秒（无法读取 ddns.refresh_interval_seconds）。"
+                    .to_string(),
             );
         }
     }
-    println!("如果刚改完配置后立即测试显示 nft 未应用，请等待一个检测周期后刷新；这通常不是 bug。");
-    println!("如需立即尝试应用，可手动执行：");
-    println!("  systemctl restart nat");
-    println!("确认当前规则是否已应用：");
-    println!("  nft list table ip self-nat");
-    println!("  nft list table ip self-filter");
-    println!("  journalctl -u nat -n 120 --no-pager");
+    lines.push(
+        "如果刚改完配置后立即测试显示 nft 未应用，请等待一个检测周期后刷新；这通常不是 bug。"
+            .to_string(),
+    );
+    lines.push("如需立即尝试应用，可手动执行：".to_string());
+    lines.push("  systemctl restart nat".to_string());
+    lines.push("确认当前规则是否已应用：".to_string());
+    lines.push("  nft list table ip self-nat".to_string());
+    lines.push("  nft list table ip self-filter".to_string());
+    lines.push("  journalctl -u nat -n 120 --no-pager".to_string());
+    lines
+}
+
+/// 不影响 nft 规则的保存提示文本（telegram / ui / audit 等）。
+/// 不引导用户去 `systemctl restart nat` 或 `nft list table`，避免误以为需要等 nft apply。
+pub(crate) fn format_non_nft_save_hint_lines(path: &str, reason: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    if reason.starts_with("telegram.") {
+        lines.push(format!(
+            "Telegram 配置已安全保存到 {path}，状态页默认不会明文显示 bot_token。"
+        ));
+    } else {
+        lines.push(format!("配置已安全保存到 {path}。"));
+    }
+    lines.push(format!(
+        "备份目录：{CONFIG_BACKUP_DIR}/（按 reason 命名，权限 0600）。"
+    ));
+    lines.push("该配置不会改变 nft 转发规则，无需等待 nft 应用。".to_string());
+    lines
 }
 
 fn refresh_ddns_interactive(
@@ -994,7 +944,7 @@ fn switch_traffic_mode(config_path: &str) -> Result<bool, io::Error> {
     println!("已保存统计口径到 {config_path}。");
     println!("后续新增流量将按新口径累计；历史 daily/monthly 不会自动重算。");
     println!("如需重新统计，请重置今日或本月统计。");
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "stats.mode.update");
     Ok(true)
 }
 
@@ -1126,7 +1076,7 @@ fn set_rule_quota_interactive(config_path: &str) -> Result<MenuOutcome, io::Erro
         }),
     );
     println!("已保存。");
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "quota.config.update");
     Ok(MenuOutcome::Done)
 }
 
@@ -1305,39 +1255,7 @@ fn has_out_without_in(state: &traffic_stats::StatsState) -> bool {
     })
 }
 
-fn restore_config_interactive(path: &str) -> Result<(), io::Error> {
-    let backups = list_config_backups()?;
-    if backups.is_empty() {
-        println!("没有找到配置备份");
-        return Ok(());
-    }
-    for (index, backup) in backups.iter().enumerate() {
-        println!("{index}) {}", backup.display());
-    }
-    let index = parse_index(&prompt("请选择要恢复的备份 index: ")?)?;
-    if index >= backups.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "备份 index 超出范围",
-        ));
-    }
-    let confirm = prompt("恢复前会备份当前配置。确认恢复? [y/N]: ")?;
-    if !matches!(confirm.as_str(), "y" | "Y") {
-        println!("已取消恢复");
-        return Ok(());
-    }
-    let restored_content = fs::read_to_string(&backups[index])?;
-    save_toml_config_from_string(path, &restored_content, "backup.restore")?;
-    audit_cli(
-        path,
-        "backup.restore",
-        AuditResult::Ok,
-        json!({"backup": backups[index].display().to_string()}),
-    );
-    println!("已恢复配置: {}", backups[index].display());
-    print_config_saved_hint(path);
-    Ok(())
-}
+// v0.6.1：restore_config_interactive 已搬到 `menu/backup.rs`。
 
 fn access_control_menu(path: &str) -> Result<(), io::Error> {
     let mut config = load_toml_config(path)?;
@@ -1426,7 +1344,7 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
                     }),
                 );
                 println!("访问控制配置已保存。");
-                print_config_saved_hint(path);
+                print_config_saved_hint(path, "access_control.update");
                 wait_enter_to_return()?;
             }
             "0" => break,
@@ -1753,7 +1671,8 @@ pub(crate) fn update_cn4_set_interactive(config_path: &str) -> Result<(), io::Er
     println!("文件路径：{}", report.path.display());
     println!("文件大小：{} bytes", report.size_bytes);
     println!("更新时间：{}", Local::now().format("%Y-%m-%d %H:%M:%S"));
-    print_config_saved_hint(config_path);
+    // 下载 CN IP set 文件本身就属于 GeoIP 规则的数据源；nat.service 会读取新文件并重新生成 set
+    print_config_saved_hint(config_path, "geoip.update_interval.update");
     Ok(())
 }
 
@@ -1829,7 +1748,7 @@ fn toggle_geoip_forward(config_path: &str) -> Result<(), io::Error> {
             "禁用"
         }
     );
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "geoip.forward.update");
     Ok(())
 }
 
@@ -1895,7 +1814,7 @@ fn toggle_geoip_ssh(config_path: &str) -> Result<(), io::Error> {
             "禁用"
         }
     );
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "geoip.ssh.update");
     Ok(())
 }
 
@@ -1907,7 +1826,7 @@ fn set_geoip_ssh_port(config_path: &str) -> Result<(), io::Error> {
     config.geoip.ssh.port = port;
     save_toml_config(config_path, &config, "geoip.ssh.port.update")?;
     println!("SSH 端口已保存为 {port}");
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "geoip.ssh.port.update");
     Ok(())
 }
 
@@ -1931,7 +1850,7 @@ fn set_geoip_update_interval(config_path: &str) -> Result<(), io::Error> {
     config.geoip.update_interval_hours = hours;
     save_toml_config(config_path, &config, "geoip.update_interval.update")?;
     println!("CN IP set 更新间隔已保存为 {hours} 小时");
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "geoip.update_interval.update");
     Ok(())
 }
 
@@ -2058,7 +1977,7 @@ fn toggle_egress_control(config_path: &str) -> Result<(), io::Error> {
             "禁用"
         }
     );
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "egress_control.update");
     Ok(())
 }
 
@@ -2084,7 +2003,7 @@ fn add_egress_target(config_path: &str) -> Result<(), io::Error> {
     }
     save_toml_config(config_path, &config, "egress.add")?;
     println!("已添加 {value}");
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "egress.add");
     Ok(())
 }
 
@@ -2113,7 +2032,7 @@ fn delete_egress_target(config_path: &str) -> Result<(), io::Error> {
     let removed = config.egress_control.allowed_target_cidrs.remove(num - 1);
     save_toml_config(config_path, &config, "egress.delete")?;
     println!("已删除 {removed}");
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "egress.delete");
     Ok(())
 }
 
@@ -2347,7 +2266,7 @@ fn configure_telegram(config_path: &str) -> Result<(), io::Error> {
         }),
     );
     println!("Telegram 配置已保存，状态页默认不会明文显示 bot_token。");
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "telegram.config.update");
     Ok(())
 }
 
@@ -2480,7 +2399,7 @@ fn toggle_telegram(config_path: &str) -> Result<bool, io::Error> {
             "禁用"
         }
     );
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "telegram.toggle");
     Ok(true)
 }
 
@@ -2504,7 +2423,7 @@ fn set_telegram_interval(config_path: &str) -> Result<(), io::Error> {
     config.telegram.notify_interval_minutes = minutes;
     save_toml_config(config_path, &config, "telegram.interval.update")?;
     println!("Telegram 通知间隔已保存为 {minutes} 分钟。");
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "telegram.interval.update");
     Ok(())
 }
 
@@ -2711,259 +2630,12 @@ fn print_uninstall_report(report: &UninstallReport) {
     println!("后续如需重新安装，请参考 README 的一键安装命令。");
 }
 
-fn update_menu(config_path: &str) -> Result<(), io::Error> {
-    println!(
-        r#"====================================
-一键更新 nftables-nat-rust-enhanced
-====================================
-1) 更新核心转发 nat，推荐
-2) 指定版本更新核心 nat
-0) 返回"#
-    );
-    let choice = prompt("请选择 [0/1/2]: ")?;
-    if choice.trim() == "0" {
-        return Ok(());
-    }
-    let specify_version = match choice.trim() {
-        "1" => false,
-        "2" => true,
-        _ => {
-            println!("未知更新目标。");
-            wait_enter_to_return()?;
-            return Ok(());
-        }
-    };
+// v0.6.1：update 相关函数已搬到 `menu/update.rs`。生产代码只需要入口 update_menu；
+// 其余符号留给本文件的 cfg(test) 模块在断言里通过 `super::update::*` 访问。
+use update::update_menu;
 
-    let version = if specify_version {
-        let tag = prompt("请输入版本 tag，例如 v0.1.2: ")?;
-        if !valid_update_version(&tag) {
-            println!("无效版本，只允许 latest 或 v 开头的 tag，例如 v0.1.2");
-            wait_enter_to_return()?;
-            return Ok(());
-        }
-        tag
-    } else {
-        "latest".to_string()
-    };
-    let plan = build_update_plan(&version, github_latest_resolver);
-
-    println!("更新摘要：");
-    println!("  当前版本：{}", current_version_for_update());
-    println!("  目标版本：{}", plan.display_version);
-    println!("  选择来源：{}", plan.source);
-    if let Some(w) = &plan.warning {
-        println!("  warning：{w}");
-    }
-    println!("  将更新：/usr/local/bin/nat 和 nat.service");
-    println!("  下载方式：GitHub Release 预编译包优先");
-    println!("  备份：/etc/nftables-nat/backups/update-YYYYmmdd-HHMMSS/");
-    println!("  保留：/etc/nat.toml、/etc/nat.conf、stats、backups");
-    println!("  重启：nat.service");
-    let confirm = prompt("继续更新？[y/N]: ")?;
-    if !matches!(confirm.as_str(), "y" | "Y" | "yes" | "YES") {
-        println!("已取消更新");
-        wait_enter_to_return()?;
-        return Ok(());
-    }
-
-    let mut args = vec!["--update", "--core-only", "--use-release"];
-    if plan.install_arg_version != "latest" {
-        args.push("--version");
-        args.push(&plan.install_arg_version);
-    }
-    let command_line = format!(
-        "curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- {}",
-        args.join(" ")
-    );
-    audit_cli(
-        config_path,
-        "update.start",
-        AuditResult::Info,
-        json!({
-            "version": plan.install_arg_version,
-            "display_version": plan.display_version,
-            "source": plan.source,
-        }),
-    );
-    println!("开始更新，install.sh 会负责备份、重启和失败回滚。");
-    let status = Command::new("sh").arg("-c").arg(command_line).status()?;
-    if !status.success() {
-        audit_cli(
-            config_path,
-            "update.fail",
-            AuditResult::Fail,
-            json!({
-                "version": plan.install_arg_version,
-                "display_version": plan.display_version,
-                "source": plan.source,
-                "exit_status": status.to_string(),
-            }),
-        );
-        println!("更新命令执行失败。install.sh 会保留旧二进制并在可能时回滚，请查看输出和服务日志");
-        wait_enter_to_return()?;
-        return Ok(());
-    }
-
-    audit_cli(
-        config_path,
-        "update.success",
-        AuditResult::Ok,
-        json!({
-            "version": plan.install_arg_version,
-            "display_version": plan.display_version,
-            "source": plan.source,
-        }),
-    );
-    println!("更新完成，正在重新载入新版 CLI 菜单...");
-    match installed_nat_version() {
-        Some(v) => println!("已安装版本: {v}"),
-        None => println!("warning: 无法读取新版本号，将继续重载菜单。"),
-    }
-
-    let bin_path = Path::new(NAT_BIN_PATH);
-    let action = reload_action(true, tty_available(), bin_path.exists());
-    match action {
-        ReloadAction::Exec => {
-            let err = reexec_menu(NAT_BIN_PATH);
-            println!("更新已完成，但自动重新载入菜单失败：{err}");
-            println!("请手动执行：");
-            println!("  nat --menu");
-            wait_enter_to_return()?;
-        }
-        ReloadAction::NoTty => {
-            println!("更新已完成。请手动执行 nat --menu 进入新版菜单。");
-        }
-        ReloadAction::BinaryMissing => {
-            println!("更新已完成，但未找到 {NAT_BIN_PATH}，无法自动重载菜单。");
-            println!("请手动执行：");
-            println!("  nat --menu");
-            wait_enter_to_return()?;
-        }
-        ReloadAction::SkipUpdateFailed => {}
-    }
-    Ok(())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ReloadAction {
-    SkipUpdateFailed,
-    NoTty,
-    BinaryMissing,
-    Exec,
-}
-
-fn reload_action(update_success: bool, tty_available: bool, binary_exists: bool) -> ReloadAction {
-    if !update_success {
-        return ReloadAction::SkipUpdateFailed;
-    }
-    if !tty_available {
-        return ReloadAction::NoTty;
-    }
-    if !binary_exists {
-        return ReloadAction::BinaryMissing;
-    }
-    ReloadAction::Exec
-}
-
-fn tty_available() -> bool {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .is_ok()
-}
-
-fn reexec_menu(bin: &str) -> io::Error {
-    Command::new(bin).arg("--menu").exec()
-}
-
-/// 查看最近 50 行 audit 日志。
-///
-/// v0.4.2：默认按 CLI 友好格式展示（time 按 Asia/Shanghai 24h；detail 缩进 kv）；
-/// 子菜单可切换为查看原始 JSON 行。文件内部仍为一行 JSON 不变。
-fn view_audit_log_interactive(config_path: &str) -> Result<(), io::Error> {
-    loop {
-        let audit_cfg = audit_config_from(config_path);
-        // ui_for_display：尽力读 [ui]；解析失败时回退默认，永不阻塞日志查看。
-        let ui = load_toml_config(config_path)
-            .map(|c| c.ui)
-            .unwrap_or_default();
-        println!("====================================");
-        println!("审计日志（最近 50 行）");
-        println!("====================================");
-        println!("audit.enabled: {}", audit_cfg.enabled);
-        println!("audit.file: {}", audit_cfg.file);
-        if !audit_cfg.enabled {
-            println!("提示：audit.enabled = false，CLI 操作不会写入审计日志。");
-        }
-        println!(
-            "1) 查看格式化日志（默认，CLI 友好，按 [ui].timezone={} 展示）",
-            ui.timezone
-        );
-        println!("2) 查看原始 JSON 日志");
-        println!("0) 返回");
-        let choice = prompt("请选择: ")?;
-        match choice.trim() {
-            "" | "1" => {
-                show_audit_log_formatted(&audit_cfg, &ui);
-                wait_enter_to_return()?;
-            }
-            "2" => {
-                show_audit_log_raw(&audit_cfg);
-                wait_enter_to_return()?;
-            }
-            "0" => break,
-            value if is_menu_refresh_command(value) => break,
-            _ => {
-                println!("未知选项: {}", choice.trim());
-                wait_enter_to_return()?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn show_audit_log_formatted(audit_cfg: &AuditConfig, ui: &nat_common::UiConfig) {
-    println!();
-    println!(
-        "提示：JSON 内部 `time` 字段为 UTC RFC3339；CLI 按 [ui].timezone={} 展示。",
-        ui.timezone
-    );
-    println!("------------------------------------");
-    let lines = audit::read_tail(&audit_cfg.file, 50);
-    if lines.is_empty() {
-        println!("（无日志或文件不存在）");
-    } else {
-        for line in lines {
-            let formatted =
-                audit::format_log_line_for_cli(&line, |s| format_cli_time_from_rfc3339_with(s, ui));
-            println!("{formatted}");
-            println!();
-        }
-    }
-    println!(
-        "提示：每条审计日志为一行 JSON，便于 grep。完整文件位于 {}",
-        audit_cfg.file
-    );
-}
-
-fn show_audit_log_raw(audit_cfg: &AuditConfig) {
-    println!();
-    println!("------------------------------------");
-    let lines = audit::read_tail(&audit_cfg.file, 50);
-    if lines.is_empty() {
-        println!("（无日志或文件不存在）");
-    } else {
-        for line in lines {
-            println!("{line}");
-        }
-    }
-    println!();
-    println!(
-        "提示：每条审计日志为一行 JSON，便于 grep。完整文件位于 {}",
-        audit_cfg.file
-    );
-}
+// v0.6.1：审计日志查看相关函数已搬到 `menu/audit_view.rs`。
+use audit_view::view_audit_log_interactive;
 
 /// 把 last-good 缓存状态摘要追加到状态展示页
 pub(crate) fn format_last_good_status(config: &TomlConfig) -> Vec<String> {
@@ -3228,7 +2900,7 @@ fn set_cli_display_timezone_interactive(config_path: &str) -> Result<(), io::Err
     );
     println!("CLI 展示时区已保存为 {}。", config.ui.timezone);
     println!("此项只影响 CLI 显示，不改变系统时区。");
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "ui.timezone.update");
     Ok(())
 }
 
@@ -3377,7 +3049,7 @@ fn set_snat_mode_interactive(config_path: &str) -> Result<(), io::Error> {
         }),
     );
     println!("SNAT 模式已设为 {}。", config.snat.mode);
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "snat.mode.update");
     Ok(())
 }
 
@@ -3421,7 +3093,7 @@ fn set_snat_fixed_source_ip_interactive(config_path: &str) -> Result<(), io::Err
             &config.snat.fixed_source_ip
         }
     );
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "snat.fixed_source_ip.update");
     Ok(())
 }
 
@@ -3476,7 +3148,7 @@ fn toggle_mss_clamp_interactive(config_path: &str) -> Result<(), io::Error> {
             "禁用"
         }
     );
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "mss_clamp.toggle");
     Ok(())
 }
 
@@ -3503,7 +3175,7 @@ fn set_mss_clamp_size_interactive(config_path: &str) -> Result<(), io::Error> {
         }),
     );
     println!("MSS size 已设为 {size}。");
-    print_config_saved_hint(config_path);
+    print_config_saved_hint(config_path, "mss_clamp.size.update");
     Ok(())
 }
 
@@ -3525,167 +3197,7 @@ pub(crate) fn parse_mss_size(value: &str) -> Result<u16, io::Error> {
     Ok(size)
 }
 
-fn current_version_for_update() -> String {
-    installed_nat_version().unwrap_or_else(|| build_version_for_update_display(build_version()))
-}
-
-fn installed_nat_version() -> Option<String> {
-    let output = Command::new("/usr/local/bin/nat")
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_nat_version_output(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn parse_nat_version_output(output: &str) -> Option<String> {
-    output
-        .split_whitespace()
-        .find(|part| valid_release_tag(part))
-        .map(ToString::to_string)
-}
-
-fn build_version_for_update_display(version: &str) -> String {
-    if valid_release_tag(version) {
-        version.to_string()
-    } else {
-        "unknown".to_string()
-    }
-}
-
-fn valid_update_version(version: &str) -> bool {
-    if version == "latest" {
-        return true;
-    }
-    version.starts_with('v')
-        && version.len() > 1
-        && version
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-}
-
-fn valid_release_tag(version: &str) -> bool {
-    version.starts_with('v')
-        && version.len() > 1
-        && version
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-}
-
-/// 一键更新摘要中显示的版本计划：包含给用户看的目标版本字符串、选择来源、可选 warning，
-/// 以及给 install.sh 的实际参数（仍是用户原始输入：latest 不解析就传 latest，
-/// 指定版本仍直接传给 --version）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UpdatePlan {
-    pub display_version: String,
-    pub source: &'static str,
-    pub warning: Option<String>,
-    /// install.sh 期望的版本值；latest 时仍传 "latest"，指定版本时传具体 tag。
-    pub install_arg_version: String,
-}
-
-/// 构建 UpdatePlan：
-/// - 当用户选了 latest：调用 `resolver()` 尝试解析实际 release tag；
-///   成功 → display_version = tag，source = "latest"；
-///   失败 / 不合法 → display_version = "latest"，source = "latest"，附带 warning。
-/// - 当用户指定版本：display_version = 指定 tag，source = "specified"。
-///
-/// install_arg_version 始终是用户原始输入，确保 install.sh 行为不变。
-pub(crate) fn build_update_plan<F>(version: &str, resolver: F) -> UpdatePlan
-where
-    F: FnOnce() -> Result<String, String>,
-{
-    if version == "latest" {
-        match resolver() {
-            Ok(tag) if valid_release_tag(&tag) => UpdatePlan {
-                display_version: tag,
-                source: "latest",
-                warning: None,
-                install_arg_version: "latest".to_string(),
-            },
-            Ok(other) => UpdatePlan {
-                display_version: "latest".to_string(),
-                source: "latest",
-                warning: Some(format!(
-                    "解析到的 release tag {other:?} 不符合 vX.Y.Z 格式，将交由 install.sh 使用 latest release。"
-                )),
-                install_arg_version: "latest".to_string(),
-            },
-            Err(e) => UpdatePlan {
-                display_version: "latest".to_string(),
-                source: "latest",
-                warning: Some(format!(
-                    "无法解析 latest release tag（{e}），将交由 install.sh 使用 latest release。"
-                )),
-                install_arg_version: "latest".to_string(),
-            },
-        }
-    } else {
-        UpdatePlan {
-            display_version: version.to_string(),
-            source: "specified",
-            warning: None,
-            install_arg_version: version.to_string(),
-        }
-    }
-}
-
-/// 生产解析器：调用 `curl -fsI` 获取 GitHub releases/latest 的重定向 URL，
-/// 解析出 `/releases/tag/vX.Y.Z`。整个过程是只读 HTTP，5 秒连接超时 + 10 秒总超时。
-///
-/// 任何执行 / 解析失败都返回 Err（不 panic）。
-pub(crate) fn github_latest_resolver() -> Result<String, String> {
-    let output = Command::new("curl")
-        .arg("-fsI")
-        .arg("--connect-timeout")
-        .arg("5")
-        .arg("--max-time")
-        .arg("10")
-        .arg("https://github.com/misaka-cpu/nftables-nat-rust-enhanced/releases/latest")
-        .output()
-        .map_err(|e| format!("执行 curl 失败: {e}"))?;
-    if !output.status.success() {
-        return Err(format!("curl 退出码非零: {}", output.status));
-    }
-    let header = String::from_utf8_lossy(&output.stdout);
-    parse_latest_tag_from_curl_headers(&header)
-        .ok_or_else(|| "curl 响应里找不到 /releases/tag/<vX.Y.Z>".to_string())
-}
-
-/// 从 curl `-fsI` 的响应头里提取 `location:` 行中的最后一段 `/releases/tag/<tag>`。
-/// 兼容 GitHub 多级重定向；GitHub 会把 `releases/latest` 重定向到具体 tag。
-pub(crate) fn parse_latest_tag_from_curl_headers(headers: &str) -> Option<String> {
-    let mut best: Option<String> = None;
-    for line in headers.lines() {
-        let lower = line.trim().to_ascii_lowercase();
-        if !(lower.starts_with("location:") || lower.starts_with("location :")) {
-            continue;
-        }
-        let (_, value) = line.split_once(':')?;
-        let value = value.trim();
-        if let Some(tag) = extract_release_tag(value) {
-            best = Some(tag);
-        }
-    }
-    best
-}
-
-/// 从形如 `https://github.com/<owner>/<repo>/releases/tag/v0.5.2` 中拿到 `v0.5.2`。
-/// 不做严格 URL 解析；只看最后一个 `/tag/` 子串。
-pub(crate) fn extract_release_tag(url: &str) -> Option<String> {
-    let idx = url.rfind("/tag/")?;
-    let rest = &url[idx + 5..];
-    // 去掉可能的 query / 末尾 / 等
-    let tag = rest
-        .split(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
-        .next()?;
-    if tag.is_empty() {
-        return None;
-    }
-    Some(tag.to_string())
-}
+// v0.6.1：update 相关函数与 UpdatePlan 已搬到 `menu/update.rs`，菜单顶部已 use 进来。
 
 fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
     let config = load_toml_config(path)?;
@@ -4266,7 +3778,7 @@ fn toggle_rule_interactive(path: &str) -> Result<(), io::Error> {
         json!({"index": rule_index}),
     );
     println!("规则已{}。", if now_enabled { "启用" } else { "禁用" });
-    print_config_saved_hint(path);
+    print_config_saved_hint(path, "rule.toggle");
     wait_enter_to_return()?;
     Ok(())
 }
@@ -4453,53 +3965,7 @@ fn format_comment(comment: &Option<String>) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn backup_filename(
-    prefix: &str,
-    extension: &str,
-    now: chrono::DateTime<Local>,
-) -> String {
-    format!("{prefix}-{}.{}", now.format("%Y%m%d-%H%M%S"), extension)
-}
-
-pub(crate) fn backup_config(path: &str) -> Result<PathBuf, io::Error> {
-    let source = Path::new(path);
-    fs::create_dir_all(CONFIG_BACKUP_DIR)?;
-    let extension = source
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("bak");
-    let prefix = if extension == "toml" {
-        "nat-config"
-    } else {
-        "nat-conf"
-    };
-    let backup_path =
-        Path::new(CONFIG_BACKUP_DIR).join(backup_filename(prefix, extension, Local::now()));
-    fs::copy(source, &backup_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(backup_path)
-}
-
-fn list_config_backups() -> Result<Vec<PathBuf>, io::Error> {
-    let dir = Path::new(CONFIG_BACKUP_DIR);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut backups = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            backups.push(path);
-        }
-    }
-    backups.sort();
-    Ok(backups)
-}
+// v0.6.1：backup_filename / backup_config / list_config_backups 已搬到 `menu/backup.rs`。
 
 pub(crate) fn format_stats_top10(state: &traffic_stats::StatsState) -> Vec<String> {
     let view = traffic_stats::state_to_view(&StatsConfig::default(), state);
@@ -4521,6 +3987,14 @@ pub(crate) fn format_stats_top10(state: &traffic_stats::StatsState) -> Vec<Strin
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    // v0.6.1：update 相关单元测试通过本地别名访问搬到 `menu/update.rs` 的项。
+    use super::update::{
+        ReloadAction, build_update_plan, build_version_for_update_display, extract_release_tag,
+        parse_latest_tag_from_curl_headers, parse_nat_version_output, reload_action,
+        valid_update_version,
+    };
+    // v0.6.1：backup 相关测试通过本地别名访问搬到 `menu/backup.rs` 的项。
+    use super::backup::{backup_filename, sanitize_backup_reason};
     use nat_common::{
         TrafficMode,
         stats::{Counter, RuleTraffic, StatsState},
@@ -5220,6 +4694,26 @@ domain = "example.com"
     }
 
     #[test]
+    fn readme_documents_v0_6_1_save_hint_split_and_script_hash() {
+        let readme = include_str!("../../README.md");
+        // 保存提示分流
+        assert!(
+            readme.contains("无需等待 nft 应用")
+                && readme.contains("不影响 nft 规则的 reason"),
+            "README 应说明 v0.6.1 配置保存提示按 reason 分流"
+        );
+        // script_hash 行为
+        assert!(
+            readme.contains("stable_script_hash") || readme.contains("script_hash"),
+            "README 应说明 v0.6.1 用 hash 判断脚本变化"
+        );
+        assert!(
+            readme.contains("FNV") || readme.contains("FNV-1a"),
+            "README 应说明 hash 算法选择"
+        );
+    }
+
+    #[test]
     fn readme_documents_v0_6_0_audit_rotation_and_safe_write_and_latest_resolution() {
         let readme = include_str!("../../README.md");
         // audit 内置轻量轮转
@@ -5383,6 +4877,146 @@ domain = "example.com"
         assert!(
             !blob.contains(".213104971"),
             "must not show nanoseconds: {blob}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reason_affects_nft_recognizes_rule_and_policy_reasons() {
+        for reason in [
+            "rule.add.single",
+            "rule.add.range",
+            "rule.delete",
+            "rule.toggle",
+            "access_control.update",
+            "geoip.forward.update",
+            "geoip.ssh.update",
+            "geoip.ssh.port.update",
+            "geoip.update_interval.update",
+            "egress_control.update",
+            "egress.add",
+            "egress.delete",
+            "snat.mode.update",
+            "snat.fixed_source_ip.update",
+            "mss_clamp.toggle",
+            "mss_clamp.size.update",
+            "backup.restore",
+            "quota.auto_disable",
+            "quota.config.update",
+            "stats.mode.update",
+        ] {
+            assert!(
+                reason_affects_nft(reason),
+                "reason {reason:?} 应被识别为影响 nft"
+            );
+        }
+    }
+
+    #[test]
+    fn reason_affects_nft_skips_telegram_ui_audit() {
+        for reason in [
+            "telegram.config.update",
+            "telegram.toggle",
+            "telegram.interval.update",
+            "ui.timezone.update",
+            "audit.update",
+            "config.update",
+        ] {
+            assert!(
+                !reason_affects_nft(reason),
+                "reason {reason:?} 不应被识别为影响 nft"
+            );
+        }
+    }
+
+    #[test]
+    fn non_nft_save_hint_does_not_mention_systemctl_or_nft_commands() {
+        let lines =
+            format_non_nft_save_hint_lines("/etc/nat.toml", "telegram.config.update").join("\n");
+        assert!(
+            lines.contains("无需等待 nft 应用"),
+            "non-nft hint 应说明无需等 nft apply: {lines}"
+        );
+        assert!(
+            !lines.contains("systemctl restart nat"),
+            "telegram 保存提示不应包含 systemctl restart: {lines}"
+        );
+        assert!(
+            !lines.contains("nft list table"),
+            "telegram 保存提示不应包含 nft list table: {lines}"
+        );
+        assert!(
+            !lines.contains("journalctl -u nat"),
+            "telegram 保存提示不应包含 journalctl: {lines}"
+        );
+        assert!(
+            !lines.contains("nft -c"),
+            "telegram 保存提示不应包含 nft -c: {lines}"
+        );
+        assert!(lines.contains("Telegram 配置已安全保存"));
+    }
+
+    #[test]
+    fn ui_timezone_save_hint_uses_short_form() {
+        let lines =
+            format_non_nft_save_hint_lines("/etc/nat.toml", "ui.timezone.update").join("\n");
+        assert!(
+            !lines.contains("Telegram"),
+            "UI 保存提示不应误带 Telegram 文案: {lines}"
+        );
+        assert!(
+            lines.contains("不会改变 nft 转发规则"),
+            "UI 保存提示应说明不影响 nft: {lines}"
+        );
+        assert!(
+            !lines.contains("systemctl restart nat"),
+            "UI 保存提示不应引导用户重启 nat: {lines}"
+        );
+    }
+
+    #[test]
+    fn nft_affecting_save_hint_still_mentions_apply_path() {
+        // 创建一个最小 TOML 让 load_toml_config 走通；hint 内部会读 ddns.refresh_interval_seconds
+        let dir = std::env::temp_dir().join(format!(
+            "nat-hint-nft-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml_path = dir.join("nat.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[[rules]]
+type = "single"
+sport = 30080
+dport = 80
+domain = "example.com"
+protocol = "tcp"
+ip_version = "ipv4"
+
+[ddns]
+refresh_interval_seconds = 120
+"#,
+        )
+        .unwrap();
+        let lines = format_nft_affecting_save_hint_lines(toml_path.to_str().unwrap()).join("\n");
+        assert!(
+            lines.contains("nat.service 通常会自动检测配置变化"),
+            "缺少 nat.service 自动应用文案: {lines}"
+        );
+        assert!(
+            lines.contains("systemctl restart nat"),
+            "应保留 systemctl restart nat 提示: {lines}"
+        );
+        assert!(
+            lines.contains("nft list table ip self-nat"),
+            "应保留 nft list table 排查命令: {lines}"
+        );
+        // 同时确认正确读取了 refresh_interval_seconds = 120
+        assert!(
+            lines.contains("120 秒"),
+            "应从 TOML 中读取自定义 ddns 间隔: {lines}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5595,7 +5229,7 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
     #[test]
     fn telegram_curl_command_has_timeouts_server_side() {
         // 服务侧 Telegram curl 命令必须包含 --connect-timeout 5 和 --max-time 15。
-        let cmd = crate::build_telegram_curl_command(
+        let cmd = crate::telegram::build_telegram_curl_command(
             "https://api.telegram.org/bot1234:fake/sendMessage",
             &[("chat_id", "1"), ("text", "hello")],
         );
@@ -5653,7 +5287,7 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
     fn telegram_server_error_sanitizes_bot_token() {
         let url = "https://api.telegram.org/bot1234567890:LEAKME_SERVER_STDERR/sendMessage";
         let stderr = format!("error stdout / stderr leak: {url}");
-        let cleaned = crate::sanitize_telegram_error(&stderr, url);
+        let cleaned = crate::telegram::sanitize_telegram_error(&stderr, url);
         assert!(
             !cleaned.contains("LEAKME_SERVER_STDERR"),
             "server Telegram error 必须脱敏 bot_token: {cleaned}"

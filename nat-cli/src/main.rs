@@ -1,40 +1,39 @@
 #![deny(warnings)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
+mod apply;
 mod config;
 mod ip;
 mod menu;
 mod prepare;
+mod quota_loop;
+mod runtime;
+mod telegram;
 
 use chrono::Local;
 use clap::Parser;
 use log::{error, info, warn};
+#[cfg(test)]
+use nat_common::last_good::ResolutionEvent;
 use nat_common::{
     Args, AuditConfig, DdnsConfig, DnsConfig, EgressControlConfig, GeoIpConfig, LastGoodConfig,
     MssClampConfig, QuotaConfig, SnatConfig, StatsConfig, TelegramConfig, TomlConfig,
     audit::{self, AuditResult},
     geoip,
-    last_good::{self, LastGoodState, ResolutionEvent, ResolutionLog},
-    logger, quota,
-    stats::{self as traffic_stats, StatsState},
+    last_good::{self, LastGoodState, ResolutionLog},
+    logger, stats as traffic_stats,
 };
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
-use std::time::Duration;
 
 const NFTABLES_ETC: &str = "/etc/nftables-nat";
 const FILE_NAME_SCRIPT: &str = "/etc/nftables-nat/nat-diy.nft";
 const BACKUP_DIR: &str = "/etc/nftables-nat/backups";
-const MANAGED_TABLES: [(&str, &str); 4] = [
-    ("ip", "self-nat"),
-    ("ip6", "self-nat"),
-    ("ip", "self-filter"),
-    ("ip6", "self-filter"),
-];
+// v0.6.1：apply / rollback 相关函数与 MANAGED_TABLES 列表已搬到 `apply` 模块。
+use apply::apply_nft_script;
 const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const IPV6_FORWARD: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
 const CARGO_CRATE_NAME: &str = env!("CARGO_CRATE_NAME");
@@ -132,7 +131,8 @@ fn global_prepare() -> Result<(), io::Error> {
 }
 
 fn handle_loop(args: &Args) -> Result<(), io::Error> {
-    let mut latest_script = String::new();
+    // v0.6.1：用稳定 FNV-1a hash 代替整 String 比较，便于日志/audit；语义与旧整字符串相等等价。
+    let mut latest_script_hash: Option<u64> = None;
     let mut last_stats_collect = None;
     let mut last_ddns_refresh = None;
     let mut last_short_ddns_warn: Option<u64> = None;
@@ -242,7 +242,8 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
             audit_resolution_events(&audit_config, &resolution_events);
             last_ddns_refresh = Some(loop_now);
             prepare::check_and_prepare()?;
-            if script != latest_script {
+            let current_script_hash = nat_common::stable_script_hash(&script);
+            if latest_script_hash != Some(current_script_hash) {
                 if stats_config.enabled {
                     let collect_now = Local::now();
                     let _ = collect_and_maybe_notify(&stats_config, &telegram_config, &rule_labels);
@@ -252,7 +253,10 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
                 for ele in &nat_cells {
                     info!("{ele:?}");
                 }
-                info!("nftables脚本如下：\n{script}");
+                info!(
+                    "nftables脚本如下（script_hash={}）：\n{script}",
+                    nat_common::hash::format_hash_hex(current_script_hash)
+                );
                 let f = File::create(FILE_NAME_SCRIPT);
                 if let Ok(mut file) = f {
                     file.write_all(script.as_bytes())?;
@@ -264,7 +268,10 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
                             &audit_config,
                             "apply.success",
                             AuditResult::Ok,
-                            serde_json::json!({"script_path": FILE_NAME_SCRIPT}),
+                            serde_json::json!({
+                                "script_path": FILE_NAME_SCRIPT,
+                                "script_hash": nat_common::hash::format_hash_hex(current_script_hash),
+                            }),
                         );
                         last_good::update_state_from_events(
                             &mut last_good_state,
@@ -285,13 +292,14 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
                             AuditResult::Fail,
                             serde_json::json!({
                                 "script_path": FILE_NAME_SCRIPT,
+                                "script_hash": nat_common::hash::format_hash_hex(current_script_hash),
                                 "error": e.to_string(),
                             }),
                         );
                         return Err(e);
                     }
                 }
-                latest_script.clone_from(&script);
+                latest_script_hash = Some(current_script_hash);
                 info!("WAIT:等待配置或目标IP发生改变....\n");
             }
         }
@@ -375,72 +383,8 @@ pub(crate) fn refresh_once(args: &Args) -> Result<(), io::Error> {
     }
 }
 
-/// 把 build 过程累计的 resolution events 转写到 audit log
-fn audit_resolution_events(audit_config: &AuditConfig, events: &[ResolutionEvent]) {
-    for ev in events {
-        match ev {
-            ResolutionEvent::LiveResolved { .. } => {
-                // 正常路径不写每条 audit，避免日志爆炸
-            }
-            ResolutionEvent::LastGoodUsed {
-                rule_id,
-                comment,
-                domain,
-                ip,
-                original_error,
-            } => {
-                audit::log_event(
-                    audit_config,
-                    "last_good.used",
-                    AuditResult::Warn,
-                    serde_json::json!({
-                        "rule_id": rule_id,
-                        "comment": comment,
-                        "domain": domain,
-                        "ip": ip,
-                        "error": original_error,
-                    }),
-                );
-            }
-            ResolutionEvent::ResolveFailedNoCache {
-                rule_id,
-                comment,
-                domain,
-                original_error,
-            } => {
-                audit::log_event(
-                    audit_config,
-                    "dns.resolve.fail",
-                    AuditResult::Fail,
-                    serde_json::json!({
-                        "rule_id": rule_id,
-                        "comment": comment,
-                        "domain": domain,
-                        "error": original_error,
-                    }),
-                );
-            }
-            ResolutionEvent::EgressSkipped {
-                rule_id,
-                comment,
-                ip,
-                source,
-            } => {
-                audit::log_event(
-                    audit_config,
-                    "rule.skipped.egress_control",
-                    AuditResult::Warn,
-                    serde_json::json!({
-                        "rule_id": rule_id,
-                        "comment": comment,
-                        "ip": ip,
-                        "source": source.as_str(),
-                    }),
-                );
-            }
-        }
-    }
-}
+// v0.6.1：audit_resolution_events 已搬到 `runtime` 模块。
+use runtime::audit_resolution_events;
 
 struct RuntimeConfig {
     dns: DnsConfig,
@@ -513,430 +457,14 @@ fn load_runtime_config(args: &Args) -> RuntimeConfig {
     }
 }
 
-fn ddns_refresh_interval(config: &DdnsConfig) -> Result<u64, io::Error> {
-    let interval = config.refresh_interval_seconds;
-    if interval < 10 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refresh_interval_seconds too low",
-        ));
-    }
-    Ok(interval)
-}
-
-fn warn_short_ddns_interval_once(interval: u64, last_warned: &mut Option<u64>) {
-    if interval < 60 && *last_warned != Some(interval) {
-        warn!("DDNS refresh interval is very short, recommended >= 300 seconds for production.");
-        *last_warned = Some(interval);
-    } else if interval >= 60 {
-        *last_warned = None;
-    }
-}
-
-fn should_collect_stats_at(
-    stats_config: &StatsConfig,
-    last_collect: Option<chrono::DateTime<Local>>,
-    now: chrono::DateTime<Local>,
-) -> bool {
-    if !stats_config.enabled {
-        return false;
-    }
-    let Some(last_collect) = last_collect else {
-        return true;
-    };
-    let elapsed = now.signed_duration_since(last_collect);
-    elapsed.num_seconds() >= stats_config.collect_interval_seconds as i64
-}
-
-fn should_refresh_ddns_at(
-    last_refresh: Option<chrono::DateTime<Local>>,
-    refresh_interval_seconds: u64,
-    now: chrono::DateTime<Local>,
-) -> bool {
-    let Some(last_refresh) = last_refresh else {
-        return true;
-    };
-    now.signed_duration_since(last_refresh).num_seconds() >= refresh_interval_seconds as i64
-}
-
-fn next_loop_sleep(
-    ddns_interval_seconds: u64,
-    stats_config: &StatsConfig,
-    last_ddns_refresh: Option<chrono::DateTime<Local>>,
-    last_stats_collect: Option<chrono::DateTime<Local>>,
-    now: chrono::DateTime<Local>,
-) -> Duration {
-    let ddns_remaining = remaining_seconds(last_ddns_refresh, ddns_interval_seconds, now);
-    let stats_remaining = if stats_config.enabled {
-        remaining_seconds(
-            last_stats_collect,
-            stats_config.collect_interval_seconds,
-            now,
-        )
-    } else {
-        ddns_remaining
-    };
-    let sleep_secs = ddns_remaining
-        .min(stats_remaining)
-        .clamp(1, MAIN_LOOP_MAX_SLEEP_SECS);
-    Duration::from_secs(sleep_secs)
-}
-
-fn should_run_quota_check(
-    last: Option<chrono::DateTime<Local>>,
-    quota_config: &QuotaConfig,
-    now: chrono::DateTime<Local>,
-) -> bool {
-    let Some(last) = last else {
-        return true;
-    };
-    now.signed_duration_since(last).num_seconds() >= quota_config.check_interval_seconds as i64
-}
-
-/// 跑一轮 quota 检查：读 TOML + Stats，找出超额规则，禁用并写 audit / Telegram。
-/// 任何失败都只 WARN，不让主循环退出。
-fn run_quota_check(
-    args: &Args,
-    quota_config: &QuotaConfig,
-    audit_config: &AuditConfig,
-    stats_config: &StatsConfig,
-    telegram_config: &TelegramConfig,
-    now: chrono::DateTime<chrono::Utc>,
-) {
-    run_quota_check_with(
-        args,
-        quota_config,
-        audit_config,
-        stats_config,
-        telegram_config,
-        now,
-        Path::new(BACKUP_DIR),
-    )
-}
-
-/// `run_quota_check` 的可注入备份根目录变体；生产代码走 `run_quota_check`，
-/// 测试可以注入 tmpdir，避免污染 /etc/nftables-nat/backups。
-#[allow(clippy::too_many_arguments)]
-fn run_quota_check_with(
-    args: &Args,
-    quota_config: &QuotaConfig,
-    audit_config: &AuditConfig,
-    stats_config: &StatsConfig,
-    telegram_config: &TelegramConfig,
-    now: chrono::DateTime<chrono::Utc>,
-    backup_root: &Path,
-) {
-    let toml_path = match args.toml.as_deref() {
-        Some(p) => p,
-        None => return,
-    };
-    let content = match fs::read_to_string(toml_path) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("quota 检查跳过：读 {toml_path} 失败 {e}");
-            return;
-        }
-    };
-    let mut config = match TomlConfig::from_toml_str(&content) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("quota 检查跳过：解析 {toml_path} 失败 {e}");
-            return;
-        }
-    };
-    let stats_state = traffic_stats::load_state(&stats_config.data_file);
-    let mut quota_state = quota::QuotaState::load(&quota_config.state_file);
-    let decisions =
-        quota::check_and_decide(&config.rules, &stats_state, quota_config, &quota_state, now);
-    if decisions.is_empty() {
-        return;
-    }
-    let changed_indices = quota::apply_disable_actions(&mut config, &decisions);
-    if !changed_indices.is_empty() {
-        // 备份后写回 TOML。备份失败 → 跳过写回（避免配置丢失风险）；
-        // 写入失败 → 备份保留并写 audit，下一轮 quota 检查会再次尝试。
-        let toml_str = match config.to_toml_string() {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("quota 写回 TOML 失败：序列化 {e}");
-                audit::log_event(
-                    audit_config,
-                    "quota.auto_disable.skipped",
-                    AuditResult::Fail,
-                    serde_json::json!({
-                        "reason": "serialize",
-                        "error": e,
-                    }),
-                );
-                return;
-            }
-        };
-        // v0.6.0：统一走 safe_write_config_to。备份失败 → 跳过写回；
-        // 写入失败 → 旧配置不动；成功 → 写 config.write.success audit。
-        // 同时仍写 quota.auto_disable.write_ok / write_fail，保留旧报警入口。
-        let backup_dir = backup_root.join("config");
-        match menu::safe_write_config_to(
-            &backup_dir,
-            audit_config,
-            toml_path,
-            &toml_str,
-            "quota.auto_disable",
-        ) {
-            Ok(backup_path) => {
-                audit::log_event(
-                    audit_config,
-                    "quota.auto_disable.write_ok",
-                    AuditResult::Ok,
-                    serde_json::json!({
-                        "toml_path": toml_path,
-                        "backup": backup_path.display().to_string(),
-                        "changed_indices": changed_indices,
-                    }),
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "quota 写回 TOML 失败（safe_write_config）：{e}；旧配置保持不变，下一轮 quota 检查会重试"
-                );
-                audit::log_event(
-                    audit_config,
-                    "quota.auto_disable.write_fail",
-                    AuditResult::Fail,
-                    serde_json::json!({
-                        "toml_path": toml_path,
-                        "error": e.to_string(),
-                    }),
-                );
-                return;
-            }
-        }
-    }
-    for decision in &decisions {
-        let usage = &decision.usage;
-        audit::log_event(
-            audit_config,
-            "quota.exceeded",
-            AuditResult::Warn,
-            serde_json::json!({
-                "rule_id": usage.rule_id,
-                "label": usage.label,
-                "period": usage.period.to_string(),
-                "period_key": usage.period_key,
-                "used_bytes": usage.used_bytes,
-                "limit_bytes": usage.limit_bytes,
-            }),
-        );
-        if decision.newly_exceeded {
-            audit::log_event(
-                audit_config,
-                "rule.disable.quota",
-                AuditResult::Warn,
-                serde_json::json!({
-                    "rule_id": usage.rule_id,
-                    "label": usage.label,
-                    "period": usage.period.to_string(),
-                }),
-            );
-        }
-        if decision.should_notify {
-            if telegram_config.enabled
-                && !telegram_config.bot_token.is_empty()
-                && !telegram_config.chat_id.is_empty()
-                && quota_config.notify_on_exceeded
-            {
-                let msg = quota::format_telegram_message(decision);
-                let send_result =
-                    traffic_stats::send_telegram_with(telegram_config, &msg, send_telegram_http);
-                audit::log_event(
-                    audit_config,
-                    "quota.telegram.notify",
-                    if send_result.is_ok() {
-                        AuditResult::Ok
-                    } else {
-                        AuditResult::Fail
-                    },
-                    serde_json::json!({
-                        "rule_id": usage.rule_id,
-                        "period_key": usage.period_key,
-                        "delivered": send_result.is_ok(),
-                    }),
-                );
-            } else {
-                audit::log_event(
-                    audit_config,
-                    "quota.telegram.skipped",
-                    AuditResult::Info,
-                    serde_json::json!({
-                        "rule_id": usage.rule_id,
-                        "reason": if !quota_config.notify_on_exceeded {
-                            "notify_on_exceeded=false"
-                        } else if !telegram_config.enabled {
-                            "telegram.disabled"
-                        } else {
-                            "telegram.unconfigured"
-                        },
-                    }),
-                );
-            }
-            quota_state.mark_notified(&usage.notify_key(), now);
-        }
-    }
-    if let Err(e) = quota_state.save(&quota_config.state_file) {
-        warn!("保存 quota 通知状态失败 ({}): {e}", quota_config.state_file);
-    }
-}
-
-// v0.6.0：quota 自动禁用写回改走 `menu::safe_write_config_to`，统一备份 + 原子写 + audit。
-// 原本的 `backup_toml_for_quota_auto_disable` / `atomic_write_text_file` 内联实现已经合并到
-// `nat_common::atomic` 与 `menu::safe_write_config_to`，避免两套写盘流程并存。
-
-fn remaining_seconds(
-    last_run: Option<chrono::DateTime<Local>>,
-    interval_seconds: u64,
-    now: chrono::DateTime<Local>,
-) -> u64 {
-    let Some(last_run) = last_run else {
-        return 0;
-    };
-    let elapsed = now.signed_duration_since(last_run).num_seconds().max(0) as u64;
-    interval_seconds.saturating_sub(elapsed)
-}
-
-fn collect_and_maybe_notify(
-    stats_config: &StatsConfig,
-    telegram_config: &TelegramConfig,
-    rule_labels: &HashMap<String, String>,
-) -> Option<StatsState> {
-    let now = Local::now().naive_local();
-    let output = match Command::new("/usr/sbin/nft")
-        .arg("-j")
-        .arg("list")
-        .arg("ruleset")
-        .output()
-    {
-        Ok(output) => output,
-        Err(e) => {
-            warn!("执行 nft -j list ruleset 失败，跳过本次流量统计: {e:?}");
-            return None;
-        }
-    };
-    if !output.status.success() {
-        warn!(
-            "nft -j list ruleset 返回失败，跳过本次流量统计: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return None;
-    }
-
-    let json = String::from_utf8_lossy(&output.stdout);
-    let mut state = match traffic_stats::collect_from_nft_json_with_config(
-        &stats_config.data_file,
-        &json,
-        rule_labels,
-        now,
-        stats_config,
-    ) {
-        Ok(state) => state,
-        Err(e) => {
-            warn!("采集 nft counter 失败，nat 主循环继续运行: {e}");
-            return None;
-        }
-    };
-
-    maybe_send_telegram(stats_config, telegram_config, &mut state, now);
-    Some(state)
-}
-
-fn maybe_send_telegram(
-    stats_config: &StatsConfig,
-    telegram_config: &TelegramConfig,
-    state: &mut StatsState,
-    now: chrono::NaiveDateTime,
-) {
-    if !traffic_stats::should_notify(telegram_config, state, now) {
-        return;
-    }
-    let message = traffic_stats::format_telegram_message_with_options(
-        state,
-        now,
-        telegram_config.notify_daily,
-        telegram_config.notify_monthly,
-        stats_config.traffic_mode,
-    );
-    match traffic_stats::send_telegram_with(telegram_config, &message, send_telegram_http) {
-        Ok(()) => {
-            state.last_notify_time = Some(now.format("%Y-%m-%d %H:%M:%S").to_string());
-            if let Err(e) = traffic_stats::save_state(&stats_config.data_file, state) {
-                warn!("保存 Telegram 通知时间失败: {e:?}");
-            }
-        }
-        Err(e) => {
-            warn!(
-                "Telegram 通知发送失败 token={} err={}",
-                traffic_stats::mask_bot_token(&telegram_config.bot_token),
-                e
-            );
-        }
-    }
-}
-
-fn send_telegram_http(url: &str, params: &[(&str, &str)]) -> Result<(), String> {
-    build_telegram_curl_command(url, params)
-        .output()
-        .map_err(|e| format!("执行 curl 失败: {e}"))
-        .and_then(|output| {
-            if output.status.success() {
-                Ok(())
-            } else {
-                // bot_token 已经在 URL 里，stderr 默认不会回显请求体；但稳妥起见，
-                // 用 mask_bot_token 把任何意外出现的 token 片段脱敏后再返回给上层。
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                Err(sanitize_telegram_error(&stderr, url))
-            }
-        })
-}
-
-/// 构造 Telegram HTTPS 请求的 curl 命令。强制带上 --connect-timeout 与 --max-time，
-/// 防止网络挂死阻塞 nat.service 主循环。
-fn build_telegram_curl_command(url: &str, params: &[(&str, &str)]) -> Command {
-    let mut command = Command::new("curl");
-    command
-        .arg("-sS")
-        .arg("--connect-timeout")
-        .arg(TELEGRAM_CURL_CONNECT_TIMEOUT_SECS)
-        .arg("--max-time")
-        .arg(TELEGRAM_CURL_MAX_TIME_SECS)
-        .arg("-X")
-        .arg("POST")
-        .arg(url);
-    for (key, value) in params {
-        command
-            .arg("--data-urlencode")
-            .arg(format!("{key}={value}"));
-    }
-    command
-}
-
-const TELEGRAM_CURL_CONNECT_TIMEOUT_SECS: &str = "5";
-const TELEGRAM_CURL_MAX_TIME_SECS: &str = "15";
-
-/// 把可能出现在 stderr 中的 bot_token 字段脱敏（curl 通常只回显 url path 的一部分，
-/// 但 5xx / timeout 错误个别版本会回显完整 URL）。
-fn sanitize_telegram_error(stderr: &str, url: &str) -> String {
-    let mut out = stderr.to_string();
-    // url 形如 https://api.telegram.org/bot<TOKEN>/sendMessage；
-    // 把 bot<token> 这段替换掉，避免 stderr 携带原 token。
-    if let Some(start) = url.find("/bot")
-        && let Some(rest) = url.get(start + 4..)
-    {
-        let token: String = rest.chars().take_while(|c| *c != '/').collect();
-        if !token.is_empty() {
-            let masked = traffic_stats::mask_bot_token(&token);
-            out = out.replace(&token, &masked);
-        }
-    }
-    out
-}
+// v0.6.1：DDNS / Stats / quota 节拍辅助、collect_and_maybe_notify 已搬到 `runtime` 模块。
+// quota 自动禁用循环已搬到 `quota_loop` 模块。
+// Telegram curl / 通知发送已搬到 `telegram` 模块。
+use quota_loop::run_quota_check;
+use runtime::{
+    collect_and_maybe_notify, ddns_refresh_interval, next_loop_sleep, should_collect_stats_at,
+    should_refresh_ddns_at, should_run_quota_check, warn_short_ddns_interval_once,
+};
 
 #[allow(clippy::too_many_arguments)]
 fn build_new_script(
@@ -1262,191 +790,19 @@ fn build_geoip_ssh_rules(geoip_config: &GeoIpConfig) -> String {
     out
 }
 
-fn apply_nft_script(script_path: &str) -> Result<(), io::Error> {
-    apply_nft_script_with("/usr/sbin/nft", Path::new(BACKUP_DIR), script_path)
-}
-
-fn apply_nft_script_with(
-    nft_bin: &str,
-    backup_dir: &Path,
-    script_path: &str,
-) -> Result<(), io::Error> {
-    check_nft_script(nft_bin, script_path)?;
-    let ruleset_backup = backup_current_ruleset(nft_bin, backup_dir)?;
-    let managed_backup = backup_managed_tables(nft_bin);
-    info!("已备份当前 ruleset: {}", ruleset_backup.display());
-
-    let output = Command::new(nft_bin).arg("-f").arg(script_path).output()?;
-    info!(
-        "执行/usr/sbin/nft -f {script_path} 执行结果: {}",
-        output.status
-    );
-    log::info!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-    log::error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    error!("nft apply failed, rolling back managed tables from backup");
-    rollback_managed_tables(nft_bin, backup_dir, &managed_backup)?;
-    Err(io::Error::other(format!(
-        "nft apply failed; managed tables rolled back; full ruleset backup: {}",
-        ruleset_backup.display()
-    )))
-}
-
-fn check_nft_script(nft_bin: &str, script_path: &str) -> Result<(), io::Error> {
-    let output = Command::new(nft_bin)
-        .arg("-c")
-        .arg("-f")
-        .arg(script_path)
-        .output()?;
-    info!(
-        "执行/usr/sbin/nft -c -f {script_path} 执行结果: {}",
-        output.status
-    );
-    log::info!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-    log::error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "nft check failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )))
-    }
-}
-
-fn backup_current_ruleset(nft_bin: &str, backup_dir: &Path) -> Result<PathBuf, io::Error> {
-    fs::create_dir_all(backup_dir)?;
-    let backup_path = PathBuf::from(format!(
-        "{}/ruleset-{}.nft",
-        backup_dir.display(),
-        Local::now().format("%Y%m%d%H%M%S")
-    ));
-    let output = Command::new(nft_bin).arg("list").arg("ruleset").output()?;
-
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "failed to backup current ruleset: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    fs::write(&backup_path, output.stdout)?;
-    Ok(backup_path)
-}
-
-fn backup_managed_tables(nft_bin: &str) -> Vec<(String, String, String)> {
-    let mut backups = Vec::new();
-    for (family, table) in MANAGED_TABLES {
-        match Command::new(nft_bin)
-            .arg("list")
-            .arg("table")
-            .arg(family)
-            .arg(table)
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                backups.push((
-                    family.to_string(),
-                    table.to_string(),
-                    String::from_utf8_lossy(&output.stdout).to_string(),
-                ));
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if is_missing_nft_table_error(&stderr) {
-                    info!("managed table {family} {table} does not exist yet, skip table backup");
-                } else {
-                    error!(
-                        "failed to backup managed table {family} {table}: {}",
-                        stderr.trim()
-                    );
-                }
-            }
-            Err(e) => {
-                error!("failed to inspect managed table {family} {table}: {e:?}");
-            }
-        }
-    }
-    backups
-}
-
-fn is_missing_nft_table_error(stderr: &str) -> bool {
-    let stderr = stderr.to_ascii_lowercase();
-    stderr.contains("no such file or directory")
-        || stderr.contains("table") && stderr.contains("does not exist")
-}
-
-fn rollback_managed_tables(
-    nft_bin: &str,
-    backup_dir: &Path,
-    backups: &[(String, String, String)],
-) -> Result<(), io::Error> {
-    for (family, table) in MANAGED_TABLES {
-        let output = Command::new(nft_bin)
-            .arg("delete")
-            .arg("table")
-            .arg(family)
-            .arg(table)
-            .output();
-        if let Ok(output) = output
-            && !output.status.success()
-        {
-            info!(
-                "delete managed table {family} {table} during rollback returned: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
-
-    if backups.is_empty() {
-        info!("no managed table backup found; rollback only removed managed tables");
-        return Ok(());
-    }
-
-    let rollback_path = PathBuf::from(format!(
-        "{}/managed-rollback-{}.nft",
-        backup_dir.display(),
-        Local::now().format("%Y%m%d%H%M%S")
-    ));
-    let mut rollback_script = String::from("#!/usr/sbin/nft -f\n\n");
-    for (_, _, table_script) in backups {
-        rollback_script.push_str(table_script);
-        rollback_script.push('\n');
-    }
-    fs::write(&rollback_path, rollback_script)?;
-
-    let output = Command::new(nft_bin)
-        .arg("-f")
-        .arg(&rollback_path)
-        .output()?;
-    info!(
-        "执行 managed rollback {} 结果: {}",
-        rollback_path.display(),
-        output.status
-    );
-    log::info!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-    log::error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "managed rollback failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )))
-    }
-}
+// v0.6.1：apply_nft_script / apply_nft_script_with / check_nft_script /
+// backup_current_ruleset / backup_managed_tables / is_missing_nft_table_error /
+// rollback_managed_tables 已迁移到 `apply` 模块。
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod safe_apply_tests {
     use super::*;
+    use crate::apply::{apply_nft_script_with, is_missing_nft_table_error};
+    use crate::quota_loop::run_quota_check_with;
+    use nat_common::quota;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
