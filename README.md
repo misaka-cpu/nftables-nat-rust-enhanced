@@ -4,6 +4,8 @@
 
 > 命名约定：项目正式名为 **`nftables-nat-rust-enhanced`**（GitHub 仓库、安装命令、release 资产、README 标题、systemd 服务路径、配置 / 数据 / 日志目录均保持此名）；CLI 主菜单标题为简称 **`nft-nat-rust`**，仅用于交互界面显示。两者指向同一项目，未来不会重命名仓库或破坏安装/数据路径。
 
+当前稳定版本：**v0.7.0**（维护性重构版本）。详见下面 [v0.7.0](#v070) 段落。
+
 核心原则：
 
 - release 预编译安装，普通 VPS 不需要编译 Rust
@@ -14,6 +16,28 @@
 - CLI 菜单管理 `/etc/nat.toml`
 
 > **Docker v28 兼容例外**：项目原则上只管理 `self-*` 表，**唯一已知**会触碰非 self-* 表的兼容处理是：启动时检测到 `ip filter FORWARD` 或 `ip6 filter FORWARD` 的默认 policy 是 `drop`（Docker v28 在某些版本会这样设置），会写入 `chain ip(6) filter FORWARD { policy accept ; }`，否则转发链路会被默认 drop。这是一次性兼容修正，不修改链中的规则，也不接管 forward policy。如果你不希望本项目触碰这条策略，请确保 `ip filter FORWARD` 的 policy 在 nat.service 启动前已经是 `accept`。
+
+## v0.7.0
+
+v0.7.0 是**维护性重构版本**，重点是降低代码复杂度、提升后续维护稳定性，不新增用户侧大功能。所有核心转发、安全 apply、quota、stats、last-good、GeoIP、egress_control、access_control、SNAT、MSS 行为均与 v0.6.x 完全一致。
+
+主要变化：
+
+- **`nat-cli/src/main.rs` 拆分**：把原来 ~4000 行的入口文件拆成 `apply.rs`（safe apply / nft -c / 备份 / 回滚）、`quota_loop.rs`（quota 自动禁用循环）、`runtime.rs`（主循环节奏 / Stats 采集 / resolution 事件 audit 转写）、`telegram.rs`（curl 超时 / 错误脱敏）。`main.rs` 保留入口与顶层流程
+- **`nat-cli/src/menu.rs` 拆分**：抽出 `menu/update.rs`（一键更新）、`menu/audit_view.rs`（审计日志查看）、`menu/backup.rs`（配置备份 / 恢复 / `safe_write_config`）。菜单编号、文案、交互行为保持不变
+- **`stable_script_hash` 判断 nft 脚本是否变化**：nat.service 主循环不再用「整段字符串相等」比较新旧 nft 脚本，改用稳定 FNV-1a 64-bit hash（`nat_common::stable_script_hash`）。等价语义、不引入新依赖，audit `apply.success` / `apply.fail` detail 新增 `script_hash` 字段，便于排查"刚刚应用的是哪一版规则"
+- **保存配置后的提示按 reason 分流**：
+  - 影响 nft 规则的 reason（`rule.*` / `access_control.*` / `geoip.*` / `egress*` / `snat.*` / `mss_clamp.*` / `backup.restore` / `quota.auto_disable` / `quota.config.update` / `stats.mode.update`）继续显示完整 `nat.service` 自动应用 + `systemctl restart nat` / `nft list table` / `journalctl` 排查命令
+  - 不影响 nft 规则的 reason（`telegram.*` / `ui.*` / `audit.*`）改为简短提示：「配置已安全保存…该配置不会改变 nft 转发规则，无需等待 nft 应用。」避免误导用户去 restart nat
+
+**未改动**（v0.7.0 维护约束的契约边界）：
+
+- nft 规则生成 / safe apply 语义 / quota 判断 / stats 统计 / last-good 解析与回退
+- GeoIP / egress_control / access_control 组合策略 / SNAT / MSS 规则
+- `install.sh` release 安装主流程、GitHub Actions workflow
+- 也没有新增 WebUI / nat-console / tc HTB / ifb / 多租户 / server-agent / 数据库
+
+v0.7.x 进入 **maintenance-only / bugfix-only** 阶段，后续路线见末尾 [维护路线](#维护路线)。
 
 ## 功能特性
 
@@ -90,7 +114,7 @@
 - 可选限制 SSH 只允许中国大陆 IPv4 和 LAN 访问；SSH 限制有锁死风险，开启前务必确认
 - CN IP set 通过 CLI 手动下载并原子替换，下载失败保留旧文件
 - 启用 GeoIP 但 `cn4_file` 不存在或为空时，核心服务会跳过 GeoIP 规则并 WARN
-- GeoIP forward 限制当前基于 `cn4.nft`，**仅作用于 IPv4 转发规则**；IPv6 转发规则不会被 `@cn4` 集合过滤，不受 GeoIP 限制。如需 IPv6 GeoIP，需要额外引入 IPv6 数据源（例如 `cn6.nft`），当前 v0.5.0 不实现 IPv6 GeoIP，请通过 `access_control` / `egress_control` 等限制为 IPv6 规则做来源 / 目标控制。
+- GeoIP forward 限制当前基于 `cn4.nft`，**仅作用于 IPv4 转发规则**；IPv6 转发规则不会被 `@cn4` 集合过滤，不受 GeoIP 限制。如需 IPv6 GeoIP，需要额外引入 IPv6 数据源（例如 `cn6.nft`），本项目尚未实现 IPv6 GeoIP，请通过 `access_control` / `egress_control` 等限制为 IPv6 规则做来源 / 目标控制。
 
 `cn4.nft` 数据源可配置，`cn4_url` 默认值只是一个参考数据源。中国大陆 IP 数据可能存在误差，使用前请自行确认；如需更严格来源，可替换为 APNIC、clang.cn、纯真、ipip.net 或其他你信任的数据源。
 
@@ -499,10 +523,10 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release
 ```
 
-指定版本：
+指定版本（推荐使用当前稳定版 `v0.7.0`，或省略 `--version` 跟随 latest release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.4.3 --enter-menu
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.7.0 --enter-menu
 ```
 
 不指定 `--version` 时使用 latest release。release 包是核心 CLI 版本，包含：
@@ -546,13 +570,13 @@ nat --menu
 nat --version
 ```
 
-release 构建会显示 GitHub tag，例如 `v0.4.3`。源码编译如果没有注入 tag，会回退到 `Cargo.toml` 的 workspace version；两者都缺失时显示 `dev`，不会输出空字符串。
+release 构建会显示 GitHub tag，例如 `v0.7.0`。源码编译如果没有注入 tag，会回退到 `Cargo.toml` 的 workspace version；两者都缺失时显示 `dev`，不会输出空字符串。
 
 菜单（v0.4.2 起标题携带当前版本号，未注入版本时显示 `nft-nat-rust dev`）：
 
 ```text
 ====================================
-nft-nat-rust v0.4.2
+nft-nat-rust v0.7.0
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
@@ -623,9 +647,29 @@ systemctl restart nat
 - 临时文件 / rename 失败 → 旧 `/etc/nat.toml` 保持不变，写 `config.write.fail`（`stage=write_or_rename`）audit
 - audit detail 不写入 `bot_token` / `chat_id` / 任何 secret key（沿用 `redact` 兜底）
 
-v0.6.1：保存提示按 reason 分流——
-- 影响 nft 规则的 reason（`rule.*` / `access_control.*` / `geoip.*` / `egress*` / `snat.*` / `mss_clamp.*` / `backup.restore` / `quota.auto_disable` / `quota.config.update` / `stats.mode.update`）继续显示完整 `nat.service` 自动应用 + `systemctl restart nat` / `nft list table` / `journalctl` 排查命令。
-- 不影响 nft 规则的 reason（`telegram.*` / `ui.*` / `audit.*`）只显示简短提示：「配置已安全保存…该配置不会改变 nft 转发规则，无需等待 nft 应用。」
+保存提示按 reason 分流（v0.6.1 引入，v0.7.0 保持）——CLI 保存配置后会区分配置类型，避免对不影响 nft 的配置误提示等待 nft 应用：
+
+**影响 nft 规则的配置 → 显示完整提示**
+
+- 添加 / 删除 / 启用 / 禁用规则
+- access_control（白名单 / 黑名单）
+- GeoIP（含转发端口 / SSH 限制 / CN IP set 更新）
+- egress_control（出口目标限制）
+- SNAT（masquerade / fixed / off）
+- MSS clamp
+- quota 配置 / 自动禁用
+- `stats.mode.update`（统计口径）
+- `backup.restore`（从备份恢复）
+
+这些保存后会提示 `nat.service` 自动检测并通过 safe apply 应用规则，并列出 `systemctl restart nat` / `nft list table ip self-nat` / `journalctl -u nat -n 120 --no-pager` 等排查命令。
+
+**不影响 nft 规则的配置 → 显示简短提示**
+
+- Telegram（bot_token / chat_id / 启用 / 通知间隔）
+- UI timezone
+- audit 显示 / 轮转配置
+
+这些保存后只显示「配置已安全保存到 /etc/nat.toml。该配置不会改变 nft 转发规则，无需等待 nft 应用。」`telegram.*` 还会附加「状态页默认不会明文显示 bot_token」一行。
 
 `启用 / 禁用规则` 会列出所有规则，选择某一条后再启用或禁用。旧配置缺少 `enabled` 字段时默认视为 `true`；`enabled = false` 的规则会保留在 `/etc/nat.toml`，但不会生成到 nft 规则，也不会进入默认连通性测试列表。
 
@@ -753,10 +797,10 @@ journalctl -u nat -f
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release
 ```
 
-指定版本：
+指定版本（推荐使用当前稳定版 `v0.7.0`，或省略 `--version` 跟随 latest release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.4.3
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.7.0
 ```
 
 CLI 更新：
@@ -789,13 +833,14 @@ nat --menu
 
 失败时会尝试回滚。
 
-#### v0.6.1：safe apply 用 hash 判断脚本是否变化
+#### safe apply 用 hash 判断脚本是否变化（v0.6.1 引入，v0.7.0 保持）
 
-nat.service 主循环以前用「`script != latest_script` 整字符串比较」判断是否要重新跑一次 safe apply。v0.6.1 起改用稳定 FNV-1a 64-bit hash（`nat_common::stable_script_hash`）：
+nat.service 主循环以前用「`script != latest_script` 整字符串比较」判断是否要重新跑一次 safe apply。v0.6.1 起改用稳定 FNV-1a 64-bit hash（`nat_common::stable_script_hash`，在 `nat-common/src/hash.rs` 中实现）；v0.7.0 把该 helper 沉淀到 `nat-common::hash` 模块并通过 `nat_common::stable_script_hash` re-export，行为与 v0.6.1 完全等价。
 
 - 相同输入 → 相同 hash，不会 apply；hash 变化 → 走原有 safe apply 流程
-- hash 跨进程稳定（不依赖 `DefaultHasher` 的随机种子），可在 audit / 日志里以 `0x<16hex>` 形式记录
-- audit 事件 `apply.success` / `apply.fail` 现在带 `script_hash` 字段，便于排查"刚刚应用的是哪一版规则"
+- hash 跨进程稳定（**不依赖** `std::collections::hash_map::DefaultHasher` 的随机种子），可在 audit / 日志里以 `0x<16hex>` 形式记录
+- audit 事件 `apply.success` / `apply.fail` detail 带 `script_hash` 字段，便于排查"刚刚应用的是哪一版规则"
+- **不引入新依赖**：FNV-1a 是 ~10 行纯 Rust 实现，复用现有工作区依赖
 - 不改变 apply 触发条件、不改变 nft 脚本内容、不改变 last-good / stats / quota 任何语义
 
 ## 卸载
@@ -880,7 +925,7 @@ bash install.sh --core-only --build-from-source
 可指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.4.3
+bash install.sh --core-only --use-release --version v0.7.0
 bash install.sh --core-only --build-from-source
 ```
 
@@ -891,6 +936,60 @@ bash install.sh --core-only --build-from-source
 ```bash
 tmp="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh -o "$tmp" && bash "$tmp" --core-only --use-release --enter-menu
 ```
+
+## 项目结构（v0.7.0）
+
+`nat-cli/src/`
+
+- `main.rs`：入口、CLI 参数解析、顶层流程；`handle_loop` / `refresh_once` / `RuntimeConfig` / `parse_conf` / `build_new_script` 等仍保留在这里
+- `apply.rs`：safe apply 全流程——`nft -c` 检查、ruleset 备份、`nft -f` 应用、失败回滚 managed tables（`MANAGED_TABLES`：`ip self-nat` / `ip6 self-nat` / `ip self-filter` / `ip6 self-filter`）
+- `runtime.rs`：nat.service 主循环节奏——DDNS / Stats / quota 节流判定、`next_loop_sleep`、Stats 采集 + Telegram 通知触发、resolution events → audit 转写
+- `quota_loop.rs`：quota 自动禁用检查——读 TOML + Stats、`quota::check_and_decide`、走 `menu::safe_write_config_to` 写回，备份失败跳过本轮
+- `telegram.rs`：nat.service 侧 Telegram 客户端——`curl` 子进程、强制 `--connect-timeout 5 --max-time 15`、stderr 兜底脱敏 `bot_token`
+- `menu.rs`：CLI 菜单主入口，以及尚未拆分的菜单逻辑（规则增删改、stats / quota 子菜单、access_control / GeoIP / egress / SNAT / MSS 子菜单、Telegram 配置、时间 / NTP 状态、测试连通性等）
+  - `menu/update.rs`：一键更新——`update_menu`、`build_update_plan`、`github_latest_resolver`、latest tag 解析、自动重载新版 CLI
+  - `menu/audit_view.rs`：「查看审计日志」子菜单——默认 CLI 友好格式 + 原始 JSON 切换
+  - `menu/backup.rs`：配置备份 / 恢复 / `safe_write_config`——所有写 `/etc/nat.toml` 的生产路径统一走它（备份 → tmp+fsync+rename → audit）
+- `config.rs` / `ip.rs` / `prepare.rs`：配置解析、IP / CIDR 辅助、启动准备
+
+`nat-common/src/`
+
+- `hash.rs`：`stable_script_hash`（FNV-1a 64-bit）+ `format_hash_hex`，跨进程稳定
+- `atomic.rs`：原子写文件 helper（`<path>.tmp.<pid>` → fsync → rename，失败时清理 .tmp）
+- `audit.rs`：audit log 写入 + 内置轻量轮转（`max_size_mb` / `max_backups` / `rotate`）+ secret 字段兜底脱敏
+- `last_good.rs` / `quota.rs` / `stats.rs` / `geoip.rs` / `forward_test.rs` / `uninstall.rs` / `logger.rs`：保持各自原职责，v0.7.0 未改
+
+非 Rust 部分：
+
+- `install.sh` / `setup.sh` / `tests/install-dry-run.sh`：v0.7.0 未改
+- `.github/workflows/`：v0.7.0 未改
+
+## 维护路线
+
+v0.7.x 进入 **bugfix-only / maintenance-only** 阶段。
+
+承诺**不**做：
+
+- 新增 WebUI
+- 新增 tc HTB / ifb / rate_limit 限速
+- 新增多租户 / server-agent 架构
+- 新增数据库
+- 任何破坏既有 CLI 文案 / 菜单编号 / TOML 字段语义的改动
+
+可选维护项（按需推进，不许诺时间）：
+
+- 继续拆分 `menu.rs` 剩余大块逻辑（stats / network / security 等子菜单）
+- 统一更多测试结构、引入更多边界测试
+- audit log 轮转边界继续增强（按时间轮转、轮转触发的 audit 自反映）
+- install / update 文档继续打磨
+
+bug fix 优先级（高 → 低）：
+
+1. nat.service 死循环 / 异常退出 / 资源泄漏
+2. 误改用户 nft 规则、误删 nat.toml、备份失败仍覆盖配置
+3. 敏感字段（`bot_token` 等）泄露到 audit / 日志
+4. quota / stats / last-good / safe apply 行为偏离文档
+5. CLI 菜单可观测性、文案一致性
 
 ## 与原项目区别
 

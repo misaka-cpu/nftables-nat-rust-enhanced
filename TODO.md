@@ -1,11 +1,12 @@
-# TODO（暂缓项）
+# TODO（暂缓项 / 维护路线）
 
 本文件记录在历次「稳定版架构体检」中被识别、但本轮不修复的低优先级改进项。
 
-> v0.4.x 系列已进入 **bugfix-only 阶段**：原则上不再加新功能，只修 bug + 文档对齐。
-> 真正会动结构的改造请挪到 v0.5.0 计划。
+> v0.7.x 进入 **bugfix-only / maintenance-only 阶段**：原则上不再加新功能，只修 bug、补测试、优化文档、处理真实反馈。
+> 真正会动结构的改造请挪到独立 minor 版本规划，并先在本文件提案。
 
 不属于本文件的内容：
+
 - 与 nft 规则生成、safe apply、quota 自动禁用核心逻辑、last-good 容错、`egress_control` / GeoIP / access_control 组合策略相关的功能性变更 —— 这些是稳定版的契约，不能在 TODO 顺手改动
 - 一键更新流程
 
@@ -17,82 +18,118 @@
 
 ### v0.4.1
 
-- `run_quota_check` 自动禁用规则写回 `/etc/nat.toml` 前先复制到 `/etc/nftables-nat/backups/config/nat.toml.quota-auto-disable-YYYYmmdd-HHMMSS.bak`；备份失败 → 跳过本轮写回，写入失败 → 备份保留。写入走临时文件 + rename 原子替换。新增 audit 事件 `quota.backup.create` / `quota.backup.fail` / `quota.auto_disable.write_ok` / `quota.auto_disable.write_fail` / `quota.auto_disable.skipped`。
-- 子菜单返回逻辑：`20) 查看审计日志` 顶层不再叠加一次 `wait_enter_to_return`；`stats_menu → set_rule_quota_interactive` 在用户按 `0` 时返回 `MenuOutcome::Cancelled`，外层不会再要求按 Enter。
-- CLI 时间显示统一为 `Asia/Shanghai` 24 小时制 `YYYY-MM-DD HH:MM:SS CST`，去掉 RFC3339 的 `T...` 与纳秒；JSON 状态文件 / audit log 内部仍保留 UTC RFC3339。
-- `19) 高级网络设置 (SNAT / MSS clamp)` 新增 `6) 时间 / NTP 状态检查`：只查看，不默认改时间；启用 NTP 需要 y/N 二次确认。
-- 规则改完后的提示加上"当前自动检测 / 刷新间隔"实际值 + "请等待一个检测周期后刷新"；连通性测试在 nft 未应用时显示 pending 提示。
+- `run_quota_check` 自动禁用规则写回 `/etc/nat.toml` 前先备份；备份失败跳过本轮写回；写入走临时文件 + rename 原子替换。
+- 子菜单返回逻辑：`20) 查看审计日志` 与 `set_rule_quota_interactive` 的 `Enter` 叠加修复。
+- CLI 时间显示统一为 `Asia/Shanghai` 24h 格式；JSON 内部仍 UTC RFC3339。
+- 高级网络设置新增 `6) 时间 / NTP 状态检查`，只查看不默认改时间。
+- 「请等待一个检测周期后刷新」+ 连通性测试 pending 提示。
 
 ### v0.4.2
 
-- 引入 `[ui] timezone` + `time_format` 配置（chrono-tz，支持 IANA 名，处理 DST）。
-- 拓宽 nft 规则检测器：`detect_rule_in_nft_json` + `classify_nft_presence` 四档（Applied / Partial / Unconfirmed / NotApplied）；不再单看 counter。
-- audit 日志 CLI 默认格式化展示，加子菜单切换原始 JSON。
-- 时间 / NTP 页面重构为 4 项子菜单（查看 / 设 CLI 时区 / 显示 set-timezone 命令 / 尝试启用 NTP），全部需要二次确认。
+- 引入 `[ui] timezone` + `time_format`（chrono-tz，IANA 名 + DST）。
+- 拓宽 nft 规则检测器：`detect_rule_in_nft_json` + `classify_nft_presence` 四档。
+- audit 日志 CLI 默认格式化展示，子菜单切换原始 JSON。
+- 时间 / NTP 页面重构为 4 项子菜单，全部需要二次确认。
 - 主菜单标题简化为 `nft-nat-rust <version>`。
 
 ### v0.4.3
 
-- `[ui].timezone` 改为**全 CLI 生效**：last-good 摘要 / quota 状态 / audit 格式化 / 测试连通性页面统一走 `format_cli_time_with(&config.ui)`；非法 timezone 在 `format_cli_time_with` 内部回退到默认时区，并通过 `from_toml_str` 阶段拒绝持久化。
-- nft 规则检测加入 `NftRuleShape` 区分 Dnat / Redirect。Redirect 规则与 domain=`localhost` / `127.0.0.1` / `::1` 的 Single 规则不再被误判为 `Partial`，显示 `已应用 (redirect)`。
-- Telegram curl 调用（server + CLI）强制 `--connect-timeout 5 --max-time 15`；新增 `sanitize_telegram_error` 兜底脱敏 bot_token，避免 stderr 透传。
-- 主菜单 `14)` 改名为「最近来源 IP 观察（手动排查）」并明确说明当前不自动采集；提供 conntrack / nft list / journalctl 三条手动观察命令。
-- 文档对齐：README 加 audit log logrotate 推荐配置、Docker v28 `ip filter FORWARD` 兼容说明；过时的 `v0.2.2` 版本示例改为 `v0.4.x` / `latest`。
-- 杂项清理：删除空 `static/` 目录；`build_version()` 强制 `dev` 兜底，避免 `nat --version` 出空字符串。
+- `[ui].timezone` 改为全 CLI 生效；非法 timezone 回退默认并拒绝持久化。
+- `NftRuleShape` 区分 Dnat / Redirect，避免 localhost-Single / Redirect 被误判为 Partial。
+- Telegram curl 强制 `--connect-timeout 5 --max-time 15`；`sanitize_telegram_error` 兜底脱敏 `bot_token`。
+- 主菜单 `14)` 改名「最近来源 IP 观察（手动排查）」并明确不自动采集。
+- 杂项：删空 `static/`；`build_version()` 强制 `dev` 兜底。
+
+### v0.5.0 / v0.5.x
+
+- 「查看当前转发规则」默认页面只显示规则核心信息 + 一行组合策略摘要 + 一行 last-good 摘要；详细诊断通过 `d` 入口展开。
+- 「测试转发规则连通性」默认只显示简短外部测试提示；详细 `curl` / `nc` / SNI 示例通过 `h` 入口查看；按 `protocol` / `target` 分支生成示例。
+- 高级网络设置子菜单合并：把分立的「查看组合策略详情」与「查看 last-good 状态缓存」合并为「查看全局诊断状态」。
+- 「查看当前转发规则 → d」与「高级网络设置 → 查看全局诊断状态」共用同一份诊断渲染。
+
+### v0.6.0
+
+- **audit log 内置轻量轮转**：`audit` 配置新增 `rotate` / `max_size_mb` / `max_backups` 字段（旧配置默认 `true / 10MB / 3`）；超阈值时 `audit.log → audit.log.1 → audit.log.2 → …`，`max_backups=0` 时截断当前文件；任何 io 失败仅 WARN，不影响主流程；轮转后当前文件仍是一行 JSON。
+- **统一 `safe_write_config`**：所有写 `/etc/nat.toml` 的生产路径——CLI 各子菜单、quota 自动禁用——都统一走「备份 → 临时文件 + fsync → rename → audit」。备份失败 / 写入失败 / rename 失败均保留旧文件并写 `config.write.fail`（带 `stage`）audit；成功写 `config.write.success`。audit detail 永不写入 `bot_token` / `chat_id`。
+- **一键更新 latest 解析真实 tag**：CLI 选 latest 时通过 `curl -fsI` 解析 GitHub `releases/latest` 重定向，更新摘要直接显示真实版本号；解析失败回退显示 `latest` 并附带 warning，install.sh 行为不变。
+
+### v0.6.1
+
+- **保存提示按 reason 分流**：影响 nft 的 reason 仍显示完整 `nat.service` 自动应用提示；不影响 nft 的 `telegram.*` / `ui.*` / `audit.*` 改为简短提示，避免误导用户去 `systemctl restart nat`。
+- **`latest_script` 改 hash-based**：`handle_loop` 不再用整字符串比较新旧 nft 脚本，改用 `nat_common::stable_script_hash`（FNV-1a 64-bit）。跨进程稳定，不依赖 `DefaultHasher` 随机种子；audit `apply.success` / `apply.fail` 新增 `script_hash` 字段；不引入新依赖；行为与字符串比较等价。
+
+### v0.7.0
+
+- **`nat-cli/src/main.rs` 拆分**：抽出 `apply.rs`（safe apply 全流程）、`runtime.rs`（主循环节奏 / Stats 采集 / resolution events audit 转写）、`quota_loop.rs`（quota 自动禁用循环）、`telegram.rs`（curl 超时 / 错误脱敏）；`main.rs` 保留入口与顶层流程。**只搬代码不改行为**，测试通过 `pub(crate) use` 引回搬出去的项。
+- **`nat-cli/src/menu.rs` 拆分**：抽出 `menu/update.rs`（一键更新）、`menu/audit_view.rs`（审计日志查看）、`menu/backup.rs`（safe_write_config / 备份 / 恢复）；菜单编号、文案、交互行为保持不变。
+- **`nat_common::stable_script_hash` 沉淀到 `hash` 模块**：v0.6.1 引入的 FNV-1a hash 在 v0.7.0 正式进入 `nat-common::hash` 模块并 re-export，行为等价；audit `script_hash` 字段保持。
+- **保存提示分流文档化**：v0.6.1 的 reason 分流逻辑在 v0.7.0 不再改动，README 单独加段说明影响 / 不影响 nft 的两类 reason 各自的提示。
+- **未改动**：nft 规则生成 / safe apply 语义 / quota 判断 / stats 统计 / last-good 解析与回退 / GeoIP / egress_control / access_control 组合策略 / SNAT / MSS 规则 / install.sh release 安装主流程 / GitHub Actions workflow。也未新增 WebUI / nat-console / tc HTB / 多租户 / server-agent / 数据库 / 任何新依赖。
 
 ---
 
-## 待办（按风险 / 收益排序）
+## 待办（按风险 / 收益排序，仅维护性）
 
-### 1. `nat-cli/src/main.rs` 拆分模块（v0.5.0 范围）
+v0.7.x 阶段不接收新功能 PR；以下都是「可选维护项」，按需推进，不许诺时间。
 
-**现状**：单文件 ~4000 行，主循环、安全 apply、quota 检查、Telegram HTTP、`safe_apply_tests` 与 `build_new_script` 的大量场景测试都在一起。
+### 1. 继续拆分 `menu.rs` 剩余大块逻辑
 
-**风险**：低（编译干净、测试齐全），但已经接近合理可读上限。
+**现状**：`menu.rs` 在 v0.7.0 拆出 `menu/update.rs` / `menu/audit_view.rs` / `menu/backup.rs` 后仍有约 6100 行，主要剩下规则增删改、stats / quota 子菜单、access_control / GeoIP / egress 子菜单、Telegram 配置、高级网络（SNAT / MSS / 时间 / NTP）、测试连通性等。
+
+**风险**：低（编译干净、测试齐全），但与 prompt / save_toml_config / confirm 等顶层 helper 耦合较深，单文件搬动会引入大量 `pub(crate)` 改动。
 
 **计划**（按依赖顺序）：
 
-- `nat-cli/src/apply.rs`：`apply_nft_script` / `check_nft_script` / `backup_current_ruleset` / `backup_managed_tables` / `rollback_managed_tables` + 现有 `safe_apply_tests`
-- `nat-cli/src/quota_loop.rs`：`should_run_quota_check` / `run_quota_check` / `run_quota_check_with` / `backup_toml_for_quota_auto_disable` / `atomic_write_text_file` + 相关 audit/Telegram 调用 + 备份相关测试
-- `nat-cli/src/build_script.rs`：`build_new_script` / `build_mss_clamp_rules` / `build_geoip_*` + `forward_summary_from` / `ForwardRuleSummary`
-- `nat-cli/src/telegram_http.rs`：`send_telegram_http` / `build_telegram_curl_command` / `sanitize_telegram_error`
-- 保留 `main.rs` 只负责 `main` / `handle_loop` / `refresh_once` / `parse_conf`
+- `menu/stats.rs`：Stats / quota 子菜单（`stats_menu` / `switch_traffic_mode` / `set_rule_quota_interactive` / `show_quota_status` / `reset_stats` 等）
+- `menu/security.rs`：access_control / GeoIP / egress_control 子菜单
+- `menu/network.rs`：高级网络设置 + 时间 / NTP 子菜单
+- `menu/telegram.rs`：CLI 侧 Telegram 配置 / 测试通知（与 nat-cli/src/telegram.rs 区分：前者是 CLI 配置入口，后者是 nat.service 发送客户端）
+- `menu/rules.rs`：规则增删改、连通性测试
 
-拆分时**不改任何行为**，纯位置迁移，测试模块跟随被测函数。
+拆分时**不改任何行为**，纯位置迁移，菜单编号 / 文案 / 交互保持不变。
 
-### 2. `latest_script` 改为 hash-based 判断（v0.5.0 范围）
+### 2. audit log 轮转边界继续增强
 
-**现状**：`handle_loop` 用「整段字符串相等」（`if script != latest_script`）判断是否需要应用新规则。生成顺序当前是稳定的（`nat_cells` 是 `Vec`、各子规则按 `summaries` 顺序拼接），所以可重入。
+**现状**：v0.6.0 已经实现按大小轮转（`max_size_mb` 阈值 + `max_backups` 滚动）；轮转失败仅 WARN。
 
-**风险**：信息性。一旦未来 build 路径里引入 `HashMap`、并行化、或可选 GeoIP set 内嵌等非确定顺序的步骤，「字符串相等」就会误判 `script` 变动，导致每轮都 reapply，触发不必要的 `nft -f` + 备份。
+**可选增强**：
 
-**计划**：把 `latest_script: String` 改成 `latest_script_hash: Option<u64>`（或 `[u8; 32]` SHA256），落盘对比时计算并存哈希，规则字符串只在需要重写文件时落盘一次。这一步**只改判断逻辑**，不改生成内容，与 last-good 缓存里的 `last_good_nft_hash` 字段对齐。
+- 时间维度轮转（每日轮转一次，无视大小阈值）
+- 轮转事件本身写一条 `audit.rotate.success` audit
+- 轮转失败的 WARN 内容更具体（点出 stage：metadata / rename / truncate）
 
-### 3. audit log 自轮转（v0.5.0 范围）
+### 3. 统一更多测试结构
 
-**现状**：audit log 默认写 `/var/log/nftables-nat-rust-audit.log`，append-only。文件可能无限增长。
+**现状**：`safe_apply_tests`、菜单 `tests` 模块、quota 集成测试散在 `main.rs` / `menu.rs`；hash / atomic / audit 在 `nat-common` 各自模块内自带测试。
 
-**当前应对**：README 推荐 logrotate 配置；CLI 不自动轮转。
+**可选**：把目前嵌在 `main.rs` 大测试模块里的 quota 集成测试搬到 `tests/` 顶层 integration tests，减小 `main.rs` 编译压力。
 
-**计划**：在 audit 模块内部加 best-effort 自轮转（文件超过例如 10MB 时 rename 为 `.1`，并新建空文件）；失败仅 WARN，不阻塞主流程。不强求引入外部 logrotate。
+### 4. install / update 文档继续打磨
 
-### 4. apply 失败时不直接退出 nat.service（v0.5.0 范围）
+**现状**：v0.6.0 起 README 已说明一键更新 latest 解析行为、`config.write.success/fail` audit、内置轮转参数等。v0.7.0 README 加了项目结构与维护路线段落。
 
-**现状**：`apply_nft_script` 失败时 `handle_loop` 直接 `return Err(e)` → 进程 exit → systemd 按 `Restart=always RestartSec=60` 重启。如果用户配置导致 `nft -c` 持续失败，nat.service 会反复 fail-restart 刷 journal。
+**可选**：
 
-**计划**：把 "立即退出" 改成 "记录 audit + sleep 一个 refresh interval + 下一轮重试"。回滚已经在 `apply_nft_script_with` 内做了，主循环不必死掉。需要 careful，避免掩盖真正的不可恢复错误。
+- 给 `--use-release` 路径加更直观的「断网 / GitHub 限速 / DNS 污染」troubleshooting 段落
+- 把 README 中「与原项目区别」表格按 v0.7.0 现状再核对一遍
 
-### 5. RuntimeConfig 携带 `ui`（v0.5.0 范围 / 可选）
+---
 
-**现状**：v0.4.3 在 menu.rs 全部按需 `load_toml_config(...).ui` 读取；`RuntimeConfig` 仍不携带 `ui`。
+## 约束（必须遵守）
 
-**风险**：信息性。
+- 不新增 WebUI / nat-console / static
+- 不新增 tc HTB / ifb / rate_limit / egress_mbps
+- 不新增 server-agent / 多租户 / 数据库
+- 不引入重依赖（如 reqwest、tokio runtime、sqlite 等）
+- 不改 nft 规则生成 / safe apply 语义 / quota 判断 / stats 统计 / last-good 解析 / GeoIP / egress_control / access_control 组合策略 / SNAT / MSS 规则
+- 不改 install.sh release 安装主流程
+- 不改 GitHub Actions workflow
 
-**计划**：把 `ui: UiConfig` 加入 `RuntimeConfig`，让 nat.service 主循环未来如果需要按 [ui] 渲染什么（例如 audit log 启动事件），也能直接拿到。当前没需求，暂缓。
+任何越界改动需要先单独立项、走独立 minor 版本，不在 v0.7.x bugfix 范围内。
 
 ---
 
 ## 备注
 
-- 上述待办均**不**属于 v0.4.x bugfix-only 范围。
+- 上述待办均**不**属于 v0.7.x bugfix-only 范围。
 - 实施前请回看本文件，确认现状描述仍然成立。
