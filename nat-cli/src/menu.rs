@@ -3,7 +3,7 @@ use log::warn;
 use nat_common::{
     AccessControlMode, Args, AuditConfig, DdnsConfig, IpVersion, MSS_CLAMP_MAX, MSS_CLAMP_MIN,
     MssClampConfig, NftCell, Protocol, QuotaPeriod, SnatConfig, SnatMode, StatsConfig, TomlConfig,
-    TrafficMode,
+    TrafficMode, atomic,
     audit::{self, AuditResult},
     build_version, format_cli_time_from_rfc3339_with, format_cli_time_with, forward_test, geoip,
     last_good::{LastGoodState, ResolveSource},
@@ -260,11 +260,146 @@ fn audit_cli(path: &str, action: &str, result: AuditResult, detail: serde_json::
     audit::log_event(&audit_config_from(path), action, result, detail);
 }
 
-fn save_toml_config(path: &str, config: &TomlConfig) -> Result<(), io::Error> {
+/// v0.6.0：所有写 /etc/nat.toml 的生产路径统一走这里。
+/// 流程：备份当前文件（按 reason 命名）→ 临时文件 + fsync + rename → 写 audit。
+/// 任何步骤失败：保留旧配置不动，写 `config.write.fail` audit，并返回 Err。
+fn save_toml_config(path: &str, config: &TomlConfig, reason: &str) -> Result<PathBuf, io::Error> {
     let content = config
         .to_toml_string()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(path, content)
+    safe_write_config(path, &content, reason)
+}
+
+/// 从已知字符串内容安全地覆盖 TOML 配置。备份恢复路径用得上：
+/// 备份文件已经在磁盘上，调用方只想原子地"恢复"到目标 path。
+fn save_toml_config_from_string(
+    path: &str,
+    content: &str,
+    reason: &str,
+) -> Result<PathBuf, io::Error> {
+    safe_write_config(path, content, reason)
+}
+
+/// 安全写 TOML 配置：备份 → tmp+fsync+rename → audit。
+/// 备份目录使用 [`CONFIG_BACKUP_DIR`]；audit 从 `path` 解析 [`AuditConfig`]。
+pub(crate) fn safe_write_config(
+    path: &str,
+    content: &str,
+    reason: &str,
+) -> Result<PathBuf, io::Error> {
+    let audit_cfg = audit_config_from(path);
+    safe_write_config_to(
+        Path::new(CONFIG_BACKUP_DIR),
+        &audit_cfg,
+        path,
+        content,
+        reason,
+    )
+}
+
+/// 可注入备份目录与 audit 配置的 safe_write 内核；测试与 quota 自动禁用复用。
+///
+/// - 备份失败 → 返回 Err，不覆盖旧文件，写 `config.write.fail` audit。
+/// - 临时文件写入或 rename 失败 → 返回 Err，旧文件保持不变，写 `config.write.fail` audit。
+///   - rename 失败时 [`atomic::write_atomic`] 会清理 .tmp。
+/// - 成功 → 写 `config.write.success` audit，返回备份路径。
+///
+/// audit detail 不包含 TOML 内容本身、不包含 bot_token；只包含 reason / path / backup / error。
+pub(crate) fn safe_write_config_to(
+    backup_dir: &Path,
+    audit_cfg: &AuditConfig,
+    path: &str,
+    content: &str,
+    reason: &str,
+) -> Result<PathBuf, io::Error> {
+    let backup_path = match backup_config_to(backup_dir, path, reason) {
+        Ok(p) => p,
+        Err(e) => {
+            audit::log_event(
+                audit_cfg,
+                "config.write.fail",
+                AuditResult::Fail,
+                json!({
+                    "reason": reason,
+                    "path": path,
+                    "stage": "backup",
+                    "error": e.to_string(),
+                }),
+            );
+            return Err(e);
+        }
+    };
+    if let Err(e) = atomic::write_atomic(path, content) {
+        audit::log_event(
+            audit_cfg,
+            "config.write.fail",
+            AuditResult::Fail,
+            json!({
+                "reason": reason,
+                "path": path,
+                "stage": "write_or_rename",
+                "backup": backup_path.display().to_string(),
+                "error": e.to_string(),
+            }),
+        );
+        return Err(e);
+    }
+    audit::log_event(
+        audit_cfg,
+        "config.write.success",
+        AuditResult::Ok,
+        json!({
+            "reason": reason,
+            "path": path,
+            "backup": backup_path.display().to_string(),
+        }),
+    );
+    Ok(backup_path)
+}
+
+/// `backup_config_to`：按 reason 命名备份并设 0600 权限。
+/// 备份文件名形如 `nat.toml.<reason>-YYYYmmdd-HHMMSS.bak`，与 `quota.backup.create` 的命名风格一致。
+pub(crate) fn backup_config_to(
+    backup_dir: &Path,
+    source_path: &str,
+    reason: &str,
+) -> Result<PathBuf, io::Error> {
+    fs::create_dir_all(backup_dir)?;
+    let source = Path::new(source_path);
+    let stem = source
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("nat.toml");
+    let safe_reason = sanitize_backup_reason(reason);
+    let backup_path = backup_dir.join(format!(
+        "{stem}.{safe_reason}-{}.bak",
+        Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    fs::copy(source, &backup_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(backup_path)
+}
+
+/// reason 在文件名里的字符约束：保留 ASCII 字母/数字/下划线/短横线/点；其余替换为 `-`。
+fn sanitize_backup_reason(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return "config-write".to_string();
+    }
+    trimmed
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn show_rules(path: &str) -> Result<(), io::Error> {
@@ -562,8 +697,7 @@ fn add_single_interactive(path: &str) -> Result<(), io::Error> {
         comment,
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    backup_config(path)?;
-    save_toml_config(path, &config)?;
+    save_toml_config(path, &config, "rule.add.single")?;
     audit_cli(
         path,
         "rule.add",
@@ -600,8 +734,7 @@ fn add_range_interactive(path: &str) -> Result<(), io::Error> {
         comment,
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    backup_config(path)?;
-    save_toml_config(path, &config)?;
+    save_toml_config(path, &config, "rule.add.range")?;
     audit_cli(
         path,
         "rule.add",
@@ -640,9 +773,8 @@ fn delete_rule_interactive(path: &str) -> Result<(), io::Error> {
         println!("已取消删除");
         return Ok(());
     }
-    backup_config(path)?;
     delete_rule(&mut config, index).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    save_toml_config(path, &config)?;
+    save_toml_config(path, &config, "rule.delete")?;
     audit_cli(
         path,
         "rule.delete",
@@ -655,7 +787,8 @@ fn delete_rule_interactive(path: &str) -> Result<(), io::Error> {
 }
 
 fn print_config_saved_hint(path: &str) {
-    println!("已保存配置到 {path}。");
+    println!("已安全保存配置到 {path}（备份 → 临时文件 + fsync → rename）。");
+    println!("备份目录：{CONFIG_BACKUP_DIR}/（按 reason 命名，权限 0600）。");
     println!("nat.service 通常会自动检测配置变化，并通过安全流程应用规则。");
     println!("安全流程包括：nft -c 检查、备份当前规则、应用失败自动回滚。");
     println!("本工具不会直接绕过安全流程执行 nft -f。");
@@ -857,8 +990,7 @@ fn switch_traffic_mode(config_path: &str) -> Result<bool, io::Error> {
         }
     };
     config.stats.traffic_mode = mode;
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "stats.mode.update")?;
     println!("已保存统计口径到 {config_path}。");
     println!("后续新增流量将按新口径累计；历史 daily/monthly 不会自动重算。");
     println!("如需重新统计，请重置今日或本月统计。");
@@ -980,8 +1112,7 @@ fn set_rule_quota_interactive(config_path: &str) -> Result<MenuOutcome, io::Erro
             return Ok(MenuOutcome::Done);
         }
     }
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "quota.config.update")?;
     let rule = &config.rules[rule_idx];
     audit_cli(
         config_path,
@@ -1195,8 +1326,8 @@ fn restore_config_interactive(path: &str) -> Result<(), io::Error> {
         println!("已取消恢复");
         return Ok(());
     }
-    backup_config(path)?;
-    fs::copy(&backups[index], path)?;
+    let restored_content = fs::read_to_string(&backups[index])?;
+    save_toml_config_from_string(path, &restored_content, "backup.restore")?;
     audit_cli(
         path,
         "backup.restore",
@@ -1284,8 +1415,7 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
                     .access_control
                     .validate()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                backup_config(path)?;
-                save_toml_config(path, &config)?;
+                save_toml_config(path, &config, "access_control.update")?;
                 audit_cli(
                     path,
                     "access_control.update",
@@ -1681,8 +1811,7 @@ fn toggle_geoip_forward(config_path: &str) -> Result<(), io::Error> {
         config.geoip.enabled = true;
         config.geoip.forward.enabled = true;
     }
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "geoip.forward.update")?;
     audit_cli(
         config_path,
         "geoip.update",
@@ -1747,8 +1876,7 @@ fn toggle_geoip_ssh(config_path: &str) -> Result<(), io::Error> {
         config.geoip.enabled = true;
         config.geoip.ssh.enabled = true;
     }
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "geoip.ssh.update")?;
     audit_cli(
         config_path,
         "geoip.update",
@@ -1777,8 +1905,7 @@ fn set_geoip_ssh_port(config_path: &str) -> Result<(), io::Error> {
     let value = prompt("请输入新的 SSH 端口 (1-65535): ")?;
     let port = parse_port(&value)?;
     config.geoip.ssh.port = port;
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "geoip.ssh.port.update")?;
     println!("SSH 端口已保存为 {port}");
     print_config_saved_hint(config_path);
     Ok(())
@@ -1802,8 +1929,7 @@ fn set_geoip_update_interval(config_path: &str) -> Result<(), io::Error> {
         ));
     }
     config.geoip.update_interval_hours = hours;
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "geoip.update_interval.update")?;
     println!("CN IP set 更新间隔已保存为 {hours} 小时");
     print_config_saved_hint(config_path);
     Ok(())
@@ -1914,8 +2040,7 @@ fn toggle_egress_control(config_path: &str) -> Result<(), io::Error> {
         }
         config.egress_control.enabled = true;
     }
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "egress_control.update")?;
     audit_cli(
         config_path,
         "egress_control.update",
@@ -1957,8 +2082,7 @@ fn add_egress_target(config_path: &str) -> Result<(), io::Error> {
             .allowed_target_cidrs
             .push(value.clone());
     }
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "egress.add")?;
     println!("已添加 {value}");
     print_config_saved_hint(config_path);
     Ok(())
@@ -1987,8 +2111,7 @@ fn delete_egress_target(config_path: &str) -> Result<(), io::Error> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "编号超出范围"));
     }
     let removed = config.egress_control.allowed_target_cidrs.remove(num - 1);
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "egress.delete")?;
     println!("已删除 {removed}");
     print_config_saved_hint(config_path);
     Ok(())
@@ -2212,8 +2335,7 @@ fn configure_telegram(config_path: &str) -> Result<(), io::Error> {
     if matches!(enable.as_str(), "y" | "Y" | "yes" | "YES") {
         config.telegram.enabled = true;
     }
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "telegram.config.update")?;
     audit_cli(
         config_path,
         "telegram.config.update",
@@ -2349,8 +2471,7 @@ fn toggle_telegram(config_path: &str) -> Result<bool, io::Error> {
             return Ok(true);
         }
     }
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "telegram.toggle")?;
     println!(
         "Telegram 通知已{}。",
         if config.telegram.enabled {
@@ -2381,8 +2502,7 @@ fn set_telegram_interval(config_path: &str) -> Result<(), io::Error> {
         ));
     }
     config.telegram.notify_interval_minutes = minutes;
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "telegram.interval.update")?;
     println!("Telegram 通知间隔已保存为 {minutes} 分钟。");
     print_config_saved_hint(config_path);
     Ok(())
@@ -2625,15 +2745,20 @@ fn update_menu(config_path: &str) -> Result<(), io::Error> {
     } else {
         "latest".to_string()
     };
+    let plan = build_update_plan(&version, github_latest_resolver);
 
     println!("更新摘要：");
-    println!("  当前版本: {}", current_version_for_update());
-    println!("  目标版本: {version}");
-    println!("  将更新: /usr/local/bin/nat 和 nat.service");
-    println!("  下载方式: GitHub Release 预编译包优先");
-    println!("  备份: /etc/nftables-nat/backups/update-YYYYmmdd-HHMMSS/");
-    println!("  保留: /etc/nat.toml、/etc/nat.conf、stats、backups");
-    println!("  重启: nat.service");
+    println!("  当前版本：{}", current_version_for_update());
+    println!("  目标版本：{}", plan.display_version);
+    println!("  选择来源：{}", plan.source);
+    if let Some(w) = &plan.warning {
+        println!("  warning：{w}");
+    }
+    println!("  将更新：/usr/local/bin/nat 和 nat.service");
+    println!("  下载方式：GitHub Release 预编译包优先");
+    println!("  备份：/etc/nftables-nat/backups/update-YYYYmmdd-HHMMSS/");
+    println!("  保留：/etc/nat.toml、/etc/nat.conf、stats、backups");
+    println!("  重启：nat.service");
     let confirm = prompt("继续更新？[y/N]: ")?;
     if !matches!(confirm.as_str(), "y" | "Y" | "yes" | "YES") {
         println!("已取消更新");
@@ -2642,9 +2767,9 @@ fn update_menu(config_path: &str) -> Result<(), io::Error> {
     }
 
     let mut args = vec!["--update", "--core-only", "--use-release"];
-    if version != "latest" {
+    if plan.install_arg_version != "latest" {
         args.push("--version");
-        args.push(&version);
+        args.push(&plan.install_arg_version);
     }
     let command_line = format!(
         "curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- {}",
@@ -2654,7 +2779,11 @@ fn update_menu(config_path: &str) -> Result<(), io::Error> {
         config_path,
         "update.start",
         AuditResult::Info,
-        json!({"version": version}),
+        json!({
+            "version": plan.install_arg_version,
+            "display_version": plan.display_version,
+            "source": plan.source,
+        }),
     );
     println!("开始更新，install.sh 会负责备份、重启和失败回滚。");
     let status = Command::new("sh").arg("-c").arg(command_line).status()?;
@@ -2663,7 +2792,12 @@ fn update_menu(config_path: &str) -> Result<(), io::Error> {
             config_path,
             "update.fail",
             AuditResult::Fail,
-            json!({"version": version, "exit_status": status.to_string()}),
+            json!({
+                "version": plan.install_arg_version,
+                "display_version": plan.display_version,
+                "source": plan.source,
+                "exit_status": status.to_string(),
+            }),
         );
         println!("更新命令执行失败。install.sh 会保留旧二进制并在可能时回滚，请查看输出和服务日志");
         wait_enter_to_return()?;
@@ -2674,7 +2808,11 @@ fn update_menu(config_path: &str) -> Result<(), io::Error> {
         config_path,
         "update.success",
         AuditResult::Ok,
-        json!({"version": version}),
+        json!({
+            "version": plan.install_arg_version,
+            "display_version": plan.display_version,
+            "source": plan.source,
+        }),
     );
     println!("更新完成，正在重新载入新版 CLI 菜单...");
     match installed_nat_version() {
@@ -3081,8 +3219,7 @@ fn set_cli_display_timezone_interactive(config_path: &str) -> Result<(), io::Err
         println!("校验失败，未保存：{e}");
         return Ok(());
     }
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "ui.timezone.update")?;
     audit_cli(
         config_path,
         "ui.timezone.update",
@@ -3229,8 +3366,7 @@ fn set_snat_mode_interactive(config_path: &str) -> Result<(), io::Error> {
         .snat
         .validate()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "snat.mode.update")?;
     audit_cli(
         config_path,
         "snat.update",
@@ -3267,8 +3403,7 @@ fn set_snat_fixed_source_ip_interactive(config_path: &str) -> Result<(), io::Err
         validate_fixed_source_ip(trimmed)?;
         config.snat.fixed_source_ip = trimmed.to_string();
     }
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "snat.fixed_source_ip.update")?;
     audit_cli(
         config_path,
         "snat.update",
@@ -3323,8 +3458,7 @@ fn toggle_mss_clamp_interactive(config_path: &str) -> Result<(), io::Error> {
         }
         config.mss_clamp.enabled = true;
     }
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "mss_clamp.toggle")?;
     audit_cli(
         config_path,
         "mss_clamp.update",
@@ -3358,8 +3492,7 @@ fn set_mss_clamp_size_interactive(config_path: &str) -> Result<(), io::Error> {
         .mss_clamp
         .validate()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    backup_config(config_path)?;
-    save_toml_config(config_path, &config)?;
+    save_toml_config(config_path, &config, "mss_clamp.size.update")?;
     audit_cli(
         config_path,
         "mss_clamp.update",
@@ -3439,6 +3572,119 @@ fn valid_release_tag(version: &str) -> bool {
         && version
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+/// 一键更新摘要中显示的版本计划：包含给用户看的目标版本字符串、选择来源、可选 warning，
+/// 以及给 install.sh 的实际参数（仍是用户原始输入：latest 不解析就传 latest，
+/// 指定版本仍直接传给 --version）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpdatePlan {
+    pub display_version: String,
+    pub source: &'static str,
+    pub warning: Option<String>,
+    /// install.sh 期望的版本值；latest 时仍传 "latest"，指定版本时传具体 tag。
+    pub install_arg_version: String,
+}
+
+/// 构建 UpdatePlan：
+/// - 当用户选了 latest：调用 `resolver()` 尝试解析实际 release tag；
+///   成功 → display_version = tag，source = "latest"；
+///   失败 / 不合法 → display_version = "latest"，source = "latest"，附带 warning。
+/// - 当用户指定版本：display_version = 指定 tag，source = "specified"。
+///
+/// install_arg_version 始终是用户原始输入，确保 install.sh 行为不变。
+pub(crate) fn build_update_plan<F>(version: &str, resolver: F) -> UpdatePlan
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    if version == "latest" {
+        match resolver() {
+            Ok(tag) if valid_release_tag(&tag) => UpdatePlan {
+                display_version: tag,
+                source: "latest",
+                warning: None,
+                install_arg_version: "latest".to_string(),
+            },
+            Ok(other) => UpdatePlan {
+                display_version: "latest".to_string(),
+                source: "latest",
+                warning: Some(format!(
+                    "解析到的 release tag {other:?} 不符合 vX.Y.Z 格式，将交由 install.sh 使用 latest release。"
+                )),
+                install_arg_version: "latest".to_string(),
+            },
+            Err(e) => UpdatePlan {
+                display_version: "latest".to_string(),
+                source: "latest",
+                warning: Some(format!(
+                    "无法解析 latest release tag（{e}），将交由 install.sh 使用 latest release。"
+                )),
+                install_arg_version: "latest".to_string(),
+            },
+        }
+    } else {
+        UpdatePlan {
+            display_version: version.to_string(),
+            source: "specified",
+            warning: None,
+            install_arg_version: version.to_string(),
+        }
+    }
+}
+
+/// 生产解析器：调用 `curl -fsI` 获取 GitHub releases/latest 的重定向 URL，
+/// 解析出 `/releases/tag/vX.Y.Z`。整个过程是只读 HTTP，5 秒连接超时 + 10 秒总超时。
+///
+/// 任何执行 / 解析失败都返回 Err（不 panic）。
+pub(crate) fn github_latest_resolver() -> Result<String, String> {
+    let output = Command::new("curl")
+        .arg("-fsI")
+        .arg("--connect-timeout")
+        .arg("5")
+        .arg("--max-time")
+        .arg("10")
+        .arg("https://github.com/misaka-cpu/nftables-nat-rust-enhanced/releases/latest")
+        .output()
+        .map_err(|e| format!("执行 curl 失败: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("curl 退出码非零: {}", output.status));
+    }
+    let header = String::from_utf8_lossy(&output.stdout);
+    parse_latest_tag_from_curl_headers(&header)
+        .ok_or_else(|| "curl 响应里找不到 /releases/tag/<vX.Y.Z>".to_string())
+}
+
+/// 从 curl `-fsI` 的响应头里提取 `location:` 行中的最后一段 `/releases/tag/<tag>`。
+/// 兼容 GitHub 多级重定向；GitHub 会把 `releases/latest` 重定向到具体 tag。
+pub(crate) fn parse_latest_tag_from_curl_headers(headers: &str) -> Option<String> {
+    let mut best: Option<String> = None;
+    for line in headers.lines() {
+        let lower = line.trim().to_ascii_lowercase();
+        if !(lower.starts_with("location:") || lower.starts_with("location :")) {
+            continue;
+        }
+        let (_, value) = line.split_once(':')?;
+        let value = value.trim();
+        if let Some(tag) = extract_release_tag(value) {
+            best = Some(tag);
+        }
+    }
+    best
+}
+
+/// 从形如 `https://github.com/<owner>/<repo>/releases/tag/v0.5.2` 中拿到 `v0.5.2`。
+/// 不做严格 URL 解析；只看最后一个 `/tag/` 子串。
+pub(crate) fn extract_release_tag(url: &str) -> Option<String> {
+    let idx = url.rfind("/tag/")?;
+    let rest = &url[idx + 5..];
+    // 去掉可能的 query / 末尾 / 等
+    let tag = rest
+        .split(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
+        .next()?;
+    if tag.is_empty() {
+        return None;
+    }
+    Some(tag.to_string())
 }
 
 fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
@@ -4007,8 +4253,7 @@ fn toggle_rule_interactive(path: &str) -> Result<(), io::Error> {
         }
     }
 
-    backup_config(path)?;
-    save_toml_config(path, &config)?;
+    save_toml_config(path, &config, "rule.toggle")?;
     let now_enabled = config.rules[rule_index].enabled();
     audit_cli(
         path,
@@ -4882,6 +5127,7 @@ domain = "example.com"
         let audit_cfg = AuditConfig {
             enabled: true,
             file: audit_path.clone(),
+            ..Default::default()
         };
         // 即使调用方意外把原始 token 塞进 detail，audit 模块也会兜底 redact
         audit::log_event(
@@ -4970,6 +5216,42 @@ domain = "example.com"
         assert!(
             readme.contains("不绕过 `egress_control`"),
             "README should explain last-good does not bypass egress_control"
+        );
+    }
+
+    #[test]
+    fn readme_documents_v0_6_0_audit_rotation_and_safe_write_and_latest_resolution() {
+        let readme = include_str!("../../README.md");
+        // audit 内置轻量轮转
+        assert!(
+            readme.contains("内置轻量轮转")
+                && readme.contains("max_size_mb")
+                && readme.contains("max_backups"),
+            "README 应说明 audit 内置轮转参数"
+        );
+        // 默认值描述
+        assert!(
+            readme.contains("max_size_mb = 10") && readme.contains("max_backups = 3"),
+            "README 应给出 audit 默认轮转参数"
+        );
+        // safe_write_config 安全写配置流程
+        assert!(
+            readme.contains("safe_write_config") || readme.contains("安全写配置"),
+            "README 应描述安全写配置流程"
+        );
+        assert!(
+            readme.contains("config.write.success") && readme.contains("config.write.fail"),
+            "README 应说明 audit 事件 config.write.success / fail"
+        );
+        // 一键更新 latest 解析行为
+        assert!(
+            readme.contains("解析 GitHub 最新 release tag")
+                || readme.contains("解析 GitHub 最新 release"),
+            "README 应说明 CLI latest 解析行为"
+        );
+        assert!(
+            readme.contains("选择来源") && readme.contains("specified"),
+            "README 应说明更新摘要中的『选择来源』字段"
         );
     }
 
@@ -5970,5 +6252,277 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             readme.contains("CLI 默认只展示简短测试提示") && readme.contains("输入 h 查看"),
             "README 应说明默认简短测试提示与 h 入口"
         );
+    }
+
+    // ============ v0.6.0: safe_write_config 统一写入 ============
+
+    fn safe_write_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nat-safe-write-{}-{}-{name}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn safe_write_config_to_creates_backup_and_writes_atomically() {
+        let dir = safe_write_dir("happy");
+        let backup_dir = dir.join("backup");
+        let audit_file = dir.join("audit.log");
+        let target = dir.join("nat.toml");
+        std::fs::write(&target, "old = true\n").unwrap();
+        let audit_cfg = nat_common::AuditConfig {
+            enabled: true,
+            file: audit_file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let backup_path = safe_write_config_to(
+            &backup_dir,
+            &audit_cfg,
+            target.to_str().unwrap(),
+            "new = true\n",
+            "telegram.toggle",
+        )
+        .unwrap();
+        // 目标文件已更新；备份目录里有按 reason 命名的 .bak
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new = true\n");
+        assert!(backup_path.starts_with(&backup_dir));
+        let bak_name = backup_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            bak_name.contains(".telegram.toggle-"),
+            "backup 文件名应含 reason: {bak_name}"
+        );
+        // audit 应当包含 config.write.success
+        let lines = audit::read_tail(audit_file.to_str().unwrap(), 10);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("config.write.success") && l.contains("telegram.toggle")),
+            "缺少 config.write.success audit: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn safe_write_config_to_when_backup_fails_keeps_original() {
+        // 备份目录用一个普通文件占位 → fs::create_dir_all 失败
+        let dir = safe_write_dir("backup-fail");
+        let blocker_parent = dir.join("blocker-as-dir");
+        std::fs::write(&blocker_parent, b"not a directory").unwrap();
+        let backup_dir = blocker_parent.join("nested");
+        let audit_file = dir.join("audit.log");
+        let target = dir.join("nat.toml");
+        std::fs::write(&target, "old = true\n").unwrap();
+        let original = std::fs::read_to_string(&target).unwrap();
+        let audit_cfg = nat_common::AuditConfig {
+            enabled: true,
+            file: audit_file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let result = safe_write_config_to(
+            &backup_dir,
+            &audit_cfg,
+            target.to_str().unwrap(),
+            "new = true\n",
+            "rule.add.single",
+        );
+        assert!(result.is_err(), "backup 失败应当返回 Err");
+        // 旧 nat.toml 必须保持不变
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+        let lines = audit::read_tail(audit_file.to_str().unwrap(), 10);
+        let parsed: Vec<serde_json::Value> = lines
+            .iter()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert!(
+            parsed
+                .iter()
+                .any(|v| v["action"] == "config.write.fail" && v["detail"]["stage"] == "backup"),
+            "缺少 config.write.fail (stage=backup) audit: {lines:?}"
+        );
+        assert!(
+            !parsed.iter().any(|v| v["action"] == "config.write.success"),
+            "备份失败时不应出现 config.write.success: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn safe_write_config_to_when_rename_fails_keeps_original() {
+        // 把目标设为一个目录路径，create File 会失败（在 v0.6.0 atomic_write 流程中阶段为 write_or_rename）
+        let dir = safe_write_dir("rename-fail");
+        let backup_dir = dir.join("bk");
+        let target = dir.join("nat.toml");
+        std::fs::write(&target, "old = true\n").unwrap();
+        let original = std::fs::read_to_string(&target).unwrap();
+        // 让 atomic write 的 tmp 文件无法创建：目标的父目录改为一个不可写位置
+        // 这里改用 readonly path：在 /proc 下尝试写
+        let unwritable = std::path::PathBuf::from("/proc/this/path/should/not/exist/nat.toml");
+        let audit_file = dir.join("audit.log");
+        let audit_cfg = nat_common::AuditConfig {
+            enabled: true,
+            file: audit_file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let result = safe_write_config_to(
+            &backup_dir,
+            &audit_cfg,
+            unwritable.to_str().unwrap(),
+            "new = true\n",
+            "rule.add.single",
+        );
+        assert!(result.is_err());
+        // target（dir/nat.toml）保持不变
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+    }
+
+    #[test]
+    fn safe_write_config_to_audit_does_not_leak_bot_token() {
+        // 通过 reason 与 path 写入；即便上游误把 token 当作 reason 传进来，也应当被脱敏。
+        let dir = safe_write_dir("no-token-leak");
+        let backup_dir = dir.join("bk");
+        let audit_file = dir.join("audit.log");
+        let target = dir.join("nat.toml");
+        std::fs::write(&target, "old = 1\n").unwrap();
+        let audit_cfg = nat_common::AuditConfig {
+            enabled: true,
+            file: audit_file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        safe_write_config_to(
+            &backup_dir,
+            &audit_cfg,
+            target.to_str().unwrap(),
+            "new = 1\n",
+            "telegram.toggle",
+        )
+        .unwrap();
+        // 即便我们再把疑似 bot_token 的字符串塞进 detail，audit::log_event 内部也会兜底 redact。
+        audit::log_event(
+            &audit_cfg,
+            "config.write.demo",
+            audit::AuditResult::Info,
+            json!({"bot_token": "1234567890:LEAKME_SAFEWRITE"}),
+        );
+        let raw = std::fs::read_to_string(&audit_file).unwrap();
+        assert!(
+            !raw.contains("LEAKME_SAFEWRITE"),
+            "audit log 不能泄露 bot_token 明文: {raw}"
+        );
+    }
+
+    // ============ v0.6.0: 一键更新 latest 解析 ============
+
+    #[test]
+    fn build_update_plan_latest_resolved_to_real_tag() {
+        let plan = build_update_plan("latest", || Ok("v0.5.2".to_string()));
+        assert_eq!(plan.display_version, "v0.5.2");
+        assert_eq!(plan.source, "latest");
+        assert!(plan.warning.is_none());
+        // install.sh 仍然按 latest 走，不要把 --version v0.5.2 强加进去
+        assert_eq!(plan.install_arg_version, "latest");
+    }
+
+    #[test]
+    fn build_update_plan_latest_falls_back_when_resolver_fails() {
+        let plan = build_update_plan("latest", || Err("timeout".to_string()));
+        assert_eq!(plan.display_version, "latest");
+        assert_eq!(plan.source, "latest");
+        let w = plan
+            .warning
+            .unwrap_or_else(|| "<missing warning>".to_string());
+        assert!(
+            w != "<missing warning>",
+            "build_update_plan 在 latest 解析失败时应附带 warning"
+        );
+        assert!(
+            w.contains("无法解析 latest release tag"),
+            "warning 文案: {w}"
+        );
+        assert!(
+            w.contains("latest release"),
+            "warning 应说明会让 install.sh 走 latest: {w}"
+        );
+        assert_eq!(plan.install_arg_version, "latest");
+    }
+
+    #[test]
+    fn build_update_plan_latest_falls_back_when_resolver_returns_invalid() {
+        let plan = build_update_plan("latest", || Ok("not-a-tag".to_string()));
+        assert_eq!(plan.display_version, "latest");
+        assert_eq!(plan.source, "latest");
+        let w = plan
+            .warning
+            .unwrap_or_else(|| "<missing warning>".to_string());
+        assert!(
+            w != "<missing warning>",
+            "build_update_plan 在解析到非法 tag 时应附带 warning"
+        );
+        assert!(w.contains("不符合 vX.Y.Z 格式"), "warning 文案: {w}");
+        assert_eq!(plan.install_arg_version, "latest");
+    }
+
+    #[test]
+    fn build_update_plan_specified_version_keeps_input_as_install_arg() {
+        let plan = build_update_plan("v0.5.2", || panic!("specified 路径不应触发 resolver"));
+        assert_eq!(plan.display_version, "v0.5.2");
+        assert_eq!(plan.source, "specified");
+        assert!(plan.warning.is_none());
+        assert_eq!(plan.install_arg_version, "v0.5.2");
+    }
+
+    #[test]
+    fn extract_release_tag_handles_github_redirect_url() {
+        assert_eq!(
+            extract_release_tag(
+                "https://github.com/misaka-cpu/nftables-nat-rust-enhanced/releases/tag/v0.5.2"
+            ),
+            Some("v0.5.2".to_string())
+        );
+        // 末尾带 query
+        assert_eq!(
+            extract_release_tag("https://github.com/x/y/releases/tag/v0.6.0?expanded=true"),
+            Some("v0.6.0".to_string())
+        );
+        // 不是 release tag
+        assert!(extract_release_tag("https://github.com/x/y/releases").is_none());
+    }
+
+    #[test]
+    fn parse_latest_tag_from_curl_headers_picks_final_redirect() {
+        // GitHub 多级重定向：第一次 -> /releases，第二次 -> /releases/tag/v0.5.2
+        let headers = r#"HTTP/2 302
+location: https://github.com/misaka-cpu/nftables-nat-rust-enhanced/releases
+
+HTTP/2 302
+Location: https://github.com/misaka-cpu/nftables-nat-rust-enhanced/releases/tag/v0.5.2
+
+HTTP/2 200
+"#;
+        assert_eq!(
+            parse_latest_tag_from_curl_headers(headers),
+            Some("v0.5.2".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_latest_tag_returns_none_when_no_tag_in_redirect() {
+        let headers = "HTTP/2 200\ncontent-type: text/html\n";
+        assert!(parse_latest_tag_from_curl_headers(headers).is_none());
+    }
+
+    #[test]
+    fn sanitize_backup_reason_filters_path_traversal_and_special_chars() {
+        // reason 用于拼文件名，必须只保留安全字符
+        let safe = sanitize_backup_reason("../rm -rf /; whatever");
+        assert!(!safe.contains('/'));
+        assert!(!safe.contains(' '));
+        assert!(!safe.contains(';'));
+        // 全空字符串应有兜底
+        assert_eq!(sanitize_backup_reason("   "), "config-write");
     }
 }

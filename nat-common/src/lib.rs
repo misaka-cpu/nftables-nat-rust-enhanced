@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use std::num::ParseIntError;
 use std::str::FromStr;
 
+pub mod atomic;
 pub mod audit;
 pub mod forward_test;
 pub mod geoip;
@@ -896,6 +897,16 @@ pub struct AuditConfig {
     pub enabled: bool,
     #[serde(default = "default_audit_file")]
     pub file: String,
+    /// 内置轻量轮转开关；旧配置缺省时为 true，避免日志无限增长。
+    #[serde(default = "default_true")]
+    pub rotate: bool,
+    /// 触发轮转的阈值（MB）。0 视为禁用阈值检测。
+    #[serde(default = "default_audit_max_size_mb")]
+    pub max_size_mb: u64,
+    /// 保留的历史备份数量（.1 / .2 / .3 …）。
+    /// `0` 表示仅截断当前日志、不保留旧文件。
+    #[serde(default = "default_audit_max_backups")]
+    pub max_backups: u32,
 }
 
 impl Default for AuditConfig {
@@ -903,6 +914,9 @@ impl Default for AuditConfig {
         Self {
             enabled: true,
             file: default_audit_file(),
+            rotate: true,
+            max_size_mb: default_audit_max_size_mb(),
+            max_backups: default_audit_max_backups(),
         }
     }
 }
@@ -918,6 +932,14 @@ impl AuditConfig {
 
 fn default_audit_file() -> String {
     "/var/log/nftables-nat-rust-audit.log".to_string()
+}
+
+fn default_audit_max_size_mb() -> u64 {
+    10
+}
+
+fn default_audit_max_backups() -> u32 {
+    3
 }
 
 /// 规则级流量配额全局配置

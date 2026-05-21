@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditResult {
@@ -40,6 +40,8 @@ struct AuditLine<'a> {
 /// 写入一条审计事件。
 /// - `config.enabled = false` 时静默不写。
 /// - 写盘失败只 WARN，不返回 Err 上抛。
+/// - 启用 `rotate` 时，append 前会先调用 [`maybe_rotate`] 做 best-effort 轮转；
+///   轮转失败仅 WARN，不影响当前事件写入。
 pub fn log_event(config: &AuditConfig, action: &str, result: AuditResult, detail: Value) {
     if !config.enabled {
         return;
@@ -57,6 +59,9 @@ pub fn log_event(config: &AuditConfig, action: &str, result: AuditResult, detail
             return;
         }
     };
+    if let Err(e) = maybe_rotate(config) {
+        log::warn!("audit 轮转失败 ({}): {e}", config.file);
+    }
     if let Err(e) = append_line(&config.file, &serialized) {
         log::warn!("audit 写入失败 ({}): {e}", config.file);
     }
@@ -72,6 +77,83 @@ fn append_line(path: &str, line: &str) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(p)?;
     file.write_all(line.as_bytes())?;
     file.write_all(b"\n")?;
+    Ok(())
+}
+
+/// 检查当前 audit.log 大小，超过阈值时执行 best-effort 轮转。
+/// 不抛 panic：任何 io 错误返回 Err，让上层只打印 WARN，不影响主流程。
+///
+/// 行为：
+/// - `config.rotate = false` → 直接返回 Ok，不动文件。
+/// - `config.max_size_mb = 0` → 视为禁用阈值检测，直接返回 Ok。
+/// - 文件不存在或读不到 metadata → Ok（什么都不做）。
+/// - 文件大小 ≤ 阈值 → Ok。
+/// - 文件大小 > 阈值 →
+///   - `max_backups == 0`：直接截断当前 audit.log（不保留 .1）。
+///   - `max_backups >= 1`：滚动重命名 `.N-1 → .N`，最旧的被覆盖；
+///     最终 `audit.log → audit.log.1`，并新建空 audit.log。
+pub fn maybe_rotate(config: &AuditConfig) -> io::Result<()> {
+    if !config.rotate {
+        return Ok(());
+    }
+    if config.max_size_mb == 0 {
+        return Ok(());
+    }
+    let limit = config.max_size_mb.saturating_mul(1024 * 1024);
+    let path = Path::new(&config.file);
+    let size = match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => meta.len(),
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if size <= limit {
+        return Ok(());
+    }
+    rotate_now(&config.file, config.max_backups)
+}
+
+/// 执行一次轮转（不再判断阈值）。供测试和 `maybe_rotate` 共用。
+pub fn rotate_now(file: &str, max_backups: u32) -> io::Result<()> {
+    if max_backups == 0 {
+        // 直接截断；保留 inode，避免追加流仍指向旧 inode。
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(file)?;
+        return Ok(());
+    }
+    // 从最大的索引开始向前滚动，避免覆盖中间文件。
+    //   audit.log.{N-1} -> audit.log.{N}   （N == max_backups 时直接删除目标外的）
+    //   ...
+    //   audit.log.1     -> audit.log.2
+    //   audit.log       -> audit.log.1
+    let path = Path::new(file);
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "audit.log".to_string());
+    let suffix_path = |n: u32| -> PathBuf { parent.join(format!("{stem}.{n}")) };
+
+    // 把最旧的扔掉（如果存在）：audit.log.{N+1} 不该存在，但 audit.log.{N} 要被覆盖
+    for n in (1..=max_backups).rev() {
+        let from = if n == 1 {
+            path.to_path_buf()
+        } else {
+            suffix_path(n - 1)
+        };
+        let to = suffix_path(n);
+        if !from.exists() {
+            continue;
+        }
+        if to.exists() {
+            let _ = fs::remove_file(&to);
+        }
+        fs::rename(&from, &to)?;
+    }
+    // rename 走完后 audit.log 已经不存在；下次 append_line 会重新 create。
     Ok(())
 }
 
@@ -311,6 +393,7 @@ mod tests {
         let cfg = AuditConfig {
             enabled: true,
             file: path.clone(),
+            ..Default::default()
         };
         log_event(&cfg, "rule.add", AuditResult::Ok, json!({"sport": 30080}));
         log_event(&cfg, "rule.delete", AuditResult::Ok, json!({"index": 0}));
@@ -328,6 +411,7 @@ mod tests {
         let cfg = AuditConfig {
             enabled: true,
             file: path.clone(),
+            ..Default::default()
         };
         log_event(
             &cfg,
@@ -353,6 +437,7 @@ mod tests {
         let cfg = AuditConfig {
             enabled: false,
             file: path.clone(),
+            ..Default::default()
         };
         log_event(&cfg, "rule.add", AuditResult::Ok, json!({}));
         assert!(read_tail(&path, 10).is_empty());
@@ -364,6 +449,7 @@ mod tests {
         let cfg = AuditConfig {
             enabled: true,
             file: "/proc/this/path/should/not/be/writable/audit.log".to_string(),
+            ..Default::default()
         };
         log_event(
             &cfg,
@@ -380,6 +466,7 @@ mod tests {
         let cfg = AuditConfig {
             enabled: true,
             file: path.clone(),
+            ..Default::default()
         };
         for i in 0..70 {
             log_event(&cfg, "rule.add", AuditResult::Ok, json!({"i": i}));
@@ -405,6 +492,7 @@ mod tests {
         let cfg = AuditConfig {
             enabled: true,
             file: path.clone(),
+            ..Default::default()
         };
         log_event(
             &cfg,
@@ -444,6 +532,7 @@ mod tests {
         let cfg = AuditConfig {
             enabled: true,
             file: path.clone(),
+            ..Default::default()
         };
         log_event(
             &cfg,
@@ -485,6 +574,7 @@ mod tests {
         let cfg = AuditConfig {
             enabled: true,
             file: path.clone(),
+            ..Default::default()
         };
         log_event(
             &cfg,
@@ -549,6 +639,7 @@ mod tests {
         let cfg = AuditConfig {
             enabled: true,
             file: path.clone(),
+            ..Default::default()
         };
         log_event(
             &cfg,
@@ -579,9 +670,199 @@ mod tests {
         let cfg = AuditConfig {
             enabled: true,
             file: path.clone(),
+            ..Default::default()
         };
         log_event(&cfg, "rule.add", AuditResult::Ok, json!({}));
         assert!(last_apply_event(&path, 50).is_none());
         assert!(last_apply_success_time(&path, 50).is_none());
+    }
+
+    // ============ v0.6.0: audit log 轻量轮转 ============
+
+    fn audit_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nat-audit-rot-{}-{}-{name}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn audit_config_defaults_when_legacy_toml_lacks_rotate_fields() {
+        // 旧 TOML 缺少 rotate / max_size_mb / max_backups 时，从 [audit] 段反序列化
+        // 应当使用默认值：rotate=true、max_size_mb=10、max_backups=3
+        #[derive(Debug, serde::Deserialize)]
+        struct Wrapper {
+            audit: AuditConfig,
+        }
+        let toml = r#"
+            [audit]
+            enabled = true
+            file = "/tmp/x.log"
+        "#;
+        let parsed: Wrapper = toml::from_str(toml).unwrap();
+        assert!(parsed.audit.rotate);
+        assert_eq!(parsed.audit.max_size_mb, 10);
+        assert_eq!(parsed.audit.max_backups, 3);
+    }
+
+    #[test]
+    fn rotate_now_rolls_files_in_order() {
+        let dir = audit_dir("order");
+        let file = dir.join("audit.log");
+        std::fs::write(&file, b"latest\n").unwrap();
+        // 先制造 .1 和 .2，验证轮转后 .1->.2，.2->.3
+        std::fs::write(dir.join("audit.log.1"), b"first\n").unwrap();
+        std::fs::write(dir.join("audit.log.2"), b"second\n").unwrap();
+        rotate_now(file.to_str().unwrap(), 3).unwrap();
+        // 轮转后 audit.log 不应存在（下次 append_line 会重建）
+        assert!(!file.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("audit.log.1")).unwrap(),
+            "latest\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("audit.log.2")).unwrap(),
+            "first\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("audit.log.3")).unwrap(),
+            "second\n"
+        );
+    }
+
+    #[test]
+    fn rotate_now_drops_oldest_when_exceeding_max_backups() {
+        let dir = audit_dir("drop-old");
+        let file = dir.join("audit.log");
+        std::fs::write(&file, b"latest\n").unwrap();
+        std::fs::write(dir.join("audit.log.1"), b"old1\n").unwrap();
+        std::fs::write(dir.join("audit.log.2"), b"old2\n").unwrap();
+        std::fs::write(dir.join("audit.log.3"), b"old3\n").unwrap();
+        rotate_now(file.to_str().unwrap(), 3).unwrap();
+        assert!(!file.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("audit.log.1")).unwrap(),
+            "latest\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("audit.log.2")).unwrap(),
+            "old1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("audit.log.3")).unwrap(),
+            "old2\n"
+        );
+        // .4 不应被生成
+        assert!(!dir.join("audit.log.4").exists());
+    }
+
+    #[test]
+    fn rotate_now_max_backups_zero_truncates_current_only() {
+        let dir = audit_dir("zero");
+        let file = dir.join("audit.log");
+        std::fs::write(&file, b"latest\n").unwrap();
+        rotate_now(file.to_str().unwrap(), 0).unwrap();
+        // max_backups=0：截断当前文件，不生成 .1
+        assert!(file.exists());
+        assert!(std::fs::read_to_string(&file).unwrap().is_empty());
+        assert!(!dir.join("audit.log.1").exists());
+    }
+
+    #[test]
+    fn maybe_rotate_skips_when_rotate_false() {
+        let dir = audit_dir("rotate-false");
+        let file = dir.join("audit.log");
+        std::fs::write(&file, vec![b'a'; 2 * 1024 * 1024]).unwrap();
+        let cfg = AuditConfig {
+            enabled: true,
+            file: file.to_string_lossy().to_string(),
+            rotate: false,
+            max_size_mb: 1,
+            max_backups: 3,
+        };
+        maybe_rotate(&cfg).unwrap();
+        // 文件保持不动
+        assert!(file.exists());
+        assert!(!dir.join("audit.log.1").exists());
+    }
+
+    #[test]
+    fn maybe_rotate_below_threshold_does_nothing() {
+        let dir = audit_dir("under-threshold");
+        let file = dir.join("audit.log");
+        std::fs::write(&file, b"tiny\n").unwrap();
+        let cfg = AuditConfig {
+            enabled: true,
+            file: file.to_string_lossy().to_string(),
+            rotate: true,
+            max_size_mb: 1,
+            max_backups: 3,
+        };
+        maybe_rotate(&cfg).unwrap();
+        assert!(file.exists());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "tiny\n");
+        assert!(!dir.join("audit.log.1").exists());
+    }
+
+    #[test]
+    fn log_event_triggers_rotation_when_size_exceeds_limit() {
+        let dir = audit_dir("auto-rotate");
+        let file = dir.join("audit.log");
+        // 写 1.5MB 数据，超过 1MB 阈值
+        std::fs::write(&file, vec![b'X'; 1_572_864]).unwrap();
+        let cfg = AuditConfig {
+            enabled: true,
+            file: file.to_string_lossy().to_string(),
+            rotate: true,
+            max_size_mb: 1,
+            max_backups: 3,
+        };
+        log_event(&cfg, "rotate.test", AuditResult::Ok, json!({"i": 1}));
+        // audit.log.1 应包含旧的 X*；audit.log 应只包含本次新写入的 JSON 行
+        let rotated = std::fs::read_to_string(dir.join("audit.log.1")).unwrap();
+        assert!(rotated.starts_with('X'));
+        let current = std::fs::read_to_string(&file).unwrap();
+        let parsed: Value = serde_json::from_str(current.trim()).unwrap();
+        assert_eq!(parsed["action"], "rotate.test");
+    }
+
+    #[test]
+    fn maybe_rotate_does_not_panic_on_unwritable_path() {
+        // /proc 下不存在的父目录：metadata 返回 NotFound，应当 Ok 直接返回。
+        let cfg = AuditConfig {
+            enabled: true,
+            file: "/proc/this/path/should/not/exist/audit.log".to_string(),
+            rotate: true,
+            max_size_mb: 1,
+            max_backups: 3,
+        };
+        assert!(maybe_rotate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn rotated_files_remain_one_line_json() {
+        let dir = audit_dir("json-format");
+        let file = dir.join("audit.log");
+        let cfg = AuditConfig {
+            enabled: true,
+            file: file.to_string_lossy().to_string(),
+            rotate: true,
+            max_size_mb: 1,
+            max_backups: 2,
+        };
+        // 先写一些数据使其超过阈值
+        std::fs::write(&file, vec![b'1'; 1_572_864]).unwrap();
+        log_event(&cfg, "post.rotate", AuditResult::Ok, json!({"k": "v"}));
+        // 当前 audit.log 必须是一行 JSON
+        let content = std::fs::read_to_string(&file).unwrap();
+        let trimmed = content.trim_end_matches('\n');
+        assert!(
+            !trimmed.contains('\n'),
+            "audit.log must be one JSON line: {content:?}"
+        );
+        let _: Value = serde_json::from_str(trimmed).unwrap();
     }
 }
