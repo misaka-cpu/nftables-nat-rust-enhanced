@@ -210,6 +210,13 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
                 info!("no rules configured, waiting for config changes");
             }
             let mut last_good_state = LastGoodState::load(&last_good_config.file);
+            prune_last_good_state_for_runtime_cells(
+                &last_good_config,
+                &audit_config,
+                &mut last_good_state,
+                &nat_cells,
+                "ddns.loop",
+            );
             let resolution_log = ResolutionLog::new();
             let script = match build_new_script(
                 &nat_cells,
@@ -325,6 +332,13 @@ pub(crate) fn refresh_once(args: &Args) -> Result<(), io::Error> {
     }
     let nat_cells = parse_conf(args).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut last_good_state = LastGoodState::load(&runtime_config.last_good.file);
+    prune_last_good_state_for_runtime_cells(
+        &runtime_config.last_good,
+        &runtime_config.audit,
+        &mut last_good_state,
+        &nat_cells,
+        "ddns.refresh",
+    );
     let resolution_log = ResolutionLog::new();
     let script = build_new_script(
         &nat_cells,
@@ -385,6 +399,41 @@ pub(crate) fn refresh_once(args: &Args) -> Result<(), io::Error> {
 
 // v0.6.1：audit_resolution_events 已搬到 `runtime` 模块。
 use runtime::audit_resolution_events;
+
+fn prune_last_good_state_for_runtime_cells(
+    last_good_config: &LastGoodConfig,
+    audit_config: &AuditConfig,
+    state: &mut LastGoodState,
+    nat_cells: &[config::RuntimeCell],
+    trigger: &str,
+) {
+    if !last_good_config.enabled {
+        return;
+    }
+    let identities = config::last_good_identities_from_runtime_cells(nat_cells);
+    let result = state.prune_stale_rules(&identities);
+    if !result.changed {
+        return;
+    }
+    match state.save(&last_good_config.file) {
+        Ok(()) => audit::log_event(
+            audit_config,
+            "last_good.prune",
+            AuditResult::Ok,
+            serde_json::json!({
+                "trigger": trigger,
+                "file": last_good_config.file,
+                "before": result.before,
+                "after": result.after,
+                "removed": result.removed,
+            }),
+        ),
+        Err(e) => warn!(
+            "清理 stale last-good 缓存失败 ({}): {e}",
+            last_good_config.file
+        ),
+    }
+}
 
 struct RuntimeConfig {
     dns: DnsConfig,
@@ -2611,13 +2660,12 @@ refresh_interval_seconds = 123
     // ===== last-good 容错与 audit 集成测试 =====
 
     fn unresolvable_domain_cell() -> Vec<config::RuntimeCell> {
-        // 包含 fake-ip 段（198.18.0.0/15），DnsConfig::default() 默认 reject_fake_ip=true，
-        // 即直接拒绝；用作"DNS 失败"模拟，无需真实 DNS 查询。
+        // 包含空格的目标会被系统解析器直接拒绝；用作"DNS 失败"模拟，无需真实 DNS 查询。
         vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
             enabled: true,
             sport: 30080,
             dport: 80,
-            domain: "198.19.184.4".to_string(),
+            domain: "invalid domain".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
             comment: Some("dns-fail-test".to_string()),
@@ -2628,14 +2676,19 @@ refresh_interval_seconds = 123
         })]
     }
 
+    fn unresolvable_domain_rule_key() -> String {
+        "single|sport=30080|dport=80|protocol=tcp|ip_version=ipv4|target=invalid domain".to_string()
+    }
+
     #[test]
     fn last_good_fallback_emits_rule_when_cache_has_ip() {
         let cells = unresolvable_domain_cell();
         let mut state = LastGoodState::default();
         state.rules.push(nat_common::last_good::LastGoodRule {
             rule_id: "r0".to_string(),
+            rule_key: Some(unresolvable_domain_rule_key()),
             comment: Some("dns-fail-test".to_string()),
-            domain: "198.19.184.4".to_string(),
+            domain: "invalid domain".to_string(),
             last_good_ip: "10.100.0.10".to_string(),
             last_resolved_at: chrono::Utc::now(),
             egress_allowed: true,
@@ -2708,8 +2761,9 @@ refresh_interval_seconds = 123
         let mut state = LastGoodState::default();
         state.rules.push(nat_common::last_good::LastGoodRule {
             rule_id: "r0".to_string(),
+            rule_key: Some(unresolvable_domain_rule_key()),
             comment: None,
-            domain: "198.19.184.4".to_string(),
+            domain: "invalid domain".to_string(),
             last_good_ip: "10.100.0.10".to_string(),
             last_resolved_at: chrono::Utc::now(),
             egress_allowed: true,
@@ -2742,8 +2796,9 @@ refresh_interval_seconds = 123
         let mut state = LastGoodState::default();
         state.rules.push(nat_common::last_good::LastGoodRule {
             rule_id: "r0".to_string(),
+            rule_key: Some(unresolvable_domain_rule_key()),
             comment: None,
-            domain: "198.19.184.4".to_string(),
+            domain: "invalid domain".to_string(),
             last_good_ip: "10.100.0.10".to_string(),
             last_resolved_at: chrono::Utc::now(),
             egress_allowed: true,
@@ -2777,8 +2832,9 @@ refresh_interval_seconds = 123
         let mut state = LastGoodState::default();
         state.rules.push(nat_common::last_good::LastGoodRule {
             rule_id: "r0".to_string(),
+            rule_key: Some(unresolvable_domain_rule_key()),
             comment: None,
-            domain: "198.19.184.4".to_string(),
+            domain: "invalid domain".to_string(),
             last_good_ip: "8.8.8.8".to_string(),
             last_resolved_at: chrono::Utc::now(),
             egress_allowed: true,
@@ -2836,6 +2892,7 @@ refresh_interval_seconds = 123
         let events = vec![
             ResolutionEvent::LastGoodUsed {
                 rule_id: "r0".to_string(),
+                rule_key: Some("k0".to_string()),
                 comment: Some("hk".to_string()),
                 domain: "example.com".to_string(),
                 ip: "1.2.3.4".to_string(),
@@ -2843,12 +2900,14 @@ refresh_interval_seconds = 123
             },
             ResolutionEvent::EgressSkipped {
                 rule_id: "r1".to_string(),
+                rule_key: Some("k1".to_string()),
                 comment: None,
                 ip: "8.8.8.8".to_string(),
                 source: nat_common::last_good::ResolveSource::LastGood,
             },
             ResolutionEvent::ResolveFailedNoCache {
                 rule_id: "r2".to_string(),
+                rule_key: Some("k2".to_string()),
                 comment: None,
                 domain: "broken.invalid".to_string(),
                 original_error: "nx".to_string(),

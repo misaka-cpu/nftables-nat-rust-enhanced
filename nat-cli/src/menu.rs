@@ -10,7 +10,7 @@ use nat_common::{
     TrafficMode,
     audit::{self, AuditResult},
     format_cli_time_from_rfc3339_with, format_cli_time_with, forward_test, geoip,
-    last_good::LastGoodState,
+    last_good::{self, LastGoodPruneResult, LastGoodState},
     quota, stats as traffic_stats,
     uninstall::{self, DataMode, UninstallTarget},
 };
@@ -924,6 +924,7 @@ fn delete_rule_interactive(path: &str) -> Result<(), io::Error> {
     }
     delete_rule(&mut config, index).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     save_toml_config(path, &config, "rule.delete")?;
+    prune_last_good_cache_after_rule_delete(path, &config);
     audit_cli(
         path,
         "rule.delete",
@@ -933,6 +934,52 @@ fn delete_rule_interactive(path: &str) -> Result<(), io::Error> {
     println!("已删除规则。");
     print_config_saved_hint(path, "rule.delete");
     Ok(())
+}
+
+fn prune_last_good_cache_after_rule_delete(path: &str, config: &TomlConfig) {
+    match prune_last_good_cache_for_config(config) {
+        Ok(Some(result)) => {
+            audit_cli(
+                path,
+                "last_good.prune",
+                AuditResult::Ok,
+                json!({
+                    "trigger": "rule.delete",
+                    "file": config.last_good.file,
+                    "before": result.before,
+                    "after": result.after,
+                    "removed": result.removed,
+                }),
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                "rule.delete 后清理 stale last-good 缓存失败 ({}): {e}",
+                config.last_good.file
+            );
+            eprintln!(
+                "WARN: 清理 stale last-good 缓存失败（{}）：{e}",
+                config.last_good.file
+            );
+        }
+    }
+}
+
+fn prune_last_good_cache_for_config(
+    config: &TomlConfig,
+) -> io::Result<Option<LastGoodPruneResult>> {
+    if !config.last_good.enabled {
+        return Ok(None);
+    }
+    let mut state = LastGoodState::try_load(&config.last_good.file)?;
+    let identities = last_good::identities_from_rules(&config.rules);
+    let result = state.prune_stale_rules(&identities);
+    if !result.changed {
+        return Ok(None);
+    }
+    state.save(&config.last_good.file)?;
+    Ok(Some(result))
 }
 
 /// 配置保存后的提示。
@@ -4967,6 +5014,139 @@ domain = "example.com"
     }
 
     #[test]
+    fn rule_delete_prunes_last_good_cache_and_writes_audit() {
+        use nat_common::last_good::LastGoodRule;
+
+        let dir = safe_write_dir("rule-delete-last-good-prune");
+        let config_path = dir.join("nat.toml");
+        let last_good_path = dir.join("last-good-state.json");
+        let audit_path = dir.join("audit.log");
+        let mut config = TomlConfig::from_toml_str(
+            r#"
+[[rules]]
+type = "single"
+sport = 30080
+dport = 80
+domain = "a.example.com"
+protocol = "tcp"
+ip_version = "ipv4"
+
+[[rules]]
+type = "single"
+sport = 30081
+dport = 81
+domain = "b.example.com"
+protocol = "tcp"
+ip_version = "ipv4"
+
+[[rules]]
+type = "single"
+sport = 30082
+dport = 82
+domain = "c.example.com"
+protocol = "tcp"
+ip_version = "ipv4"
+"#,
+        )
+        .unwrap();
+        config.last_good.file = last_good_path.to_string_lossy().to_string();
+        config.audit = nat_common::AuditConfig {
+            enabled: true,
+            file: audit_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let before = last_good::identities_from_rules(&config.rules);
+        let state = LastGoodState {
+            last_success_at: None,
+            rules: vec![
+                LastGoodRule {
+                    rule_id: "r0".to_string(),
+                    rule_key: Some(before[0].rule_key.clone()),
+                    comment: None,
+                    domain: "a.example.com".to_string(),
+                    last_good_ip: "10.0.0.1".to_string(),
+                    last_resolved_at: chrono::Utc::now(),
+                    egress_allowed: true,
+                    last_apply_status: "ok".to_string(),
+                },
+                LastGoodRule {
+                    rule_id: "r1".to_string(),
+                    rule_key: Some(before[1].rule_key.clone()),
+                    comment: None,
+                    domain: "b.example.com".to_string(),
+                    last_good_ip: "10.0.0.2".to_string(),
+                    last_resolved_at: chrono::Utc::now(),
+                    egress_allowed: true,
+                    last_apply_status: "ok".to_string(),
+                },
+                LastGoodRule {
+                    rule_id: "r2".to_string(),
+                    rule_key: Some(before[2].rule_key.clone()),
+                    comment: None,
+                    domain: "c.example.com".to_string(),
+                    last_good_ip: "10.0.0.3".to_string(),
+                    last_resolved_at: chrono::Utc::now(),
+                    egress_allowed: true,
+                    last_apply_status: "ok".to_string(),
+                },
+            ],
+            last_good_nft_hash: None,
+        };
+        state.save(last_good_path.to_str().unwrap()).unwrap();
+
+        delete_rule(&mut config, 1).unwrap();
+        std::fs::write(&config_path, config.to_toml_string().unwrap()).unwrap();
+        prune_last_good_cache_after_rule_delete(config_path.to_str().unwrap(), &config);
+
+        let pruned = LastGoodState::load(last_good_path.to_str().unwrap());
+        assert_eq!(pruned.rules.len(), 2);
+        assert!(pruned.lookup_by_key(&before[1].rule_key).is_none());
+        let c = pruned.lookup_by_key(&before[2].rule_key).unwrap();
+        assert_eq!(c.rule_id, "r1");
+        assert_eq!(c.last_good_ip, "10.0.0.3");
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(audit.contains("\"action\":\"last_good.prune\""));
+        assert!(audit.contains("\"removed\":1"));
+    }
+
+    #[test]
+    fn corrupt_last_good_prune_is_nonfatal_for_rule_delete() {
+        let dir = safe_write_dir("rule-delete-last-good-corrupt");
+        let config_path = dir.join("nat.toml");
+        let last_good_path = dir.join("last-good-state.json");
+        let audit_path = dir.join("audit.log");
+        let mut config = TomlConfig::from_toml_str(
+            r#"
+[[rules]]
+type = "single"
+sport = 30080
+dport = 80
+domain = "a.example.com"
+"#,
+        )
+        .unwrap();
+        config.last_good.file = last_good_path.to_string_lossy().to_string();
+        config.audit = nat_common::AuditConfig {
+            enabled: true,
+            file: audit_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        std::fs::write(&config_path, config.to_toml_string().unwrap()).unwrap();
+        std::fs::write(&last_good_path, "{not-json").unwrap();
+
+        prune_last_good_cache_after_rule_delete(config_path.to_str().unwrap(), &config);
+
+        assert_eq!(
+            std::fs::read_to_string(&last_good_path).unwrap(),
+            "{not-json"
+        );
+        assert!(
+            !audit_path.exists(),
+            "损坏 last-good 文件只应 WARN，不应写成功 prune audit"
+        );
+    }
+
+    #[test]
     fn validates_inputs() {
         assert!(parse_port("0").is_err());
         assert!(parse_port("65536").is_err());
@@ -5721,6 +5901,10 @@ domain = "example.com"
             ),
             rules: vec![LastGoodRule {
                 rule_id: "r0".to_string(),
+                rule_key: Some(
+                    "single|sport=30080|dport=443|protocol=tcp|ip_version=ipv4|target=example.com"
+                        .to_string(),
+                ),
                 comment: Some("hk-out".to_string()),
                 domain: "example.com".to_string(),
                 last_good_ip: "1.2.3.4".to_string(),
@@ -6459,6 +6643,10 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             ),
             rules: vec![LastGoodRule {
                 rule_id: "r0".to_string(),
+                rule_key: Some(
+                    "single|sport=30080|dport=443|protocol=tcp|ip_version=ipv4|target=example.com"
+                        .to_string(),
+                ),
                 comment: Some("hk-out".to_string()),
                 domain: "example.com".to_string(),
                 last_good_ip: "1.2.3.4".to_string(),
@@ -6514,6 +6702,10 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             ),
             rules: vec![LastGoodRule {
                 rule_id: "r0".to_string(),
+                rule_key: Some(
+                    "single|sport=30080|dport=443|protocol=tcp|ip_version=ipv4|target=example.com"
+                        .to_string(),
+                ),
                 comment: None,
                 domain: "example.com".to_string(),
                 last_good_ip: "1.2.3.4".to_string(),

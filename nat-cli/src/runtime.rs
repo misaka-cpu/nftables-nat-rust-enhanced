@@ -180,6 +180,7 @@ pub(crate) fn audit_resolution_events(audit_config: &AuditConfig, events: &[Reso
                 domain,
                 ip,
                 original_error,
+                ..
             } => {
                 audit::log_event(
                     audit_config,
@@ -199,6 +200,7 @@ pub(crate) fn audit_resolution_events(audit_config: &AuditConfig, events: &[Reso
                 comment,
                 domain,
                 original_error,
+                ..
             } => {
                 audit::log_event(
                     audit_config,
@@ -217,6 +219,7 @@ pub(crate) fn audit_resolution_events(audit_config: &AuditConfig, events: &[Reso
                 comment,
                 ip,
                 source,
+                ..
             } => {
                 audit::log_event(
                     audit_config,

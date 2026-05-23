@@ -103,21 +103,33 @@ impl NftCellBuilder for NftCell {
                 let id_str = rule_index
                     .map(|i| format!("r{i}"))
                     .unwrap_or_else(|| "unknown".to_string());
+                let rule_key = last_good::rule_key_for_cell(self);
 
                 // 域名解析：先 live；失败时按配置回退到 last-good 缓存
                 let (dst_ip, source) = match ip::remote_ip_with_dns(domain, ip_version, dns_config)
                 {
                     Ok(ip) => {
-                        resolution_log.record(ResolutionEvent::LiveResolved {
-                            rule_id: id_str.clone(),
-                            comment: user_comment.clone(),
-                            domain: domain.clone(),
-                            ip: ip.clone(),
-                        });
+                        if let Some(rule_key) = &rule_key {
+                            resolution_log.record(ResolutionEvent::LiveResolved {
+                                rule_id: id_str.clone(),
+                                rule_key: Some(rule_key.clone()),
+                                comment: user_comment.clone(),
+                                domain: domain.clone(),
+                                ip: ip.clone(),
+                            });
+                        }
                         (ip, ResolveSource::Live)
                     }
                     Err(e) => {
-                        match last_good::fallback_ip(last_good_config, last_good_state, &id_str) {
+                        match rule_key.as_deref().and_then(|rule_key| {
+                            last_good::fallback_ip_for_rule(
+                                last_good_config,
+                                last_good_state,
+                                &id_str,
+                                rule_key,
+                                domain,
+                            )
+                        }) {
                             Some(cached)
                                 if matches_ip_version(&cached.last_good_ip, ip_version) =>
                             {
@@ -127,6 +139,7 @@ impl NftCellBuilder for NftCell {
                                 );
                                 resolution_log.record(ResolutionEvent::LastGoodUsed {
                                     rule_id: id_str.clone(),
+                                    rule_key: rule_key.clone(),
                                     comment: user_comment.clone(),
                                     domain: domain.clone(),
                                     ip: cached.last_good_ip.clone(),
@@ -140,6 +153,7 @@ impl NftCellBuilder for NftCell {
                                 );
                                 resolution_log.record(ResolutionEvent::ResolveFailedNoCache {
                                     rule_id: id_str.clone(),
+                                    rule_key: rule_key.clone(),
                                     comment: user_comment.clone(),
                                     domain: domain.clone(),
                                     original_error: e.to_string(),
@@ -158,6 +172,7 @@ impl NftCellBuilder for NftCell {
                     );
                     resolution_log.record(ResolutionEvent::EgressSkipped {
                         rule_id: id_str.clone(),
+                        rule_key: rule_key.clone(),
                         comment: user_comment.clone(),
                         ip: dst_ip.clone(),
                         source,
@@ -876,6 +891,23 @@ pub fn read_toml_config(toml_path: &str) -> Result<Vec<RuntimeCell>, io::Error> 
     }
 
     Ok(cells)
+}
+
+pub(crate) fn last_good_identities_from_runtime_cells(
+    cells: &[RuntimeCell],
+) -> Vec<last_good::LastGoodRuleIdentity> {
+    let mut identities = Vec::new();
+    let mut rule_index = 0usize;
+    for cell in cells {
+        if let RuntimeCell::Rule(rule) = cell {
+            let rule_id = format!("r{rule_index}");
+            rule_index += 1;
+            if let Some(identity) = last_good::identity_for_rule(&rule_id, rule) {
+                identities.push(identity);
+            }
+        }
+    }
+    identities
 }
 
 // TOML配置示例函数
