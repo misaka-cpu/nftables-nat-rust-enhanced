@@ -3986,8 +3986,10 @@ pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) 
 
     lines.push("6. 结论".to_string());
     lines.extend(connectivity_conclusion_lines(
+        report.rule,
         report.rule_enabled,
         report.nat_service,
+        report.last_apply.state,
         &report.nft,
         report.target_tcp,
     ));
@@ -4013,8 +4015,10 @@ fn target_udp_label(rule: &forward_test::TestableRule) -> &'static str {
 }
 
 pub(crate) fn connectivity_conclusion_lines(
+    rule: &forward_test::TestableRule,
     rule_enabled: bool,
     nat_service: NatServiceStatus,
+    last_apply: LastApplyState,
     nft: &NftConnectivityStatus,
     target_tcp: Option<bool>,
 ) -> Vec<String> {
@@ -4034,6 +4038,21 @@ pub(crate) fn connectivity_conclusion_lines(
             return lines;
         }
     }
+    match last_apply {
+        LastApplyState::Success => {}
+        LastApplyState::Fail => {
+            lines.push("- ⚠️ 最近 apply 失败，请检查 nat.service 日志。".to_string());
+            return lines;
+        }
+        LastApplyState::Unknown => {
+            lines.push("- ⚠️ 最近 apply 状态未知，请结合 nat.service 日志确认。".to_string());
+            return lines;
+        }
+        LastApplyState::NotChecked => {
+            lines.push("- ⚠️ 最近 apply 未检查。".to_string());
+            return lines;
+        }
+    }
     if target_tcp == Some(false) {
         lines.push("- ⚠️ 目标不可达，请检查目标 IP/端口、防火墙、目标服务。".to_string());
         return lines;
@@ -4042,7 +4061,16 @@ pub(crate) fn connectivity_conclusion_lines(
         NftConnectivityStatus::Checked { verdict, .. } => match verdict {
             forward_test::NftDetectionVerdict::Applied
             | forward_test::NftDetectionVerdict::AppliedRedirect => {
-                lines.push("- ✅ 看起来正常".to_string());
+                if target_tcp_ok_for_conclusion(rule, target_tcp) {
+                    lines.push("- ✅ 服务端配置、nft 应用和目标连通性看起来正常".to_string());
+                    lines.push(format!(
+                        "- ℹ️ 最终入口可用性仍建议从另一台外部机器访问 SERVER_IP:{} 验证",
+                        rule.sport
+                    ));
+                } else {
+                    lines
+                        .push("- ⚠️ 目标 TCP 连通性未确认，请检查解析结果或目标服务。".to_string());
+                }
             }
             forward_test::NftDetectionVerdict::Partial => {
                 lines.push("- ⚠️ 规则已保存，但 nft 只部分匹配。".to_string());
@@ -4061,8 +4089,17 @@ pub(crate) fn connectivity_conclusion_lines(
             lines.push("- ⚠️ 规则未启用，不会生成 nft。".to_string());
         }
     }
-    lines.push("- ⚠️ 需要从外部机器测试入口端口。".to_string());
     lines
+}
+
+fn target_tcp_ok_for_conclusion(
+    rule: &forward_test::TestableRule,
+    target_tcp: Option<bool>,
+) -> bool {
+    if rule.protocol == "udp" {
+        return true;
+    }
+    target_tcp == Some(true)
 }
 
 /// 「测试转发规则连通性」结果页的简短外部访问提示。默认只显示必要信息，不再大段列出
@@ -6116,6 +6153,10 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
         }
     }
 
+    fn conclusion_text(lines: &str) -> &str {
+        lines.split("6. 结论").nth(1).unwrap_or(lines)
+    }
+
     #[test]
     fn connectivity_report_active_applied_reachable_concludes_ok() {
         let rule = sample_testable_rule("93.184.216.34", "tcp");
@@ -6131,7 +6172,30 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
         assert!(lines.contains("- nat.service：active"));
         assert!(lines.contains("- 检测结论：已应用"));
         assert!(lines.contains("- 目标 TCP：可达"));
-        assert!(lines.contains("✅ 看起来正常"));
+        let conclusion = conclusion_text(&lines);
+        assert!(conclusion.contains("✅ 服务端配置、nft 应用和目标连通性看起来正常"));
+        assert!(conclusion.contains("ℹ️ 最终入口可用性仍建议"));
+        assert!(
+            !conclusion.contains("⚠️"),
+            "正常结论不应把外部机器测试建议展示为 warning: {conclusion}"
+        );
+    }
+
+    #[test]
+    fn connectivity_report_udp_applied_uses_info_not_warning_for_external_validation() {
+        let rule = sample_testable_rule("93.184.216.34", "udp");
+        let report = sample_connectivity_report(
+            &rule,
+            true,
+            NatServiceStatus::Active,
+            checked_nft_status(nat_common::forward_test::NftDetectionVerdict::Applied),
+            None,
+        );
+        let lines = render_connectivity_report_lines(&report).join("\n");
+        let conclusion = conclusion_text(&lines);
+        assert!(conclusion.contains("✅ 服务端配置、nft 应用和目标连通性看起来正常"));
+        assert!(conclusion.contains("ℹ️ 最终入口可用性仍建议"));
+        assert!(!conclusion.contains("⚠️"));
     }
 
     #[test]
@@ -6145,10 +6209,11 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             Some(true),
         );
         let lines = render_connectivity_report_lines(&report).join("\n");
-        assert!(lines.contains("检测器尚未确认应用"));
+        let conclusion = conclusion_text(&lines);
+        assert!(conclusion.contains("⚠️ 规则已保存，但 nft 检测器尚未确认应用"));
         assert!(
-            !lines.contains("nft 尚未确认应用"),
-            "Unconfirmed 应归因为检测器未确认，不应判死为未应用: {lines}"
+            !conclusion.contains("nft 尚未确认应用"),
+            "Unconfirmed 应归因为检测器未确认，不应判死为未应用: {conclusion}"
         );
     }
 
@@ -6164,7 +6229,24 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
         );
         let lines = render_connectivity_report_lines(&report).join("\n");
         assert!(lines.contains("- nat.service：inactive"));
-        assert!(lines.contains("nat.service 未运行，请先检查 systemctl status nat"));
+        assert!(
+            conclusion_text(&lines)
+                .contains("⚠️ nat.service 未运行，请先检查 systemctl status nat")
+        );
+    }
+
+    #[test]
+    fn connectivity_report_target_tcp_unreachable_still_warns() {
+        let rule = sample_testable_rule("93.184.216.34", "tcp");
+        let report = sample_connectivity_report(
+            &rule,
+            true,
+            NatServiceStatus::Active,
+            checked_nft_status(nat_common::forward_test::NftDetectionVerdict::Applied),
+            Some(false),
+        );
+        let lines = render_connectivity_report_lines(&report).join("\n");
+        assert!(conclusion_text(&lines).contains("⚠️ 目标不可达"));
     }
 
     #[test]
@@ -6179,7 +6261,7 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
         );
         let lines = render_connectivity_report_lines(&report).join("\n");
         assert!(lines.contains("- 规则：disabled"));
-        assert!(lines.contains("规则未启用，不会生成 nft"));
+        assert!(conclusion_text(&lines).contains("⚠️ 规则未启用，不会生成 nft"));
     }
 
     #[test]

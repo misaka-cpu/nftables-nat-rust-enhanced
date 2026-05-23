@@ -4,7 +4,7 @@
 
 > 命名约定：项目正式名为 **`nftables-nat-rust-enhanced`**（GitHub 仓库、安装命令、release 资产、README 标题、systemd 服务路径、配置 / 数据 / 日志目录均保持此名）；CLI 主菜单标题为简称 **`nft-nat-rust`**，仅用于交互界面显示。两者指向同一项目，未来不会重命名仓库或破坏安装/数据路径。
 
-当前稳定版本：**v0.7.0**（维护性重构版本）。详见下面 [v0.7.0](#v070) 段落。
+当前稳定版本：**v0.7.1**（v0.7.x CLI 与文档小修版本）。v0.7.0 维护性重构详见下面 [v0.7.0](#v070) 段落。
 
 核心原则：
 
@@ -599,10 +599,10 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release
 ```
 
-指定版本（推荐使用当前稳定版 `v0.7.0`，或省略 `--version` 跟随 latest release）：
+指定版本（推荐使用当前稳定版 `v0.7.1`，或省略 `--version` 跟随 latest release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.7.0 --enter-menu
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.7.1
 ```
 
 不指定 `--version` 时使用 latest release。release 包是核心 CLI 版本，包含：
@@ -646,13 +646,13 @@ nat --menu
 nat --version
 ```
 
-release 构建会显示 GitHub tag，例如 `v0.7.0`。源码编译如果没有注入 tag，会回退到 `Cargo.toml` 的 workspace version；两者都缺失时显示 `dev`，不会输出空字符串。
+release 构建会显示 GitHub tag，例如 `v0.7.1`。源码编译如果没有注入 tag，会回退到 `Cargo.toml` 的 workspace version；两者都缺失时显示 `dev`，不会输出空字符串。
 
 菜单（v0.4.2 起标题携带当前版本号，未注入版本时显示 `nft-nat-rust dev`）：
 
 ```text
 ====================================
-nft-nat-rust v0.7.0
+nft-nat-rust v0.7.1
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
@@ -694,7 +694,7 @@ nft-nat-rust v0.7.0
 - 若检测器未找到，但 `nat.service` 仍 active 且最近一次 `apply.success`，会显示 `未确认` 而不是 `未应用`，并提示用户手动查看：`nft list table ip self-nat` / `journalctl -u nat -n 120 --no-pager`
 - 不会因检测未确认就自动重启 nat、也不会绕过 safe apply 直接 `nft -f`
 
-测试页面按层展示含义：配置状态说明规则是否 enabled、目标是域名还是 IP、实时 resolved_ip 与 last-good 来源；服务状态说明 `nat.service` 与最近 apply；nft 应用状态说明 `self-nat` / `self-filter` 是否被检测器确认；目标连通性只表示本机到目标 TCP 的探测结果；外部访问测试仍需要从另一台机器访问 `SERVER_IP:入口端口`。
+测试页面按层展示含义：配置状态说明规则是否 enabled、目标是域名还是 IP、实时 resolved_ip 与 last-good 来源；服务状态说明 `nat.service` 与最近 apply；nft 应用状态说明 `self-nat` / `self-filter` 是否被检测器确认；目标连通性只表示本机到目标 TCP 的探测结果；外部访问测试仍需要从另一台机器访问 `SERVER_IP:入口端口`。服务端检查正常时，外部机器测试只是最终入口验证建议，不代表服务端配置异常。
 
 CLI 默认只展示简短测试提示（`SERVER_IP:入口端口` + 协议提示），详细 `curl` / `nc` / SNI 示例可在测试页面**输入 h 查看**。详细命令会按规则的 `protocol` 与 `target` 分支：
 - `protocol=tcp` 显示 TCP `nc` 与 `curl`，IP 目标不附 `Host` header；
@@ -877,10 +877,10 @@ journalctl -u nat -f
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release
 ```
 
-指定版本（推荐使用当前稳定版 `v0.7.0`，或省略 `--version` 跟随 latest release）：
+指定版本（推荐使用当前稳定版 `v0.7.1`，或省略 `--version` 跟随 latest release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.7.0
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.7.1
 ```
 
 CLI 更新：
@@ -1005,7 +1005,7 @@ bash install.sh --core-only --build-from-source
 可指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.7.0
+bash install.sh --core-only --use-release --version v0.7.1
 bash install.sh --core-only --build-from-source
 ```
 
