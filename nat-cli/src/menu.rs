@@ -3409,7 +3409,7 @@ fn toggle_mss_clamp_interactive(config_path: &str) -> Result<(), io::Error> {
         config.mss_clamp.enabled = false;
     } else {
         println!(
-            "提示：MSS clamp 适合多跳 / 隧道 / po0 / MTU 异常场景；不懂 MTU/MSS 时不建议随意开启。"
+            "提示：MSS clamp 适合多跳 / 隧道 / 私有网络链路 / MTU 异常场景；不懂 MTU/MSS 时不建议随意开启。"
         );
         if !confirm("启用 MSS clamp? [y/N]: ")? {
             println!("已取消");
