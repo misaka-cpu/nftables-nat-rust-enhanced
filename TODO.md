@@ -72,6 +72,50 @@
 
 v0.7.x 阶段不接收新功能 PR；以下都是「可选维护项」，按需推进，不许诺时间。
 
+## 可选设计：规则级备用目标 failover
+
+当前版本不实现 failover；本节只是设计备忘，避免未来直接堆重功能。
+
+目标：
+
+一个入口规则可以配置主目标和备用目标。当主目标连续检测失败时，切换到备用目标；当主目标恢复后，可选切回。
+
+示例设计，不实现：
+
+```toml
+[[rules]]
+sport = 30080
+target = "primary.example.com"
+dport = 443
+
+[[rules.failover_targets]]
+target = "backup1.example.com"
+dport = 443
+priority = 10
+
+[[rules.failover_targets]]
+target = "backup2.example.com"
+dport = 443
+priority = 20
+```
+
+设计原则：
+
+1. 默认不实现，不进入当前版本功能。
+2. 如果未来实现，必须继续遵守：
+   - 不做负载均衡
+   - 不做多出口调度
+   - 不做健康检查高频循环
+   - 不做用户态 relay
+   - 不引入数据库
+3. 只考虑轻量 failover：
+   - 主目标失败 N 次后切备用
+   - 恢复检测低频执行
+   - 切换必须写 audit
+   - egress_control 必须重新验证备用目标 IP
+   - last-good 不得绕过 egress_control
+4. 当前版本不实现 failover；不改配置 parser，不改 nft 规则生成，不改 safe apply。
+
 ### 1. 继续拆分 `menu.rs` 剩余大块逻辑
 
 **现状**：`menu.rs` 在 v0.7.0 拆出 `menu/update.rs` / `menu/audit_view.rs` / `menu/backup.rs` 后仍有约 6100 行，主要剩下规则增删改、stats / quota 子菜单、access_control / GeoIP / egress 子菜单、Telegram 配置、高级网络（SNAT / MSS / 时间 / NTP）、测试连通性等。

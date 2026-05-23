@@ -17,6 +17,82 @@
 
 > **Docker v28 兼容例外**：项目原则上只管理 `self-*` 表，**唯一已知**会触碰非 self-* 表的兼容处理是：启动时检测到 `ip filter FORWARD` 或 `ip6 filter FORWARD` 的默认 policy 是 `drop`（Docker v28 在某些版本会这样设置），会写入 `chain ip(6) filter FORWARD { policy accept ; }`，否则转发链路会被默认 drop。这是一次性兼容修正，不修改链中的规则，也不接管 forward policy。如果你不希望本项目触碰这条策略，请确保 `ip filter FORWARD` 的 policy 在 nat.service 启动前已经是 `accept`。
 
+## 典型使用场景
+
+本项目是 CLI-first / core-only 的 nftables NAT 管理器，只做 Linux nftables DNAT / SNAT 规则管理；不做 TLS 解密，不终止 HTTPS，不做应用层协议封装。
+
+### 1. 普通公网端口转发
+
+```text
+客户端
+  ↓
+VPS 入口端口
+  ↓ nft DNAT/SNAT
+目标服务
+```
+
+适合：
+
+- 固定 IP 目标
+- 固定端口
+- 个人自用转发
+
+### 2. DDNS / 域名目标转发
+
+```text
+客户端
+  ↓
+VPS 入口端口
+  ↓
+DDNS 域名解析到目标 IP
+  ↓
+目标服务
+```
+
+说明：
+
+- 域名解析成功后更新规则
+- DNS 失败时可用 last-good IP 兜底
+- last-good 不会绕过 egress_control
+
+### 3. 国内入口 / po0 / RFC1918 出口机
+
+```text
+客户端
+  ↓
+入口机
+  ↓ nft DNAT/SNAT
+po0 / 内网出口机
+  ↓
+目标服务
+```
+
+说明：
+
+- 推荐开启 egress_control，只允许转发到固定出口机 IP / 网段
+- 如需固定源地址，可使用 SNAT fixed
+- SNAT=off 仅适合已经配置好回程路由的高级用户
+
+### 4. 安全固定目标转发
+
+客户端来源限制：
+
+- access_control 白名单 / 黑名单
+- GeoIP / CN IP 来源限制
+
+目标限制：
+
+- egress_control allowed_target_cidrs
+
+说明：
+
+- access_control / GeoIP 限制“谁能访问入口”
+- egress_control 限制“本机能转发到哪里”
+- 两者不是同一个概念
+- 同时开启时应叠加限制，不是互相绕过
+
+如果用 HTTPS 做外部测试，证书 / SNI 取决于客户端访问域名和目标服务证书；本项目不终止 TLS，也不替目标服务处理证书。
+
 ## v0.7.0
 
 v0.7.0 是**维护性重构版本**，重点是降低代码复杂度、提升后续维护稳定性，不新增用户侧大功能。所有核心转发、安全 apply、quota、stats、last-good、GeoIP、egress_control、access_control、SNAT、MSS 行为均与 v0.6.x 完全一致。
@@ -605,6 +681,8 @@ nft-nat-rust v0.7.0
 
 `查看当前转发规则` 默认只展示每条规则的核心字段（index / 状态 / type / sport / target / resolved / dport / protocol / ip_version / access_control / quota / egress），以及一行组合策略摘要和一行 last-good 摘要。可在页面尾部输入 `d` 展开完整组合策略 + 完整 last-good 状态缓存；按 Enter 直接返回主菜单。
 
+添加单端口 / 端口段转发时，CLI 会尽力使用 `ss -lntup` 检测入口端口是否已被本机 TCP / UDP 监听服务占用。发现占用时默认取消添加，用户明确输入 `y` 后才会继续保存，并写入 `port_conflict.override` audit 事件。若系统没有 `ss` 或检测命令失败，只显示 warning，不阻塞添加，也不会自动安装依赖、kill 进程或修改已有服务。
+
 `查看审计日志` 显示最近 50 行 audit 事件。默认以 CLI 友好格式（按 Asia/Shanghai / `[ui].timezone` 展示时间），可在子菜单切换查看原始 JSON。文件路径默认 `audit.file = /var/log/nftables-nat-rust-audit.log`，可用 `tail -F` / `grep` 直接查看。
 
 `测试转发规则连通性` v0.4.2 起改用更宽松的 nft 规则存在性检测：
@@ -612,15 +690,17 @@ nft-nat-rust v0.7.0
 - 同时扫描 `ip self-nat / ip self-filter / ip6 self-nat / ip6 self-filter`
 - 不依赖 counter 非零（避免「规则刚 apply 还没流量」时误报「未应用」）
 - protocol=all 时同时识别 `meta l4proto { tcp, udp }` 与拆分形式
-- 结论分四档：`已应用` / `部分匹配` / `未确认` / `未应用`
+- nft 检测结论分四档：`已应用` / `部分匹配` / `未确认` / `未应用`
 - 若检测器未找到，但 `nat.service` 仍 active 且最近一次 `apply.success`，会显示 `未确认` 而不是 `未应用`，并提示用户手动查看：`nft list table ip self-nat` / `journalctl -u nat -n 120 --no-pager`
 - 不会因检测未确认就自动重启 nat、也不会绕过 safe apply 直接 `nft -f`
+
+测试页面按层展示含义：配置状态说明规则是否 enabled、目标是域名还是 IP、实时 resolved_ip 与 last-good 来源；服务状态说明 `nat.service` 与最近 apply；nft 应用状态说明 `self-nat` / `self-filter` 是否被检测器确认；目标连通性只表示本机到目标 TCP 的探测结果；外部访问测试仍需要从另一台机器访问 `SERVER_IP:入口端口`。
 
 CLI 默认只展示简短测试提示（`SERVER_IP:入口端口` + 协议提示），详细 `curl` / `nc` / SNI 示例可在测试页面**输入 h 查看**。详细命令会按规则的 `protocol` 与 `target` 分支：
 - `protocol=tcp` 显示 TCP `nc` 与 `curl`，IP 目标不附 `Host` header；
 - `protocol=udp` 仅显示 UDP `nc -vzu` 提示，并提醒最终需用业务客户端验证；
 - 目标是域名时附 `Host` header 与 `--connect-to ... SNI` 示例。
-这些命令只用于外部连通性测试，与 GeoIP / last-good / egress_control 等准入功能是不同模块。
+这些命令只用于外部连通性测试，与 GeoIP / last-good / egress_control 等准入功能是不同模块。HTTPS 测试中的证书 / SNI 取决于客户端访问域名和目标服务证书；本项目不终止 TLS。
 
 `GeoIP / CN IP 限制` 子菜单包含：查看状态、下载 / 更新 CN IP set、启用或禁用转发端口 CN 限制、启用或禁用 SSH CN 限制（需要输入 `CONFIRM`）、设置 SSH 端口、设置更新间隔。
 

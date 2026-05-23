@@ -10,7 +10,7 @@ use nat_common::{
     TrafficMode,
     audit::{self, AuditResult},
     format_cli_time_from_rfc3339_with, format_cli_time_with, forward_test, geoip,
-    last_good::{LastGoodState, ResolveSource},
+    last_good::LastGoodState,
     quota, stats as traffic_stats,
     uninstall::{self, DataMode, UninstallTarget},
 };
@@ -553,6 +553,22 @@ fn add_single_interactive(path: &str) -> Result<(), io::Error> {
     let ip_version = parse_ip_version(&prompt("IP 版本 ipv4/ipv6/all [ipv4]: ")?)?;
     let comment = parse_optional_comment(&prompt("comment，可为空: ")?);
 
+    let conflict_override = match confirm_port_conflict_override_interactive(sport, sport)? {
+        PortConflictAction::Proceed {
+            override_conflicts,
+            warning,
+        } => {
+            if let Some(warning) = warning {
+                println!("warning: {warning}");
+            }
+            override_conflicts
+        }
+        PortConflictAction::Cancel => {
+            println!("已取消添加规则。");
+            return Ok(());
+        }
+    };
+
     let mut config = load_toml_config(path)?;
     add_single_rule(
         &mut config,
@@ -565,6 +581,7 @@ fn add_single_interactive(path: &str) -> Result<(), io::Error> {
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     save_toml_config(path, &config, "rule.add.single")?;
+    audit_port_conflict_override(path, sport, sport, protocol, &conflict_override);
     audit_cli(
         path,
         "rule.add",
@@ -590,6 +607,23 @@ fn add_range_interactive(path: &str) -> Result<(), io::Error> {
     let ip_version = parse_ip_version(&prompt("IP 版本 ipv4/ipv6/all [ipv4]: ")?)?;
     let comment = parse_optional_comment(&prompt("comment，可为空: ")?);
 
+    let conflict_override = match confirm_port_conflict_override_interactive(port_start, port_end)?
+    {
+        PortConflictAction::Proceed {
+            override_conflicts,
+            warning,
+        } => {
+            if let Some(warning) = warning {
+                println!("warning: {warning}");
+            }
+            override_conflicts
+        }
+        PortConflictAction::Cancel => {
+            println!("已取消添加端口段规则。");
+            return Ok(());
+        }
+    };
+
     let mut config = load_toml_config(path)?;
     add_range_rule(
         &mut config,
@@ -602,6 +636,7 @@ fn add_range_interactive(path: &str) -> Result<(), io::Error> {
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     save_toml_config(path, &config, "rule.add.range")?;
+    audit_port_conflict_override(path, port_start, port_end, protocol, &conflict_override);
     audit_cli(
         path,
         "rule.add",
@@ -617,6 +652,253 @@ fn add_range_interactive(path: &str) -> Result<(), io::Error> {
     println!("已添加端口段规则。当前模型会转发到目标同端口段。");
     print_config_saved_hint(path, "rule.add.range");
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PortConflict {
+    pub protocol: String,
+    pub state: String,
+    pub local_addr: String,
+    pub port: u16,
+    pub process: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PortConflictCheck {
+    Clear,
+    Conflicts(Vec<PortConflict>),
+    Unavailable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PortConflictAction {
+    Proceed {
+        override_conflicts: Vec<PortConflict>,
+        warning: Option<String>,
+    },
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PortConflictCommandOutput {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+fn confirm_port_conflict_override_interactive(
+    port_start: u16,
+    port_end: u16,
+) -> Result<PortConflictAction, io::Error> {
+    match check_listening_port_conflicts(port_start, port_end) {
+        PortConflictCheck::Clear => Ok(PortConflictAction::Proceed {
+            override_conflicts: Vec::new(),
+            warning: None,
+        }),
+        PortConflictCheck::Unavailable(warning) => Ok(PortConflictAction::Proceed {
+            override_conflicts: Vec::new(),
+            warning: Some(warning),
+        }),
+        PortConflictCheck::Conflicts(conflicts) => {
+            for line in port_conflict_warning_lines(port_start, port_end, &conflicts) {
+                println!("{line}");
+            }
+            let confirm = prompt("是否仍继续？[y/N] ")?;
+            Ok(port_conflict_action_from_answer(conflicts, &confirm))
+        }
+    }
+}
+
+pub(crate) fn check_listening_port_conflicts(port_start: u16, port_end: u16) -> PortConflictCheck {
+    check_listening_port_conflicts_with(port_start, port_end, || {
+        Command::new("ss")
+            .arg("-lntup")
+            .output()
+            .map(|output| PortConflictCommandOutput {
+                success: output.status.success(),
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            })
+    })
+}
+
+pub(crate) fn check_listening_port_conflicts_with<F>(
+    port_start: u16,
+    port_end: u16,
+    run_ss: F,
+) -> PortConflictCheck
+where
+    F: FnOnce() -> Result<PortConflictCommandOutput, io::Error>,
+{
+    match run_ss() {
+        Ok(output) if output.success => {
+            let conflicts = parse_ss_listening_conflicts(&output.stdout, port_start, port_end);
+            if conflicts.is_empty() {
+                PortConflictCheck::Clear
+            } else {
+                PortConflictCheck::Conflicts(conflicts)
+            }
+        }
+        Ok(output) => {
+            let stderr = output.stderr.trim();
+            let reason = if stderr.is_empty() {
+                "入口端口占用检测失败：ss 返回非零状态；将继续添加。".to_string()
+            } else {
+                format!("入口端口占用检测失败：{stderr}；将继续添加。")
+            };
+            PortConflictCheck::Unavailable(reason)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => PortConflictCheck::Unavailable(
+            "无法检测入口端口占用：未找到 ss 命令；将继续添加，不会自动安装 iproute2。".to_string(),
+        ),
+        Err(e) => {
+            PortConflictCheck::Unavailable(format!("入口端口占用检测失败：{e}；将继续添加。"))
+        }
+    }
+}
+
+pub(crate) fn parse_ss_listening_conflicts(
+    ss_output: &str,
+    port_start: u16,
+    port_end: u16,
+) -> Vec<PortConflict> {
+    let mut conflicts: Vec<PortConflict> = ss_output
+        .lines()
+        .filter_map(parse_ss_listening_line)
+        .filter(|entry| entry.port >= port_start && entry.port <= port_end)
+        .collect();
+    conflicts.sort_by(|a, b| {
+        a.port
+            .cmp(&b.port)
+            .then_with(|| a.protocol.cmp(&b.protocol))
+            .then_with(|| a.local_addr.cmp(&b.local_addr))
+    });
+    conflicts
+}
+
+fn parse_ss_listening_line(line: &str) -> Option<PortConflict> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() < 5 {
+        return None;
+    }
+    let protocol = fields[0];
+    if !(protocol.starts_with("tcp") || protocol.starts_with("udp")) {
+        return None;
+    }
+    let local_addr = fields[4];
+    let port = parse_port_from_ss_local_addr(local_addr)?;
+    let process_raw = if fields.len() > 6 {
+        fields[6..].join(" ")
+    } else {
+        String::new()
+    };
+    Some(PortConflict {
+        protocol: protocol.to_string(),
+        state: fields[1].to_string(),
+        local_addr: local_addr.to_string(),
+        port,
+        process: extract_ss_process_name(&process_raw).unwrap_or_else(|| "-".to_string()),
+    })
+}
+
+fn parse_port_from_ss_local_addr(local_addr: &str) -> Option<u16> {
+    let (_, port) = local_addr.rsplit_once(':')?;
+    if port == "*" {
+        return None;
+    }
+    port.parse::<u16>().ok()
+}
+
+fn extract_ss_process_name(raw: &str) -> Option<String> {
+    let start = raw.find('"')?;
+    let rest = &raw[start + 1..];
+    let end = rest.find('"')?;
+    let name = &rest[..end];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+pub(crate) fn port_conflict_warning_lines(
+    port_start: u16,
+    port_end: u16,
+    conflicts: &[PortConflict],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if port_start == port_end {
+        lines.push(format!("检测到入口端口 {port_start} 已被本机服务监听："));
+    } else {
+        lines.push(format!(
+            "检测到入口端口段 {port_start}-{port_end} 内已有本机服务监听："
+        ));
+    }
+    for conflict in conflicts.iter().take(10) {
+        lines.push(format!(
+            "{} {} {} process={}",
+            conflict.protocol, conflict.state, conflict.local_addr, conflict.process
+        ));
+    }
+    if conflicts.len() > 10 {
+        lines.push(format!(
+            "... 还有 {} 个监听项未显示。",
+            conflicts.len() - 10
+        ));
+    }
+    lines.push("继续添加可能导致转发不可用。".to_string());
+    lines
+}
+
+pub(crate) fn port_conflict_action_from_answer(
+    conflicts: Vec<PortConflict>,
+    answer: &str,
+) -> PortConflictAction {
+    if matches!(answer.trim(), "y" | "Y") {
+        PortConflictAction::Proceed {
+            override_conflicts: conflicts,
+            warning: None,
+        }
+    } else {
+        PortConflictAction::Cancel
+    }
+}
+
+fn audit_port_conflict_override(
+    path: &str,
+    port_start: u16,
+    port_end: u16,
+    protocol: Protocol,
+    conflicts: &[PortConflict],
+) {
+    if conflicts.is_empty() {
+        return;
+    }
+    let preview: Vec<serde_json::Value> = conflicts
+        .iter()
+        .take(10)
+        .map(|conflict| {
+            json!({
+                "protocol": conflict.protocol,
+                "state": conflict.state,
+                "local_addr": conflict.local_addr,
+                "port": conflict.port,
+                "process": conflict.process,
+            })
+        })
+        .collect();
+    audit_cli(
+        path,
+        "port_conflict.override",
+        AuditResult::Warn,
+        json!({
+            "port_start": port_start,
+            "port_end": port_end,
+            "protocol": protocol.to_string(),
+            "conflict_count": conflicts.len(),
+            "conflicts_preview": preview,
+        }),
+    );
 }
 
 fn delete_rule_interactive(path: &str) -> Result<(), io::Error> {
@@ -3199,21 +3481,142 @@ pub(crate) fn parse_mss_size(value: &str) -> Result<u16, io::Error> {
 
 // v0.6.1：update 相关函数与 UpdatePlan 已搬到 `menu/update.rs`，菜单顶部已 use 进来。
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NatServiceStatus {
+    Active,
+    Inactive,
+    Failed,
+    Unknown,
+    NotChecked,
+}
+
+impl NatServiceStatus {
+    fn label(self) -> &'static str {
+        match self {
+            NatServiceStatus::Active => "active",
+            NatServiceStatus::Inactive => "inactive",
+            NatServiceStatus::Failed => "failed",
+            NatServiceStatus::Unknown => "unknown",
+            NatServiceStatus::NotChecked => "未检查（规则未启用）",
+        }
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, NatServiceStatus::Active)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LastApplyState {
+    Success,
+    Fail,
+    Unknown,
+    NotChecked,
+}
+
+impl LastApplyState {
+    fn label(self) -> &'static str {
+        match self {
+            LastApplyState::Success => "success",
+            LastApplyState::Fail => "fail",
+            LastApplyState::Unknown => "unknown",
+            LastApplyState::NotChecked => "未检查（规则未启用）",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LastApplyDisplay {
+    pub state: LastApplyState,
+    pub time_label: Option<String>,
+}
+
+impl LastApplyDisplay {
+    fn not_checked() -> Self {
+        Self {
+            state: LastApplyState::NotChecked,
+            time_label: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeState {
+    Found,
+    Missing,
+    NotApplicable,
+}
+
+impl ProbeState {
+    fn label(self) -> &'static str {
+        match self {
+            ProbeState::Found => "已找到",
+            ProbeState::Missing => "未找到",
+            ProbeState::NotApplicable => "不适用",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NftConnectivityStatus {
+    Checked {
+        self_nat: ProbeState,
+        self_filter: ProbeState,
+        verdict: nat_common::forward_test::NftDetectionVerdict,
+        counters: Option<nat_common::forward_test::RuleTestCounters>,
+        counter_warning: Option<String>,
+    },
+    Unconfirmed {
+        reason: String,
+    },
+    SkippedDisabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuleResolutionDisplay {
+    pub target_kind: String,
+    pub resolved_ip_label: String,
+    pub last_good_label: String,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectivityReport<'a> {
+    pub rule: &'a forward_test::TestableRule,
+    pub rule_enabled: bool,
+    pub resolution: RuleResolutionDisplay,
+    pub nat_service: NatServiceStatus,
+    pub last_apply: LastApplyDisplay,
+    pub nft: NftConnectivityStatus,
+    pub target_tcp: Option<bool>,
+    pub access_control_note: Option<String>,
+}
+
 fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
     let config = load_toml_config(path)?;
-    let rules = forward_test::list_testable_rules(&config);
+    let rules: Vec<_> = config
+        .rules
+        .iter()
+        .enumerate()
+        .filter_map(|(index, rule)| forward_test::rule_to_testable_rule(index, rule))
+        .collect();
     if rules.is_empty() {
-        if config.rules.iter().any(|rule| !rule.enabled()) {
-            println!("当前没有启用的可测试转发规则。");
-            println!("禁用规则不会应用到 nft，也不会出现在默认连通性测试列表。");
-        } else {
-            println!("当前没有可测试的转发规则");
-        }
+        println!("当前没有可测试的转发规则");
         wait_enter_to_return()?;
         return Ok(());
     }
     for rule in &rules {
-        println!("{}) {}", rule.index, rule.label);
+        let enabled = config
+            .rules
+            .get(rule.index)
+            .map(NftCell::enabled)
+            .unwrap_or(false);
+        println!(
+            "{}) [{}] {}",
+            rule.index,
+            if enabled { "enabled" } else { "disabled" },
+            rule.label
+        );
     }
     let index = parse_index(&prompt("请选择要测试的规则 index: ")?)?;
     let Some(rule) = rules.iter().find(|rule| rule.index == index) else {
@@ -3222,160 +3625,45 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
         return Ok(());
     };
 
-    println!("规则详情：");
-    println!("  type: {}", rule.r#type);
-    println!("  sport: {}", rule.sport);
-    println!("  target/domain: {}", rule.target);
-    println!(
-        "  resolved ip: {}",
-        rule.resolved_ip.as_deref().unwrap_or("解析失败或暂不可用")
-    );
-    let rule_id = format!("r{}", rule.index);
+    let rule_enabled = config
+        .rules
+        .get(rule.index)
+        .map(NftCell::enabled)
+        .unwrap_or(false);
     let last_good_state = LastGoodState::load(&config.last_good.file);
-    let cached = last_good_state.lookup(&rule_id);
-    match (rule.resolved_ip.as_deref(), cached) {
-        (Some(ip), Some(cached)) if ip == cached.last_good_ip => {
-            println!(
-                "  解析来源: {} (与 last-good 缓存一致)",
-                ResolveSource::Live.as_str()
-            );
-            println!(
-                "  上次成功解析时间: {}",
-                format_cli_time_with(cached.last_resolved_at, &config.ui)
-            );
-        }
-        (Some(_), Some(cached)) => {
-            println!(
-                "  解析来源: {} (实时解析，缓存中的旧 IP 为 {})",
-                ResolveSource::Live.as_str(),
-                cached.last_good_ip
-            );
-            println!(
-                "  上次成功解析时间: {}",
-                format_cli_time_with(cached.last_resolved_at, &config.ui)
-            );
-        }
-        (Some(_), None) => {
-            println!(
-                "  解析来源: {} (last-good 缓存中无此规则记录)",
-                ResolveSource::Live.as_str()
-            );
-        }
-        (None, Some(cached)) => {
-            println!(
-                "  解析来源: 当前实时解析失败；若 last_good.enabled=true 会回退到 last-good IP {}",
-                cached.last_good_ip
-            );
-            println!(
-                "  last-good 上次成功解析时间: {}",
-                format_cli_time_with(cached.last_resolved_at, &config.ui)
-            );
-            println!(
-                "  egress_control 判断: {}",
-                if cached.egress_allowed {
-                    "allowed"
-                } else {
-                    "blocked"
-                }
-            );
-        }
-        (None, None) => {
-            println!("  解析来源: 当前实时解析失败，且 last-good 缓存无记录，规则会被跳过");
-        }
-    }
-    if config.egress_control.enabled
-        && let Some(ip) = rule.resolved_ip.as_deref()
-    {
-        let allowed = config.egress_control.allows_ip(ip);
-        println!(
-            "  egress_control 判断: {} (live IP)",
-            if allowed { "allowed" } else { "blocked" }
+    let resolution = build_rule_resolution_display(&config, rule, &last_good_state);
+    let (nat_service, last_apply, nft, target_tcp) = if rule_enabled {
+        let nat_service = read_nat_service_status();
+        let last_apply = read_last_apply_display(&config);
+        let nft = read_nft_connectivity_status(
+            rule,
+            nat_service.is_active(),
+            last_apply.state == LastApplyState::Success,
         );
-    }
-    println!("  dport: {}", rule.dport);
-    println!("  protocol: {}", rule.protocol);
-    println!("  ip_version: {}", rule.ip_version);
-    println!("  access_control: {}", config.access_control.mode);
-    if !config.access_control.entries.is_empty() {
-        println!("  entries: {}", config.access_control.entries.join(", "));
-    }
-    if let Some(note) = forward_test::access_control_note(&config.access_control) {
-        println!("  提示: {note}");
-    }
-
-    // nat.service / nft 检测合并在 print_nft_detection_block 里输出，避免重复打印 active 状态。
-    let nat_active = is_nat_service_active();
-    let nft_json = read_nft_json_ruleset();
-    match nft_json {
-        Ok(json) => {
-            // 用新的 detect_rule_in_nft_json 做"规则是否存在"检测；旧的 parse_rule_counters
-            // 仅看 counter 值，会把"刚 apply 但还没流量"误判为未应用 —— 仍保留它用于显示 baseline。
-            let presence = forward_test::detect_rule_in_nft_json(&json, &rule.id);
-            let counters = forward_test::parse_rule_counters(&json, &rule.id);
-
-            // 查 audit log 最近一次 apply 事件，作为 Unconfirmed/NotApplied 的判定依据
-            let last_apply = audit::last_apply_event(&config.audit.file, 200);
-            let last_apply_success = matches!(&last_apply, Some((a, _)) if a == "apply.success");
-            let last_apply_label = match &last_apply {
-                Some((action, time)) if !time.is_empty() => {
-                    format!(
-                        "{action} @ {}",
-                        format_cli_time_from_rfc3339_with(time, &config.ui)
-                    )
-                }
-                Some((action, _)) => action.clone(),
-                None => "(无)".to_string(),
-            };
-
-            match presence {
-                Ok(presence) => {
-                    // v0.4.3：把 rule 的 nft 形态（Dnat / Redirect）传进 classify，
-                    // 避免 Redirect / localhost-Single 规则因没有 FORWARD counter 被误判为 Partial。
-                    let shape = forward_test::detect_rule_shape(rule);
-                    let verdict = forward_test::classify_nft_presence_with_shape(
-                        &presence,
-                        rule.ip_version.as_str(),
-                        rule.protocol.as_str(),
-                        shape,
-                        nat_active,
-                        last_apply_success,
-                    );
-                    print_nft_detection_block(
-                        &presence,
-                        verdict,
-                        rule,
-                        nat_active,
-                        last_apply_success,
-                        &last_apply_label,
-                        config.ddns.refresh_interval_seconds,
-                    );
-                }
-                Err(e) => {
-                    println!("nft 规则检测失败：{e}");
-                }
-            }
-
-            match counters {
-                Ok(c) => println!(
-                    "baseline counters: nat-rule={}B, out={}B, in={}B",
-                    c.nat_rule.bytes, c.out.bytes, c.r#in.bytes
-                ),
-                Err(e) => println!("读取 nft counter 失败: {e}"),
-            }
-        }
-        Err(e) => println!("读取 nft ruleset 失败: {e}"),
-    }
-
-    match forward_test::tcp_connect_target(rule, std::time::Duration::from_secs(3)) {
-        Some(true) => println!("目标 TCP: 可达，服务器到目标 TCP 端口可连接。"),
-        Some(false) => println!("目标 TCP: 不可达，请检查目标 IP/端口、防火墙、目标服务。"),
-        None => println!("目标 TCP: UDP/all 场景无法完全可靠判断，请结合外部访问和 counter。"),
-    }
-
-    println!();
-    for line in external_test_brief_lines(rule) {
+        let target_tcp = forward_test::tcp_connect_target(rule, std::time::Duration::from_secs(3));
+        (nat_service, last_apply, nft, target_tcp)
+    } else {
+        (
+            NatServiceStatus::NotChecked,
+            LastApplyDisplay::not_checked(),
+            NftConnectivityStatus::SkippedDisabled,
+            None,
+        )
+    };
+    let report = ConnectivityReport {
+        rule,
+        rule_enabled,
+        resolution,
+        nat_service,
+        last_apply,
+        nft,
+        target_tcp,
+        access_control_note: forward_test::access_control_note(&config.access_control),
+    };
+    for line in render_connectivity_report_lines(&report) {
         println!("{line}");
     }
+
     let choice = prompt("> ")?;
     if matches!(choice.trim(), "h" | "H") {
         println!();
@@ -3389,8 +3677,397 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
     Ok(())
 }
 
+fn build_rule_resolution_display(
+    config: &TomlConfig,
+    rule: &forward_test::TestableRule,
+    last_good_state: &LastGoodState,
+) -> RuleResolutionDisplay {
+    let target_is_ip = rule.target.parse::<std::net::IpAddr>().is_ok();
+    let target_kind = if target_is_ip { "IP" } else { "domain" }.to_string();
+    let resolved_ip_label = rule.resolved_ip.as_deref().unwrap_or("none").to_string();
+    let cached = last_good_state.lookup(&rule.id);
+    let mut notes = Vec::new();
+    let last_good_label = match (target_is_ip, rule.resolved_ip.as_deref(), cached) {
+        (true, Some(_), _) => "none (IP target)".to_string(),
+        (false, Some(ip), Some(cached)) if ip == cached.last_good_ip => {
+            notes.push(format!(
+                "last-good 上次成功解析时间：{}",
+                format_cli_time_with(cached.last_resolved_at, &config.ui)
+            ));
+            "live DNS (与 last-good 缓存一致)".to_string()
+        }
+        (false, Some(_), Some(cached)) => {
+            notes.push(format!("last-good 缓存旧 IP：{}", cached.last_good_ip));
+            notes.push(format!(
+                "last-good 上次成功解析时间：{}",
+                format_cli_time_with(cached.last_resolved_at, &config.ui)
+            ));
+            "live DNS".to_string()
+        }
+        (false, Some(_), None) => "live DNS".to_string(),
+        (false, None, Some(cached)) if config.last_good.enabled => {
+            notes.push(format!(
+                "last-good 上次成功解析时间：{}",
+                format_cli_time_with(cached.last_resolved_at, &config.ui)
+            ));
+            notes.push(format!(
+                "last-good egress_control 判断：{}",
+                if cached.egress_allowed {
+                    "allowed"
+                } else {
+                    "blocked"
+                }
+            ));
+            format!("last-good ({})", cached.last_good_ip)
+        }
+        (false, None, Some(_)) => "none (last-good disabled)".to_string(),
+        (false, None, None) => "none".to_string(),
+        (true, None, _) => "none".to_string(),
+    };
+    if config.egress_control.enabled
+        && let Some(ip) = rule.resolved_ip.as_deref()
+    {
+        notes.push(format!(
+            "live IP egress_control 判断：{}",
+            if config.egress_control.allows_ip(ip) {
+                "allowed"
+            } else {
+                "blocked"
+            }
+        ));
+    }
+    RuleResolutionDisplay {
+        target_kind,
+        resolved_ip_label,
+        last_good_label,
+        notes,
+    }
+}
+
+fn read_nat_service_status() -> NatServiceStatus {
+    match Command::new("systemctl")
+        .arg("is-active")
+        .arg("nat")
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            match stdout.trim() {
+                "active" => NatServiceStatus::Active,
+                "inactive" => NatServiceStatus::Inactive,
+                "failed" => NatServiceStatus::Failed,
+                _ if output.status.success() => NatServiceStatus::Active,
+                _ => NatServiceStatus::Unknown,
+            }
+        }
+        Err(_) => NatServiceStatus::Unknown,
+    }
+}
+
+fn read_last_apply_display(config: &TomlConfig) -> LastApplyDisplay {
+    match audit::last_apply_event(&config.audit.file, 200) {
+        Some((action, time)) => {
+            let state = match action.as_str() {
+                "apply.success" => LastApplyState::Success,
+                "apply.fail" => LastApplyState::Fail,
+                _ => LastApplyState::Unknown,
+            };
+            let time_label = if time.is_empty() {
+                None
+            } else {
+                Some(format_cli_time_from_rfc3339_with(&time, &config.ui))
+            };
+            LastApplyDisplay { state, time_label }
+        }
+        None => LastApplyDisplay {
+            state: LastApplyState::Unknown,
+            time_label: None,
+        },
+    }
+}
+
+fn read_nft_connectivity_status(
+    rule: &forward_test::TestableRule,
+    nat_active: bool,
+    last_apply_success: bool,
+) -> NftConnectivityStatus {
+    let json = match read_nft_json_ruleset() {
+        Ok(json) => json,
+        Err(e) => {
+            return NftConnectivityStatus::Unconfirmed {
+                reason: format!("读取 nft ruleset 失败：{e}"),
+            };
+        }
+    };
+    let presence = match forward_test::detect_rule_in_nft_json(&json, &rule.id) {
+        Ok(presence) => presence,
+        Err(e) => {
+            return NftConnectivityStatus::Unconfirmed {
+                reason: format!("nft 规则检测失败：{e}"),
+            };
+        }
+    };
+    let counters = match forward_test::parse_rule_counters(&json, &rule.id) {
+        Ok(counters) => (Some(counters), None),
+        Err(e) => (None, Some(format!("读取 nft counter 失败：{e}"))),
+    };
+    let shape = forward_test::detect_rule_shape(rule);
+    let verdict = forward_test::classify_nft_presence_with_shape(
+        &presence,
+        rule.ip_version.as_str(),
+        rule.protocol.as_str(),
+        shape,
+        nat_active,
+        last_apply_success,
+    );
+    let (self_nat, self_filter) = summarize_nft_probe_states(rule, &presence, shape);
+    NftConnectivityStatus::Checked {
+        self_nat,
+        self_filter,
+        verdict,
+        counters: counters.0,
+        counter_warning: counters.1,
+    }
+}
+
+fn summarize_nft_probe_states(
+    rule: &forward_test::TestableRule,
+    presence: &forward_test::NftRulePresence,
+    shape: forward_test::NftRuleShape,
+) -> (ProbeState, ProbeState) {
+    let nat_found = presence.nat_rule_v4_found || presence.nat_rule_v6_found;
+    let self_nat = if nat_found {
+        ProbeState::Found
+    } else {
+        ProbeState::Missing
+    };
+    if matches!(shape, forward_test::NftRuleShape::Redirect) {
+        return (self_nat, ProbeState::NotApplicable);
+    }
+    let need_v4 = matches!(rule.ip_version.as_str(), "ipv4" | "all");
+    let need_v6 = matches!(rule.ip_version.as_str(), "ipv6" | "all");
+    let filter_found = (need_v4 && (presence.forward_out_v4_found || presence.forward_in_v4_found))
+        || (need_v6 && (presence.forward_out_v6_found || presence.forward_in_v6_found));
+    let self_filter = if filter_found {
+        ProbeState::Found
+    } else {
+        ProbeState::Missing
+    };
+    (self_nat, self_filter)
+}
+
+pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("====================================".to_string());
+    lines.push("转发规则连通性测试".to_string());
+    lines.push("====================================".to_string());
+    lines.push(String::new());
+
+    lines.push("1. 配置状态".to_string());
+    lines.push(format!(
+        "- 规则：{}",
+        if report.rule_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    ));
+    lines.push("- 配置文件：已保存".to_string());
+    lines.push(format!(
+        "- 入口：{} / {} / {}",
+        report.rule.sport, report.rule.protocol, report.rule.ip_version
+    ));
+    lines.push(format!(
+        "- 目标：{} {}:{}",
+        report.resolution.target_kind, report.rule.target, report.rule.dport
+    ));
+    lines.push(format!(
+        "- resolved_ip：{}",
+        report.resolution.resolved_ip_label
+    ));
+    lines.push(format!(
+        "- last-good：{}",
+        report.resolution.last_good_label
+    ));
+    for note in &report.resolution.notes {
+        lines.push(format!("- {note}"));
+    }
+    if !report.rule_enabled {
+        lines.push("- 提示：规则未启用，不会生成 nft。".to_string());
+    }
+    if let Some(note) = &report.access_control_note {
+        lines.push(format!("- access_control：{note}"));
+    }
+    lines.push(String::new());
+
+    lines.push("2. 服务状态".to_string());
+    lines.push(format!("- nat.service：{}", report.nat_service.label()));
+    lines.push(format!("- 最近 apply：{}", report.last_apply.state.label()));
+    lines.push(format!(
+        "- 最近 apply 时间：{}",
+        report.last_apply.time_label.as_deref().unwrap_or("unknown")
+    ));
+    match report.nat_service {
+        NatServiceStatus::Inactive => {
+            lines.push("- 提示：nat.service 未运行，请先检查 systemctl status nat。".to_string());
+        }
+        NatServiceStatus::Failed => {
+            lines.push(
+                "- 提示：nat.service 状态为 failed，请先检查 systemctl status nat。".to_string(),
+            );
+        }
+        _ => {}
+    }
+    lines.push(String::new());
+
+    lines.push("3. nft 应用状态".to_string());
+    match &report.nft {
+        NftConnectivityStatus::Checked {
+            self_nat,
+            self_filter,
+            verdict,
+            counters,
+            counter_warning,
+        } => {
+            lines.push(format!("- self-nat：{}", self_nat.label()));
+            lines.push(format!("- self-filter：{}", self_filter.label()));
+            lines.push(format!("- 检测结论：{}", verdict.label()));
+            if let Some(counters) = counters {
+                lines.push(format!(
+                    "- baseline counters：nat-rule={}B, out={}B, in={}B",
+                    counters.nat_rule.bytes, counters.out.bytes, counters.r#in.bytes
+                ));
+            }
+            if let Some(warning) = counter_warning {
+                lines.push(format!("- counter：{warning}"));
+            }
+            if matches!(verdict, forward_test::NftDetectionVerdict::Unconfirmed) {
+                lines
+                    .push("- 说明：检测器未确认当前规则，不等同于已经判定规则未应用。".to_string());
+            }
+        }
+        NftConnectivityStatus::Unconfirmed { reason } => {
+            lines.push("- self-nat：未确认".to_string());
+            lines.push("- self-filter：未确认".to_string());
+            lines.push("- 检测结论：未确认".to_string());
+            lines.push(format!("- 说明：{reason}"));
+        }
+        NftConnectivityStatus::SkippedDisabled => {
+            lines.push("- self-nat：未找到".to_string());
+            lines.push("- self-filter：未找到".to_string());
+            lines.push("- 检测结论：规则未启用，不会生成 nft".to_string());
+        }
+    }
+    lines.push(String::new());
+
+    lines.push("4. 目标连通性".to_string());
+    lines.push(format!(
+        "- 目标 TCP：{}",
+        target_tcp_label(report.rule, report.target_tcp)
+    ));
+    lines.push(format!("- 目标 UDP：{}", target_udp_label(report.rule)));
+    lines.push(String::new());
+
+    lines.push("5. 外部访问测试".to_string());
+    if report.rule_enabled {
+        lines.push(format!(
+            "- 请在另一台机器访问 SERVER_IP:{}",
+            report.rule.sport
+        ));
+        lines.push(format!(
+            "- 本机 curl 127.0.0.1:{} 通常不能完整验证 DNAT PREROUTING。",
+            report.rule.sport
+        ));
+        lines.push("- 输入 h 查看详细 curl / nc 示例，按 Enter 返回。".to_string());
+    } else {
+        lines.push("- 规则未启用，外部访问不会命中本项目 nft 规则。".to_string());
+    }
+    lines.push(String::new());
+
+    lines.push("6. 结论".to_string());
+    lines.extend(connectivity_conclusion_lines(
+        report.rule_enabled,
+        report.nat_service,
+        &report.nft,
+        report.target_tcp,
+    ));
+    lines
+}
+
+fn target_tcp_label(rule: &forward_test::TestableRule, target_tcp: Option<bool>) -> &'static str {
+    if rule.protocol == "udp" {
+        return "不适用";
+    }
+    match target_tcp {
+        Some(true) => "可达",
+        Some(false) => "不可达",
+        None => "不适用",
+    }
+}
+
+fn target_udp_label(rule: &forward_test::TestableRule) -> &'static str {
+    match rule.protocol.as_str() {
+        "udp" | "all" => "需业务客户端验证",
+        _ => "不适用",
+    }
+}
+
+pub(crate) fn connectivity_conclusion_lines(
+    rule_enabled: bool,
+    nat_service: NatServiceStatus,
+    nft: &NftConnectivityStatus,
+    target_tcp: Option<bool>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !rule_enabled {
+        lines.push("- ⚠️ 规则未启用，不会生成 nft。".to_string());
+        return lines;
+    }
+    match nat_service {
+        NatServiceStatus::Inactive | NatServiceStatus::Failed | NatServiceStatus::Unknown => {
+            lines.push("- ⚠️ nat.service 未运行，请先检查 systemctl status nat。".to_string());
+            return lines;
+        }
+        NatServiceStatus::Active => {}
+        NatServiceStatus::NotChecked => {
+            lines.push("- ⚠️ nat.service 未检查。".to_string());
+            return lines;
+        }
+    }
+    if target_tcp == Some(false) {
+        lines.push("- ⚠️ 目标不可达，请检查目标 IP/端口、防火墙、目标服务。".to_string());
+        return lines;
+    }
+    match nft {
+        NftConnectivityStatus::Checked { verdict, .. } => match verdict {
+            forward_test::NftDetectionVerdict::Applied
+            | forward_test::NftDetectionVerdict::AppliedRedirect => {
+                lines.push("- ✅ 看起来正常".to_string());
+            }
+            forward_test::NftDetectionVerdict::Partial => {
+                lines.push("- ⚠️ 规则已保存，但 nft 只部分匹配。".to_string());
+            }
+            forward_test::NftDetectionVerdict::Unconfirmed => {
+                lines.push("- ⚠️ 规则已保存，但 nft 检测器尚未确认应用。".to_string());
+            }
+            forward_test::NftDetectionVerdict::NotApplied => {
+                lines.push("- ⚠️ 规则已保存，但 nft 尚未确认应用。".to_string());
+            }
+        },
+        NftConnectivityStatus::Unconfirmed { .. } => {
+            lines.push("- ⚠️ 规则已保存，但 nft 检测器尚未确认应用。".to_string());
+        }
+        NftConnectivityStatus::SkippedDisabled => {
+            lines.push("- ⚠️ 规则未启用，不会生成 nft。".to_string());
+        }
+    }
+    lines.push("- ⚠️ 需要从外部机器测试入口端口。".to_string());
+    lines
+}
+
 /// 「测试转发规则连通性」结果页的简短外部访问提示。默认只显示必要信息，不再大段列出
 /// HTTP/TCP/HTTPS/SNI 示例；用户输入 h 后再展示完整命令。
+#[cfg(test)]
 pub(crate) fn external_test_brief_lines(rule: &forward_test::TestableRule) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push("外部访问测试：".to_string());
@@ -3433,6 +4110,9 @@ pub(crate) fn external_test_detailed_lines(rule: &forward_test::TestableRule) ->
                 lines.push(
                     "提示：目标是域名时建议带 Host header / SNI，以匹配后端虚拟主机。".to_string(),
                 );
+                lines.push(
+                    "提示：本项目不终止 TLS，不解密 HTTPS；证书 / SNI 取决于客户端访问域名和目标服务证书。".to_string(),
+                );
             } else {
                 lines.push(format!(
                     "HTTP 示例: curl -v http://SERVER_IP:{}/",
@@ -3458,6 +4138,7 @@ pub(crate) fn external_test_detailed_lines(rule: &forward_test::TestableRule) ->
 /// 把 v0.4.2 的 nft 规则检测结果打印成结构化区块。
 /// - 总是显示 self-nat / self-filter / protocol 子项，避免单一行误判。
 /// - verdict 是综合结论（已应用 / 部分匹配 / 未确认 / 未应用）。
+#[cfg(test)]
 fn print_nft_detection_block(
     presence: &nat_common::forward_test::NftRulePresence,
     verdict: nat_common::forward_test::NftDetectionVerdict,
@@ -3583,17 +4264,9 @@ fn print_nft_detection_block(
     }
 }
 
+#[cfg(test)]
 fn yes_no(found: bool) -> &'static str {
     if found { "已找到" } else { "未找到" }
-}
-
-fn is_nat_service_active() -> bool {
-    Command::new("systemctl")
-        .arg("is-active")
-        .arg("nat")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
 }
 
 fn read_nft_json_ruleset() -> Result<String, io::Error> {
@@ -4062,6 +4735,175 @@ mod tests {
         .unwrap();
         assert_eq!(config.rules.len(), 1);
         assert!(matches!(config.rules[0], NftCell::Range { .. }));
+    }
+
+    fn sample_port_conflict(port: u16) -> PortConflict {
+        PortConflict {
+            protocol: "tcp".to_string(),
+            state: "LISTEN".to_string(),
+            local_addr: format!("0.0.0.0:{port}"),
+            port,
+            process: "nginx".to_string(),
+        }
+    }
+
+    #[test]
+    fn port_conflict_single_unoccupied_passes_with_mock_ss() {
+        let output = r#"
+Netid State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+tcp   LISTEN 0      128    0.0.0.0:22         0.0.0.0:*     users:(("sshd",pid=100,fd=3))
+"#;
+        let check = check_listening_port_conflicts_with(30080, 30080, || {
+            Ok(PortConflictCommandOutput {
+                success: true,
+                stdout: output.to_string(),
+                stderr: String::new(),
+            })
+        });
+        assert_eq!(check, PortConflictCheck::Clear);
+    }
+
+    #[test]
+    fn port_conflict_single_occupied_prompts_and_default_rejects() {
+        let output = r#"
+Netid State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+tcp   LISTEN 0      128    0.0.0.0:30080      0.0.0.0:*     users:(("nginx",pid=101,fd=3))
+udp   UNCONN 0      0      0.0.0.0:30080      0.0.0.0:*     users:(("dnsmasq",pid=102,fd=4))
+"#;
+        let check = check_listening_port_conflicts_with(30080, 30080, || {
+            Ok(PortConflictCommandOutput {
+                success: true,
+                stdout: output.to_string(),
+                stderr: String::new(),
+            })
+        });
+        let PortConflictCheck::Conflicts(conflicts) = check else {
+            panic!("expected conflicts");
+        };
+        assert_eq!(conflicts.len(), 2);
+        let warning = port_conflict_warning_lines(30080, 30080, &conflicts).join("\n");
+        assert!(warning.contains("入口端口 30080"));
+        assert!(warning.contains("tcp LISTEN 0.0.0.0:30080 process=nginx"));
+        assert!(warning.contains("udp UNCONN 0.0.0.0:30080 process=dnsmasq"));
+        assert_eq!(
+            port_conflict_action_from_answer(conflicts, ""),
+            PortConflictAction::Cancel
+        );
+    }
+
+    #[test]
+    fn port_conflict_override_allows_rule_and_writes_audit() {
+        let conflicts = vec![sample_port_conflict(30080)];
+        let action = port_conflict_action_from_answer(conflicts.clone(), "y");
+        let mut config = TomlConfig::default();
+        match action {
+            PortConflictAction::Proceed {
+                override_conflicts, ..
+            } => {
+                add_single_rule(
+                    &mut config,
+                    30080,
+                    80,
+                    "example.com".to_string(),
+                    Protocol::Tcp,
+                    IpVersion::V4,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(override_conflicts, conflicts);
+            }
+            PortConflictAction::Cancel => panic!("expected override"),
+        }
+        assert_eq!(config.rules.len(), 1);
+
+        let dir = std::env::temp_dir().join(format!(
+            "nat-port-conflict-audit-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.log");
+        let toml_path = dir.join("nat.toml");
+        std::fs::write(
+            &toml_path,
+            format!(
+                r#"
+[audit]
+enabled = true
+file = "{}"
+"#,
+                audit_path.display()
+            ),
+        )
+        .unwrap();
+        audit_port_conflict_override(
+            toml_path.to_str().unwrap(),
+            30080,
+            30080,
+            Protocol::Tcp,
+            &conflicts,
+        );
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(audit.contains("port_conflict.override"));
+        assert!(audit.contains("\"conflict_count\":1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn port_conflict_reject_keeps_config_unchanged() {
+        let conflicts = vec![sample_port_conflict(30080)];
+        let action = port_conflict_action_from_answer(conflicts, "n");
+        let mut config = TomlConfig::default();
+        if let PortConflictAction::Proceed { .. } = action {
+            add_single_rule(
+                &mut config,
+                30080,
+                80,
+                "example.com".to_string(),
+                Protocol::Tcp,
+                IpVersion::V4,
+                None,
+            )
+            .unwrap();
+        }
+        assert!(config.rules.is_empty());
+    }
+
+    #[test]
+    fn port_conflict_ss_missing_warns_without_blocking() {
+        let check = check_listening_port_conflicts_with(30080, 30080, || {
+            Err(io::Error::new(io::ErrorKind::NotFound, "ss"))
+        });
+        let PortConflictCheck::Unavailable(reason) = check else {
+            panic!("expected unavailable");
+        };
+        assert!(reason.contains("未找到 ss 命令"));
+        assert!(reason.contains("将继续添加"));
+    }
+
+    #[test]
+    fn port_range_conflict_summary_shows_first_ten() {
+        let conflicts: Vec<PortConflict> = (30000..30012).map(sample_port_conflict).collect();
+        let lines = port_conflict_warning_lines(30000, 30020, &conflicts).join("\n");
+        assert!(lines.contains("入口端口段 30000-30020"));
+        assert!(lines.contains("0.0.0.0:30009"));
+        assert!(!lines.contains("0.0.0.0:30010 process=nginx"));
+        assert!(lines.contains("还有 2 个监听项未显示"));
+    }
+
+    #[test]
+    fn parses_port_range_conflicts_from_mock_ss_tcp_and_udp() {
+        let output = r#"
+Netid State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+tcp   LISTEN 0      128    0.0.0.0:30001      0.0.0.0:*     users:(("nginx",pid=101,fd=3))
+udp   UNCONN 0      0      [::]:30002         [::]:*        users:(("dnsmasq",pid=102,fd=4))
+tcp   LISTEN 0      128    127.0.0.1:40000    0.0.0.0:*     users:(("other",pid=103,fd=5))
+"#;
+        let conflicts = parse_ss_listening_conflicts(output, 30000, 30010);
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].port, 30001);
+        assert_eq!(conflicts[1].port, 30002);
+        assert_eq!(conflicts[1].protocol, "udp");
     }
 
     #[test]
@@ -4698,8 +5540,7 @@ domain = "example.com"
         let readme = include_str!("../../README.md");
         // 保存提示分流
         assert!(
-            readme.contains("无需等待 nft 应用")
-                && readme.contains("不影响 nft 规则的 reason"),
+            readme.contains("无需等待 nft 应用") && readme.contains("不影响 nft 规则的 reason"),
             "README 应说明 v0.6.1 配置保存提示按 reason 分流"
         );
         // script_hash 行为
@@ -5222,6 +6063,137 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             "apply.success @ 2026-05-19 20:00:00 CST",
             300,
         );
+    }
+
+    fn sample_resolution_display() -> RuleResolutionDisplay {
+        RuleResolutionDisplay {
+            target_kind: "IP".to_string(),
+            resolved_ip_label: "93.184.216.34".to_string(),
+            last_good_label: "none (IP target)".to_string(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn sample_last_apply_success() -> LastApplyDisplay {
+        LastApplyDisplay {
+            state: LastApplyState::Success,
+            time_label: Some("2026-05-19 20:00:00 CST".to_string()),
+        }
+    }
+
+    fn checked_nft_status(
+        verdict: nat_common::forward_test::NftDetectionVerdict,
+    ) -> NftConnectivityStatus {
+        NftConnectivityStatus::Checked {
+            self_nat: ProbeState::Found,
+            self_filter: ProbeState::Found,
+            verdict,
+            counters: Some(nat_common::forward_test::RuleTestCounters::default()),
+            counter_warning: None,
+        }
+    }
+
+    fn sample_connectivity_report<'a>(
+        rule: &'a nat_common::forward_test::TestableRule,
+        rule_enabled: bool,
+        nat_service: NatServiceStatus,
+        nft: NftConnectivityStatus,
+        target_tcp: Option<bool>,
+    ) -> ConnectivityReport<'a> {
+        ConnectivityReport {
+            rule,
+            rule_enabled,
+            resolution: sample_resolution_display(),
+            nat_service,
+            last_apply: if rule_enabled {
+                sample_last_apply_success()
+            } else {
+                LastApplyDisplay::not_checked()
+            },
+            nft,
+            target_tcp,
+            access_control_note: None,
+        }
+    }
+
+    #[test]
+    fn connectivity_report_active_applied_reachable_concludes_ok() {
+        let rule = sample_testable_rule("93.184.216.34", "tcp");
+        let report = sample_connectivity_report(
+            &rule,
+            true,
+            NatServiceStatus::Active,
+            checked_nft_status(nat_common::forward_test::NftDetectionVerdict::Applied),
+            Some(true),
+        );
+        let lines = render_connectivity_report_lines(&report).join("\n");
+        assert!(lines.contains("1. 配置状态"));
+        assert!(lines.contains("- nat.service：active"));
+        assert!(lines.contains("- 检测结论：已应用"));
+        assert!(lines.contains("- 目标 TCP：可达"));
+        assert!(lines.contains("✅ 看起来正常"));
+    }
+
+    #[test]
+    fn connectivity_report_unconfirmed_nft_with_reachable_target_does_not_claim_not_applied() {
+        let rule = sample_testable_rule("93.184.216.34", "tcp");
+        let report = sample_connectivity_report(
+            &rule,
+            true,
+            NatServiceStatus::Active,
+            checked_nft_status(nat_common::forward_test::NftDetectionVerdict::Unconfirmed),
+            Some(true),
+        );
+        let lines = render_connectivity_report_lines(&report).join("\n");
+        assert!(lines.contains("检测器尚未确认应用"));
+        assert!(
+            !lines.contains("nft 尚未确认应用"),
+            "Unconfirmed 应归因为检测器未确认，不应判死为未应用: {lines}"
+        );
+    }
+
+    #[test]
+    fn connectivity_report_inactive_service_tells_user_to_check_systemctl_status() {
+        let rule = sample_testable_rule("93.184.216.34", "tcp");
+        let report = sample_connectivity_report(
+            &rule,
+            true,
+            NatServiceStatus::Inactive,
+            checked_nft_status(nat_common::forward_test::NftDetectionVerdict::NotApplied),
+            None,
+        );
+        let lines = render_connectivity_report_lines(&report).join("\n");
+        assert!(lines.contains("- nat.service：inactive"));
+        assert!(lines.contains("nat.service 未运行，请先检查 systemctl status nat"));
+    }
+
+    #[test]
+    fn connectivity_report_disabled_rule_says_no_nft_generation() {
+        let rule = sample_testable_rule("93.184.216.34", "tcp");
+        let report = sample_connectivity_report(
+            &rule,
+            false,
+            NatServiceStatus::NotChecked,
+            NftConnectivityStatus::SkippedDisabled,
+            None,
+        );
+        let lines = render_connectivity_report_lines(&report).join("\n");
+        assert!(lines.contains("- 规则：disabled"));
+        assert!(lines.contains("规则未启用，不会生成 nft"));
+    }
+
+    #[test]
+    fn connectivity_report_keeps_h_entry_for_detailed_commands() {
+        let rule = sample_testable_rule("93.184.216.34", "tcp");
+        let report = sample_connectivity_report(
+            &rule,
+            true,
+            NatServiceStatus::Active,
+            checked_nft_status(nat_common::forward_test::NftDetectionVerdict::Applied),
+            Some(true),
+        );
+        let lines = render_connectivity_report_lines(&report).join("\n");
+        assert!(lines.contains("输入 h 查看详细 curl / nc 示例"));
     }
 
     // ============ v0.4.3 ============
