@@ -4,7 +4,7 @@
 
 > 命名约定：项目正式名为 **`nftables-nat-rust-enhanced`**（GitHub 仓库、安装命令、release 资产、README 标题、systemd 服务路径、配置 / 数据 / 日志目录均保持此名）；CLI 主菜单标题为简称 **`nft-nat-rust`**，仅用于交互界面显示。两者指向同一项目，未来不会重命名仓库或破坏安装/数据路径。
 
-当前稳定版本：**v0.7.1**（v0.7.x CLI 与文档小修版本）。v0.7.0 维护性重构详见下面 [v0.7.0](#v070) 段落。
+当前稳定版本：**v0.7.2**（v0.7.x CLI 与文档小修版本）。v0.7.0 维护性重构详见下面 [v0.7.0](#v070) 段落。
 
 核心原则：
 
@@ -599,10 +599,10 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release
 ```
 
-指定版本（推荐使用当前稳定版 `v0.7.1`，或省略 `--version` 跟随 latest release）：
+指定版本（推荐使用当前稳定版 `v0.7.2`，或省略 `--version` 跟随 latest release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.7.1
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.7.2
 ```
 
 不指定 `--version` 时使用 latest release。release 包是核心 CLI 版本，包含：
@@ -646,13 +646,19 @@ nat --menu
 nat --version
 ```
 
-release 构建会显示 GitHub tag，例如 `v0.7.1`。源码编译如果没有注入 tag，会回退到 `Cargo.toml` 的 workspace version；两者都缺失时显示 `dev`，不会输出空字符串。
+示例输出：
+
+```text
+nat v0.7.2
+```
+
+release 构建会显示 GitHub tag，例如 `v0.7.2`。源码编译如果没有注入 tag，会回退到 `Cargo.toml` 的 workspace version；两者都缺失时显示 `dev`，不会输出空字符串。
 
 菜单（v0.4.2 起标题携带当前版本号，未注入版本时显示 `nft-nat-rust dev`）：
 
 ```text
 ====================================
-nft-nat-rust v0.7.1
+nft-nat-rust v0.7.2
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
@@ -877,10 +883,10 @@ journalctl -u nat -f
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release
 ```
 
-指定版本（推荐使用当前稳定版 `v0.7.1`，或省略 `--version` 跟随 latest release）：
+指定版本（推荐使用当前稳定版 `v0.7.2`，或省略 `--version` 跟随 latest release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.7.1
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.7.2
 ```
 
 CLI 更新：
@@ -1005,7 +1011,7 @@ bash install.sh --core-only --build-from-source
 可指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.7.1
+bash install.sh --core-only --use-release --version v0.7.2
 bash install.sh --core-only --build-from-source
 ```
 
