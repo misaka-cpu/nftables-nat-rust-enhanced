@@ -917,7 +917,7 @@ fn delete_rule_interactive(path: &str) -> Result<(), io::Error> {
             "规则 index 超出范围",
         ));
     }
-    let confirm = prompt("危险操作：删除前会自动备份配置。确认删除? [y/N]: ")?;
+    let confirm = prompt("危险操作：确认删除该规则? [y/N]: ")?;
     if !matches!(confirm.as_str(), "y" | "Y") {
         println!("已取消删除");
         return Ok(());
@@ -942,7 +942,7 @@ fn delete_rule_interactive(path: &str) -> Result<(), io::Error> {
 ///   "无需等待 nft 应用"，避免误导用户。
 fn print_config_saved_hint(path: &str, reason: &str) {
     if reason_affects_nft(reason) {
-        print_nft_affecting_save_hint(path);
+        print_nft_affecting_save_hint(path, reason);
     } else {
         print_non_nft_save_hint(path, reason);
     }
@@ -976,8 +976,8 @@ pub(crate) fn reason_affects_nft(reason: &str) -> bool {
     )
 }
 
-fn print_nft_affecting_save_hint(path: &str) {
-    for line in format_nft_affecting_save_hint_lines(path) {
+fn print_nft_affecting_save_hint(path: &str, reason: &str) {
+    for line in format_nft_affecting_save_hint_lines(path, reason) {
         println!("{line}");
     }
 }
@@ -989,14 +989,19 @@ fn print_non_nft_save_hint(path: &str, reason: &str) {
 }
 
 /// 影响 nft 规则的保存提示文本（按行返回，便于单元测试断言）。
-pub(crate) fn format_nft_affecting_save_hint_lines(path: &str) -> Vec<String> {
+pub(crate) fn format_nft_affecting_save_hint_lines(path: &str, reason: &str) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push(format!(
-        "已安全保存配置到 {path}（备份 → 临时文件 + fsync → rename）。"
-    ));
-    lines.push(format!(
-        "备份目录：{CONFIG_BACKUP_DIR}/（按 reason 命名，权限 0600）。"
-    ));
+    if reason == "rule.delete" {
+        lines.push(format!("已安全保存配置到 {path}。"));
+        lines.push("本次操作为删除规则，已按策略跳过自动备份。".to_string());
+    } else {
+        lines.push(format!(
+            "已安全保存配置到 {path}（备份 → 临时文件 + fsync → rename）。"
+        ));
+        lines.push(format!(
+            "备份目录：{CONFIG_BACKUP_DIR}/（按 reason 命名，权限 0600）。"
+        ));
+    }
     lines.push("nat.service 通常会自动检测配置变化，并通过安全流程应用规则。".to_string());
     lines.push("安全流程包括：nft -c 检查、备份当前规则、应用失败自动回滚。".to_string());
     lines.push("本工具不会直接绕过安全流程执行 nft -f。".to_string());
@@ -5878,7 +5883,9 @@ refresh_interval_seconds = 120
 "#,
         )
         .unwrap();
-        let lines = format_nft_affecting_save_hint_lines(toml_path.to_str().unwrap()).join("\n");
+        let lines =
+            format_nft_affecting_save_hint_lines(toml_path.to_str().unwrap(), "rule.add.single")
+                .join("\n");
         assert!(
             lines.contains("nat.service 通常会自动检测配置变化"),
             "缺少 nat.service 自动应用文案: {lines}"
@@ -5895,6 +5902,36 @@ refresh_interval_seconds = 120
         assert!(
             lines.contains("120 秒"),
             "应从 TOML 中读取自定义 ddns 间隔: {lines}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rule_delete_save_hint_mentions_backup_skip_and_omits_backup_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "nat-hint-rule-delete-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml_path = dir.join("nat.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[ddns]
+refresh_interval_seconds = 120
+"#,
+        )
+        .unwrap();
+        let lines =
+            format_nft_affecting_save_hint_lines(toml_path.to_str().unwrap(), "rule.delete")
+                .join("\n");
+        assert!(lines.contains("已安全保存配置到"));
+        assert!(lines.contains("本次操作为删除规则，已按策略跳过自动备份。"));
+        assert!(lines.contains("nat.service 通常会自动检测配置变化"));
+        assert!(
+            !lines.contains("备份目录："),
+            "rule.delete 提示不应显示备份目录: {lines}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6966,14 +7003,18 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             file: audit_file.to_string_lossy().to_string(),
             ..Default::default()
         };
-        let backup_path = safe_write_config_to(
+        let backup_path = match safe_write_config_to(
             &backup_dir,
             &audit_cfg,
             target.to_str().unwrap(),
             "new = true\n",
             "telegram.toggle",
         )
-        .unwrap();
+        .unwrap()
+        {
+            Some(path) => path,
+            None => panic!("telegram.toggle should create backup"),
+        };
         // 目标文件已更新；备份目录里有按 reason 命名的 .bak
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new = true\n");
         assert!(backup_path.starts_with(&backup_dir));
@@ -6994,6 +7035,88 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
                 .any(|l| l.contains("config.write.success") && l.contains("telegram.toggle")),
             "缺少 config.write.success audit: {lines:?}"
         );
+    }
+
+    #[test]
+    fn safe_write_rule_delete_skips_backup_but_writes_atomically_and_audits() {
+        let dir = safe_write_dir("rule-delete-skip-backup");
+        let backup_dir = dir.join("backup");
+        let audit_file = dir.join("audit.log");
+        let target = dir.join("nat.toml");
+        std::fs::write(&target, "old = true\n").unwrap();
+        let audit_cfg = nat_common::AuditConfig {
+            enabled: true,
+            file: audit_file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let backup_path = safe_write_config_to(
+            &backup_dir,
+            &audit_cfg,
+            target.to_str().unwrap(),
+            "new = true\n",
+            "rule.delete",
+        )
+        .unwrap();
+        assert!(backup_path.is_none(), "rule.delete 不应返回备份路径");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new = true\n");
+        assert!(
+            !backup_dir.exists(),
+            "rule.delete 不应创建备份目录: {}",
+            backup_dir.display()
+        );
+        let raw = std::fs::read_to_string(&audit_file).unwrap();
+        assert!(raw.contains("\"action\":\"config.write.success\""));
+        assert!(raw.contains("\"reason\":\"rule.delete\""));
+        assert!(raw.contains("\"backup_skipped\":true"));
+        assert!(raw.contains("\"backup_skip_reason\":\"rule.delete\""));
+        assert!(
+            !raw.contains("\"backup\":"),
+            "rule.delete audit 不应写不存在的 backup 字段: {raw}"
+        );
+    }
+
+    fn assert_reason_still_creates_backup(reason: &str) {
+        let dir = safe_write_dir(&format!("backup-required-{reason}"));
+        let backup_dir = dir.join("backup");
+        let audit_file = dir.join("audit.log");
+        let target = dir.join("nat.toml");
+        std::fs::write(&target, "old = true\n").unwrap();
+        let audit_cfg = nat_common::AuditConfig {
+            enabled: true,
+            file: audit_file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let backup_path = safe_write_config_to(
+            &backup_dir,
+            &audit_cfg,
+            target.to_str().unwrap(),
+            "new = true\n",
+            reason,
+        )
+        .unwrap()
+        .unwrap_or_else(|| panic!("{reason} should create backup"));
+        assert!(backup_path.exists(), "{reason} backup should exist");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new = true\n");
+        let raw = std::fs::read_to_string(&audit_file).unwrap();
+        assert!(raw.contains("\"action\":\"config.write.success\""));
+        assert!(raw.contains(&format!("\"reason\":\"{reason}\"")));
+        assert!(raw.contains("\"backup\":"));
+        assert!(!raw.contains("\"backup_skipped\":true"));
+    }
+
+    #[test]
+    fn safe_write_rule_add_still_creates_backup() {
+        assert_reason_still_creates_backup("rule.add.single");
+    }
+
+    #[test]
+    fn safe_write_rule_toggle_still_creates_backup() {
+        assert_reason_still_creates_backup("rule.toggle");
+    }
+
+    #[test]
+    fn safe_write_telegram_config_update_still_creates_backup() {
+        assert_reason_still_creates_backup("telegram.config.update");
     }
 
     #[test]

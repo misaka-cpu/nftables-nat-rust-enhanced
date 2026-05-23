@@ -111,7 +111,10 @@ pub(crate) fn run_quota_check_with(
                     AuditResult::Ok,
                     serde_json::json!({
                         "toml_path": toml_path,
-                        "backup": backup_path.display().to_string(),
+                        "backup": backup_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
                         "changed_indices": changed_indices,
                     }),
                 );

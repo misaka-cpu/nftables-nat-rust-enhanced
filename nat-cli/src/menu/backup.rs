@@ -2,7 +2,7 @@
 //!
 //! 拆自 `nat-cli/src/menu.rs`（v0.6.1 维护性重构），行为未变。
 //!
-//! - `safe_write_config` / `safe_write_config_to`：备份 → 临时文件 + fsync → rename → audit
+//! - `safe_write_config` / `safe_write_config_to`：备份（rule.delete 跳过）→ 临时文件 + fsync → rename → audit
 //! - `save_toml_config` / `save_toml_config_from_string`：把 TomlConfig 序列化后走 safe_write
 //! - `backup_config_to` / `backup_config` / `backup_filename` / `list_config_backups`：备份相关
 //! - `sanitize_backup_reason`：把 reason 字符串约束到文件名安全字符集
@@ -26,7 +26,7 @@ pub(crate) fn save_toml_config(
     path: &str,
     config: &TomlConfig,
     reason: &str,
-) -> Result<PathBuf, io::Error> {
+) -> Result<Option<PathBuf>, io::Error> {
     let content = config
         .to_toml_string()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -37,17 +37,17 @@ pub(crate) fn save_toml_config_from_string(
     path: &str,
     content: &str,
     reason: &str,
-) -> Result<PathBuf, io::Error> {
+) -> Result<Option<PathBuf>, io::Error> {
     safe_write_config(path, content, reason)
 }
 
-/// 安全写 TOML 配置：备份 → tmp+fsync+rename → audit。
+/// 安全写 TOML 配置：备份（rule.delete 跳过）→ tmp+fsync+rename → audit。
 /// 备份目录使用 [`CONFIG_BACKUP_DIR`]；audit 从 `path` 解析 [`AuditConfig`]。
 pub(crate) fn safe_write_config(
     path: &str,
     content: &str,
     reason: &str,
-) -> Result<PathBuf, io::Error> {
+) -> Result<Option<PathBuf>, io::Error> {
     let audit_cfg = audit_config_from(path);
     safe_write_config_to(
         Path::new(CONFIG_BACKUP_DIR),
@@ -60,10 +60,11 @@ pub(crate) fn safe_write_config(
 
 /// 可注入备份目录与 audit 配置的 safe_write 内核；测试与 quota 自动禁用复用。
 ///
-/// - 备份失败 → 返回 Err，不覆盖旧文件，写 `config.write.fail` audit。
+/// - `reason == "rule.delete"` → 跳过备份，但仍原子写入并写 `backup_skipped=true` audit。
+/// - 其它 reason 备份失败 → 返回 Err，不覆盖旧文件，写 `config.write.fail` audit。
 /// - 临时文件写入或 rename 失败 → 返回 Err，旧文件保持不变，写 `config.write.fail` audit。
 ///   - rename 失败时 [`atomic::write_atomic`] 会清理 .tmp。
-/// - 成功 → 写 `config.write.success` audit，返回备份路径。
+/// - 成功 → 写 `config.write.success` audit，返回备份路径；跳过备份时返回 `None`。
 ///
 /// audit detail 不包含 TOML 内容本身、不包含 bot_token；只包含 reason / path / backup / error。
 pub(crate) fn safe_write_config_to(
@@ -72,50 +73,64 @@ pub(crate) fn safe_write_config_to(
     path: &str,
     content: &str,
     reason: &str,
-) -> Result<PathBuf, io::Error> {
-    let backup_path = match backup_config_to(backup_dir, path, reason) {
-        Ok(p) => p,
-        Err(e) => {
-            audit::log_event(
-                audit_cfg,
-                "config.write.fail",
-                AuditResult::Fail,
-                json!({
-                    "reason": reason,
-                    "path": path,
-                    "stage": "backup",
-                    "error": e.to_string(),
-                }),
-            );
-            return Err(e);
+) -> Result<Option<PathBuf>, io::Error> {
+    let backup_path = if skips_config_backup(reason) {
+        None
+    } else {
+        match backup_config_to(backup_dir, path, reason) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                audit::log_event(
+                    audit_cfg,
+                    "config.write.fail",
+                    AuditResult::Fail,
+                    json!({
+                        "reason": reason,
+                        "path": path,
+                        "stage": "backup",
+                        "error": e.to_string(),
+                    }),
+                );
+                return Err(e);
+            }
         }
     };
     if let Err(e) = atomic::write_atomic(path, content) {
-        audit::log_event(
-            audit_cfg,
-            "config.write.fail",
-            AuditResult::Fail,
-            json!({
-                "reason": reason,
-                "path": path,
-                "stage": "write_or_rename",
-                "backup": backup_path.display().to_string(),
-                "error": e.to_string(),
-            }),
-        );
+        let mut detail = json!({
+            "reason": reason,
+            "path": path,
+            "stage": "write_or_rename",
+            "error": e.to_string(),
+        });
+        if let Some(backup_path) = &backup_path {
+            detail["backup"] = json!(backup_path.display().to_string());
+        } else if skips_config_backup(reason) {
+            detail["backup_skipped"] = json!(true);
+            detail["backup_skip_reason"] = json!(reason);
+        }
+        audit::log_event(audit_cfg, "config.write.fail", AuditResult::Fail, detail);
         return Err(e);
     }
-    audit::log_event(
-        audit_cfg,
-        "config.write.success",
-        AuditResult::Ok,
+    let detail = if let Some(backup_path) = &backup_path {
         json!({
             "reason": reason,
             "path": path,
             "backup": backup_path.display().to_string(),
-        }),
-    );
+        })
+    } else {
+        json!({
+            "reason": reason,
+            "path": path,
+            "backup_skipped": true,
+            "backup_skip_reason": reason,
+        })
+    };
+    audit::log_event(audit_cfg, "config.write.success", AuditResult::Ok, detail);
     Ok(backup_path)
+}
+
+fn skips_config_backup(reason: &str) -> bool {
+    reason == "rule.delete"
 }
 
 /// `backup_config_to`：按 reason 命名备份并设 0600 权限。
