@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 pub mod atomic;
 pub mod audit;
+pub mod dynamic_whitelist;
 pub mod forward_test;
 pub mod geoip;
 pub mod hash;
@@ -375,6 +376,8 @@ pub struct TomlConfig {
     #[serde(default)]
     pub egress_control: EgressControlConfig,
     #[serde(default)]
+    pub dynamic_whitelist: DynamicWhitelistConfig,
+    #[serde(default)]
     pub snat: SnatConfig,
     #[serde(default)]
     pub mss_clamp: MssClampConfig,
@@ -530,6 +533,53 @@ pub struct AccessControlConfig {
     pub mode: AccessControlMode,
     #[serde(default)]
     pub entries: Vec<String>,
+}
+
+/// 动态 DDNS 来源白名单配置。
+///
+/// 该配置只描述“来源 IP 白名单”增强，不参与目标域名解析、last-good 目标缓存或
+/// egress_control 目标限制。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicWhitelistConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_dynamic_whitelist_refresh_interval_seconds")]
+    pub refresh_interval_seconds: u64,
+    #[serde(default = "default_true")]
+    pub use_last_good_on_dns_failure: bool,
+    #[serde(default = "default_true")]
+    pub resolve_ipv4: bool,
+    #[serde(default)]
+    pub resolve_ipv6: bool,
+    #[serde(default = "default_true")]
+    pub notify_on_change: bool,
+    #[serde(default = "default_dynamic_whitelist_state_file")]
+    pub state_file: String,
+    #[serde(default)]
+    pub domains: Vec<DynamicWhitelistDomainConfig>,
+}
+
+impl Default for DynamicWhitelistConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            refresh_interval_seconds: default_dynamic_whitelist_refresh_interval_seconds(),
+            use_last_good_on_dns_failure: true,
+            resolve_ipv4: true,
+            resolve_ipv6: false,
+            notify_on_change: true,
+            state_file: default_dynamic_whitelist_state_file(),
+            domains: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DynamicWhitelistDomainConfig {
+    pub name: String,
+    pub domain: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 impl Default for AccessControlConfig {
@@ -1181,6 +1231,14 @@ fn default_ddns_refresh_interval_seconds() -> u64 {
     300
 }
 
+fn default_dynamic_whitelist_refresh_interval_seconds() -> u64 {
+    300
+}
+
+fn default_dynamic_whitelist_state_file() -> String {
+    "/var/lib/nftables-nat-rust/dynamic-whitelist-state.json".to_string()
+}
+
 fn default_stats_data_file() -> String {
     "/var/lib/nftables-nat-rust/stats.json".to_string()
 }
@@ -1461,6 +1519,7 @@ impl TomlConfig {
     /// 验证配置是否合法
     pub fn validate(&self) -> Result<(), String> {
         self.access_control.validate()?;
+        self.dynamic_whitelist.validate()?;
         self.geoip.validate()?;
         self.egress_control.validate()?;
         self.snat.validate()?;
@@ -1496,6 +1555,81 @@ impl AccessControlConfig {
         }
         Ok(())
     }
+}
+
+impl DynamicWhitelistConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.refresh_interval_seconds < 10 {
+            return Err(
+                "dynamic_whitelist.refresh_interval_seconds 不能低于 10 秒，生产环境建议 >= 300 秒"
+                    .to_string(),
+            );
+        }
+        if self.state_file.trim().is_empty() {
+            return Err("dynamic_whitelist.state_file 不能为空".to_string());
+        }
+        for (idx, domain) in self.domains.iter().enumerate() {
+            domain
+                .validate()
+                .map_err(|e| format!("dynamic_whitelist.domains[{}] {e}", idx + 1))?;
+        }
+        Ok(())
+    }
+}
+
+impl DynamicWhitelistDomainConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err("name 不能为空".to_string());
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            return Err(format!(
+                "name 只能包含 ASCII 字母、数字、下划线、短横线或点: {name}"
+            ));
+        }
+        validate_dynamic_whitelist_domain(&self.domain)?;
+        Ok(())
+    }
+}
+
+pub fn validate_dynamic_whitelist_domain(domain: &str) -> Result<(), String> {
+    let trimmed = domain.trim();
+    if trimmed.is_empty() {
+        return Err("domain 不能为空".to_string());
+    }
+    if trimmed.len() > 253 {
+        return Err(format!("domain 长度超过 253 字符: {trimmed}"));
+    }
+    if trimmed.contains(char::is_whitespace)
+        || trimmed.contains('/')
+        || trimmed.contains(':')
+        || trimmed.contains('*')
+    {
+        return Err(format!("domain 不是合法 DDNS 域名: {trimmed}"));
+    }
+    let without_trailing_dot = trimmed.trim_end_matches('.');
+    if without_trailing_dot.is_empty() {
+        return Err("domain 不是合法 DDNS 域名: .".to_string());
+    }
+    for label in without_trailing_dot.split('.') {
+        if label.is_empty() {
+            return Err(format!("domain 包含空 label: {trimmed}"));
+        }
+        if label.len() > 63 {
+            return Err(format!("domain label 长度超过 63 字符: {label}"));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!("domain label 不能以短横线开头或结尾: {label}"));
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(format!("domain 包含非法字符: {trimmed}"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_access_entry(entry: &str) -> Result<(), String> {
@@ -2125,6 +2259,13 @@ ip_version = "all"
         assert_eq!(config.ddns.refresh_interval_seconds, 300);
         assert_eq!(config.access_control.mode, AccessControlMode::Off);
         assert!(config.access_control.entries.is_empty());
+        assert!(!config.dynamic_whitelist.enabled);
+        assert_eq!(config.dynamic_whitelist.refresh_interval_seconds, 300);
+        assert!(config.dynamic_whitelist.use_last_good_on_dns_failure);
+        assert!(config.dynamic_whitelist.resolve_ipv4);
+        assert!(!config.dynamic_whitelist.resolve_ipv6);
+        assert!(config.dynamic_whitelist.notify_on_change);
+        assert!(config.dynamic_whitelist.domains.is_empty());
     }
 
     #[test]
@@ -2174,6 +2315,97 @@ entries = ["192.0.2.1", "2001:db8::/64"]
         .unwrap();
         assert_eq!(config.access_control.mode, AccessControlMode::Whitelist);
         assert_eq!(config.access_control.entries.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_whitelist_parses_defaults_and_domains() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[dynamic_whitelist]
+enabled = true
+
+[[dynamic_whitelist.domains]]
+name = "home"
+domain = "home.example.com"
+"#,
+        )
+        .unwrap();
+        assert!(config.dynamic_whitelist.enabled);
+        assert_eq!(config.dynamic_whitelist.refresh_interval_seconds, 300);
+        assert!(config.dynamic_whitelist.use_last_good_on_dns_failure);
+        assert!(config.dynamic_whitelist.resolve_ipv4);
+        assert!(!config.dynamic_whitelist.resolve_ipv6);
+        assert!(config.dynamic_whitelist.notify_on_change);
+        assert_eq!(config.dynamic_whitelist.domains.len(), 1);
+        assert!(config.dynamic_whitelist.domains[0].enabled);
+    }
+
+    #[test]
+    fn dynamic_whitelist_allows_empty_domains() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[dynamic_whitelist]
+enabled = true
+domains = []
+"#,
+        )
+        .unwrap();
+        assert!(config.dynamic_whitelist.domains.is_empty());
+    }
+
+    #[test]
+    fn dynamic_whitelist_rejects_empty_name_and_domain() {
+        let empty_name = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[dynamic_whitelist]
+enabled = true
+
+[[dynamic_whitelist.domains]]
+name = ""
+domain = "home.example.com"
+"#,
+        )
+        .unwrap_err();
+        assert!(empty_name.contains("name 不能为空"));
+
+        let empty_domain = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[dynamic_whitelist]
+enabled = true
+
+[[dynamic_whitelist.domains]]
+name = "home"
+domain = ""
+"#,
+        )
+        .unwrap_err();
+        assert!(empty_domain.contains("domain 不能为空"));
+    }
+
+    #[test]
+    fn dynamic_whitelist_rejects_invalid_domain() {
+        let err = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[dynamic_whitelist]
+enabled = true
+
+[[dynamic_whitelist.domains]]
+name = "home"
+domain = "https://home.example.com"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("不是合法 DDNS 域名"));
     }
 
     #[test]

@@ -1005,6 +1005,7 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
         stats: StatsConfig::default(),
         telegram: TelegramConfig::default(),
         access_control: AccessControlConfig::default(),
+        dynamic_whitelist: Default::default(),
         geoip: Default::default(),
         egress_control: Default::default(),
         snat: Default::default(),

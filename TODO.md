@@ -2,7 +2,7 @@
 
 本文件记录在历次「稳定版架构体检」中被识别、但本轮不修复的低优先级改进项。
 
-> v0.7.x 进入 **bugfix-only / maintenance-only 阶段**：原则上不再加新功能，只修 bug、补测试、优化文档、处理真实反馈。
+> v0.8.0 是 dynamic_whitelist 功能版本。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
 > 真正会动结构的改造请挪到独立 minor 版本规划，并先在本文件提案。
 
 不属于本文件的内容：
@@ -66,11 +66,28 @@
 - **保存提示分流文档化**：v0.6.1 的 reason 分流逻辑在 v0.7.0 不再改动，README 单独加段说明影响 / 不影响 nft 的两类 reason 各自的提示。
 - **未改动**：nft 规则生成 / safe apply 语义 / quota 判断 / stats 统计 / last-good 解析与回退 / GeoIP / egress_control / access_control 组合策略 / SNAT / MSS 规则 / install.sh release 安装主流程 / GitHub Actions workflow。也未新增 WebUI / nat-console / tc HTB / 多租户 / server-agent / 数据库 / 任何新依赖。
 
+### v0.8.0
+
+- **动态 DDNS 来源白名单 (`dynamic_whitelist`)**：新增 access_control 来源白名单增强。定期解析用户已有 DDNS 域名，把 A 记录并入来源白名单；默认 disabled，默认 IPv4，独立 state 文件 `/var/lib/nftables-nat-rust/dynamic-whitelist-state.json`。
+- **独立 last-good 来源 IP 兜底**：DNS 失败且有上一次成功解析结果时可临时保留 last-good 来源 IP，标记 `stale=true`；不会无限累积历史 IP，不会在无结果时开放所有来源。
+- **规则生成保持边界**：只在 `access_control.mode = "whitelist"` 时合并静态白名单 + dynamic whitelist；不影响 `egress_control`、目标 DDNS / 目标 last-good、SSH GeoIP、SNAT、MSS、quota、stats。
+- **CLI 管理入口**：`11) 白名单 / 黑名单管理` 增加「动态 DDNS 白名单管理」，支持状态、详情、添加、删除、启停单个域名、刷新间隔、手动刷新 state。
+- **audit / Telegram**：解析成功、失败、IP 变化、state prune 写 audit；IP 变化且 `notify_on_change=true` 且 Telegram 可用时通知，沿用 curl 超时和 bot_token 脱敏策略。
+- **未引入**：WebUI / nat-console / tc HTB / ifb / 多用户架构 / 分布式 agent / 数据库存储 / DNS 供应商接口。
+
 ---
 
-## 待办（按风险 / 收益排序，仅维护性）
+## 待办（按风险 / 收益排序）
 
-v0.7.x 阶段不接收新功能 PR；以下都是「可选维护项」，按需推进，不许诺时间。
+以下都是「可选维护项」，按需推进，不许诺时间。
+
+## 可选增强：dynamic_whitelist 后续项
+
+- IPv6 完整支持：当前默认 IPv4，后续可在 ip6 来源限制路径和文档验证充分后增强。
+- `allowed_resolved_cidrs`：限制 DDNS 解析结果必须落在用户指定来源 CIDR 内，降低 DDNS 账号被盗后的影响面。
+- DNS 失败通知节流：第一版只通知 IP 变化，避免 DNS 抖动刷屏；后续可加入失败通知但必须节流。
+
+不规划：多用户架构、WebUI、复杂 DNS 供应商接口、自动更新 DDNS 供应商。
 
 ## 可选设计：规则级备用目标 failover
 

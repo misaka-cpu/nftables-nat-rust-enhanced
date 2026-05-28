@@ -16,9 +16,13 @@ use log::{error, info, warn};
 #[cfg(test)]
 use nat_common::last_good::ResolutionEvent;
 use nat_common::{
-    Args, AuditConfig, DdnsConfig, DnsConfig, EgressControlConfig, GeoIpConfig, LastGoodConfig,
-    MssClampConfig, QuotaConfig, SnatConfig, StatsConfig, TelegramConfig, TomlConfig,
+    Args, AuditConfig, DdnsConfig, DnsConfig, DynamicWhitelistConfig, EgressControlConfig,
+    GeoIpConfig, LastGoodConfig, MssClampConfig, QuotaConfig, SnatConfig, StatsConfig,
+    TelegramConfig, TomlConfig,
     audit::{self, AuditResult},
+    dynamic_whitelist::{
+        self, DynamicWhitelistEvent, DynamicWhitelistRefreshResult, DynamicWhitelistState,
+    },
     geoip,
     last_good::{self, LastGoodState, ResolutionLog},
     logger, stats as traffic_stats,
@@ -135,6 +139,7 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
     let mut latest_script_hash: Option<u64> = None;
     let mut last_stats_collect = None;
     let mut last_ddns_refresh = None;
+    let mut last_dynamic_whitelist_refresh = None;
     let mut last_short_ddns_warn: Option<u64> = None;
     let mut last_quota_check: Option<chrono::DateTime<Local>> = None;
     let mut last_stats_warn_for_quota: bool = false;
@@ -142,9 +147,12 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
         let loop_now = Local::now();
         let runtime_config = load_runtime_config(args);
         let refresh_interval = ddns_refresh_interval(&runtime_config.ddns)?;
+        let dynamic_whitelist_interval =
+            dynamic_whitelist_refresh_interval(&runtime_config.dynamic_whitelist)?;
         warn_short_ddns_interval_once(refresh_interval, &mut last_short_ddns_warn);
         let dns_config = runtime_config.dns;
         let access_config = runtime_config.access_control;
+        let dynamic_whitelist_config = runtime_config.dynamic_whitelist;
         let geoip_config = runtime_config.geoip;
         let egress_config = runtime_config.egress_control;
         let snat_config = runtime_config.snat;
@@ -191,17 +199,30 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
             last_quota_check = Some(loop_now);
         }
 
-        if should_refresh_ddns_at(last_ddns_refresh, refresh_interval, loop_now) {
+        let ddns_due = should_refresh_ddns_at(last_ddns_refresh, refresh_interval, loop_now);
+        let dynamic_whitelist_due = dynamic_whitelist_config.enabled
+            && should_refresh_ddns_at(
+                last_dynamic_whitelist_refresh,
+                dynamic_whitelist_interval,
+                loop_now,
+            );
+
+        if ddns_due || dynamic_whitelist_due {
             let nat_cells = match parse_conf(args) {
                 Ok(cells) => cells,
                 Err(e) => {
                     error!("解析配置文件失败: {e:?}");
-                    sleep(next_loop_sleep(
+                    sleep(next_loop_sleep_with_dynamic_whitelist(
                         refresh_interval,
                         &stats_config,
                         last_ddns_refresh,
                         last_stats_collect,
                         Local::now(),
+                        DynamicWhitelistSleepContext {
+                            config: &dynamic_whitelist_config,
+                            interval_seconds: dynamic_whitelist_interval,
+                            last_refresh: last_dynamic_whitelist_refresh,
+                        },
                     ));
                     continue;
                 }
@@ -217,11 +238,37 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
                 &nat_cells,
                 "ddns.loop",
             );
+            let mut dynamic_whitelist_state =
+                DynamicWhitelistState::load(&dynamic_whitelist_config.state_file);
+            if dynamic_whitelist_due {
+                let refreshed = refresh_dynamic_whitelist(
+                    &dynamic_whitelist_config,
+                    &dns_config,
+                    &audit_config,
+                    &telegram_config,
+                    &dynamic_whitelist_state,
+                    loop_now.with_timezone(&chrono::Utc),
+                    "ddns.loop",
+                );
+                dynamic_whitelist_state = refreshed.state;
+                last_dynamic_whitelist_refresh = Some(loop_now);
+            }
+            let dynamic_whitelist_ips = dynamic_whitelist::current_ips_for_config(
+                &dynamic_whitelist_config,
+                &dynamic_whitelist_state,
+            );
+            warn_dynamic_whitelist_policy(
+                &access_config,
+                &dynamic_whitelist_config,
+                &dynamic_whitelist_ips,
+            );
+            let effective_access_config =
+                access_config_with_dynamic_whitelist(&access_config, &dynamic_whitelist_ips);
             let resolution_log = ResolutionLog::new();
             let script = match build_new_script(
                 &nat_cells,
                 &dns_config,
-                &access_config,
+                &effective_access_config,
                 &geoip_config,
                 &egress_config,
                 &snat_config,
@@ -235,12 +282,17 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
                     error!(
                         "解析域名或生成 nftables 脚本失败，保持上一版已应用规则并等待下一次解析: {e}"
                     );
-                    sleep(next_loop_sleep(
+                    sleep(next_loop_sleep_with_dynamic_whitelist(
                         refresh_interval,
                         &stats_config,
                         last_ddns_refresh,
                         last_stats_collect,
                         Local::now(),
+                        DynamicWhitelistSleepContext {
+                            config: &dynamic_whitelist_config,
+                            interval_seconds: dynamic_whitelist_interval,
+                            last_refresh: last_dynamic_whitelist_refresh,
+                        },
                     ));
                     continue;
                 }
@@ -311,12 +363,17 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
             }
         }
 
-        sleep(next_loop_sleep(
+        sleep(next_loop_sleep_with_dynamic_whitelist(
             refresh_interval,
             &stats_config,
             last_ddns_refresh,
             last_stats_collect,
             Local::now(),
+            DynamicWhitelistSleepContext {
+                config: &dynamic_whitelist_config,
+                interval_seconds: dynamic_whitelist_interval,
+                last_refresh: last_dynamic_whitelist_refresh,
+            },
         ));
     }
 }
@@ -339,11 +396,38 @@ pub(crate) fn refresh_once(args: &Args) -> Result<(), io::Error> {
         &nat_cells,
         "ddns.refresh",
     );
+    let mut dynamic_whitelist_state =
+        DynamicWhitelistState::load(&runtime_config.dynamic_whitelist.state_file);
+    if runtime_config.dynamic_whitelist.enabled {
+        let refreshed = refresh_dynamic_whitelist(
+            &runtime_config.dynamic_whitelist,
+            &runtime_config.dns,
+            &runtime_config.audit,
+            &runtime_config.telegram,
+            &dynamic_whitelist_state,
+            chrono::Utc::now(),
+            "ddns.refresh",
+        );
+        dynamic_whitelist_state = refreshed.state;
+    }
+    let dynamic_whitelist_ips = dynamic_whitelist::current_ips_for_config(
+        &runtime_config.dynamic_whitelist,
+        &dynamic_whitelist_state,
+    );
+    warn_dynamic_whitelist_policy(
+        &runtime_config.access_control,
+        &runtime_config.dynamic_whitelist,
+        &dynamic_whitelist_ips,
+    );
+    let effective_access_config = access_config_with_dynamic_whitelist(
+        &runtime_config.access_control,
+        &dynamic_whitelist_ips,
+    );
     let resolution_log = ResolutionLog::new();
     let script = build_new_script(
         &nat_cells,
         &runtime_config.dns,
-        &runtime_config.access_control,
+        &effective_access_config,
         &runtime_config.geoip,
         &runtime_config.egress_control,
         &runtime_config.snat,
@@ -439,6 +523,7 @@ struct RuntimeConfig {
     dns: DnsConfig,
     ddns: DdnsConfig,
     access_control: nat_common::AccessControlConfig,
+    dynamic_whitelist: DynamicWhitelistConfig,
     geoip: GeoIpConfig,
     egress_control: EgressControlConfig,
     snat: SnatConfig,
@@ -456,6 +541,7 @@ fn default_runtime_config() -> RuntimeConfig {
         dns: DnsConfig::default(),
         ddns: DdnsConfig::default(),
         access_control: Default::default(),
+        dynamic_whitelist: DynamicWhitelistConfig::default(),
         geoip: GeoIpConfig::default(),
         egress_control: EgressControlConfig::default(),
         snat: SnatConfig::default(),
@@ -487,6 +573,7 @@ fn load_runtime_config(args: &Args) -> RuntimeConfig {
                 dns: config.dns,
                 ddns: config.ddns,
                 access_control: config.access_control,
+                dynamic_whitelist: config.dynamic_whitelist,
                 geoip: config.geoip,
                 egress_control: config.egress_control,
                 snat: config.snat,
@@ -506,13 +593,244 @@ fn load_runtime_config(args: &Args) -> RuntimeConfig {
     }
 }
 
+fn dynamic_whitelist_refresh_interval(config: &DynamicWhitelistConfig) -> Result<u64, io::Error> {
+    let interval = config.refresh_interval_seconds;
+    if interval < 10 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dynamic_whitelist.refresh_interval_seconds too low",
+        ));
+    }
+    Ok(interval)
+}
+
+struct DynamicWhitelistSleepContext<'a> {
+    config: &'a DynamicWhitelistConfig,
+    interval_seconds: u64,
+    last_refresh: Option<chrono::DateTime<Local>>,
+}
+
+fn next_loop_sleep_with_dynamic_whitelist(
+    ddns_interval_seconds: u64,
+    stats_config: &StatsConfig,
+    last_ddns_refresh: Option<chrono::DateTime<Local>>,
+    last_stats_collect: Option<chrono::DateTime<Local>>,
+    now: chrono::DateTime<Local>,
+    dynamic: DynamicWhitelistSleepContext<'_>,
+) -> std::time::Duration {
+    let base = next_loop_sleep(
+        ddns_interval_seconds,
+        stats_config,
+        last_ddns_refresh,
+        last_stats_collect,
+        now,
+    );
+    if !dynamic.config.enabled {
+        return base;
+    }
+    let dynamic_remaining = remaining_seconds(dynamic.last_refresh, dynamic.interval_seconds, now);
+    let dynamic_sleep =
+        std::time::Duration::from_secs(dynamic_remaining.clamp(1, MAIN_LOOP_MAX_SLEEP_SECS));
+    base.min(dynamic_sleep)
+}
+
+fn refresh_dynamic_whitelist(
+    config: &DynamicWhitelistConfig,
+    dns_config: &DnsConfig,
+    audit_config: &AuditConfig,
+    telegram_config: &TelegramConfig,
+    previous_state: &DynamicWhitelistState,
+    now: chrono::DateTime<chrono::Utc>,
+    trigger: &str,
+) -> DynamicWhitelistRefreshResult {
+    let result = dynamic_whitelist::refresh_state_with_resolver(
+        config,
+        previous_state,
+        |domain| ip::remote_ips_with_dns(domain, dns_config).map_err(|e| e.to_string()),
+        now,
+    );
+    audit_dynamic_whitelist_events(audit_config, &result.events);
+    maybe_notify_dynamic_whitelist_changes(config, telegram_config, &result.events);
+    if let Err(e) = result.state.save(&config.state_file) {
+        warn!(
+            "dynamic whitelist state 写入失败 ({}): {e}",
+            config.state_file
+        );
+        audit::log_event(
+            audit_config,
+            "dynamic_whitelist.state.write.fail",
+            AuditResult::Warn,
+            serde_json::json!({
+                "trigger": trigger,
+                "file": config.state_file,
+                "error": e.to_string(),
+            }),
+        );
+    }
+    result
+}
+
+fn audit_dynamic_whitelist_events(audit_config: &AuditConfig, events: &[DynamicWhitelistEvent]) {
+    for event in events {
+        match event {
+            DynamicWhitelistEvent::ResolveSuccess {
+                name,
+                domain,
+                ips,
+                changed,
+            } => audit::log_event(
+                audit_config,
+                "dynamic_whitelist.resolve.success",
+                AuditResult::Ok,
+                serde_json::json!({
+                    "name": name,
+                    "domain": domain,
+                    "ips": ips,
+                    "changed": changed,
+                }),
+            ),
+            DynamicWhitelistEvent::ResolveFail {
+                name,
+                domain,
+                error,
+                using_last_good,
+            } => audit::log_event(
+                audit_config,
+                "dynamic_whitelist.resolve.fail",
+                AuditResult::Warn,
+                serde_json::json!({
+                    "name": name,
+                    "domain": domain,
+                    "error": error,
+                    "using_last_good": using_last_good,
+                }),
+            ),
+            DynamicWhitelistEvent::Change {
+                name,
+                domain,
+                old_ips,
+                new_ips,
+            } => audit::log_event(
+                audit_config,
+                "dynamic_whitelist.change",
+                AuditResult::Ok,
+                serde_json::json!({
+                    "name": name,
+                    "domain": domain,
+                    "old_ips": old_ips,
+                    "new_ips": new_ips,
+                }),
+            ),
+        }
+    }
+}
+
+fn maybe_notify_dynamic_whitelist_changes(
+    config: &DynamicWhitelistConfig,
+    telegram_config: &TelegramConfig,
+    events: &[DynamicWhitelistEvent],
+) {
+    maybe_notify_dynamic_whitelist_changes_with(
+        config,
+        telegram_config,
+        events,
+        telegram::send_telegram_http,
+    );
+}
+
+fn maybe_notify_dynamic_whitelist_changes_with<F>(
+    config: &DynamicWhitelistConfig,
+    telegram_config: &TelegramConfig,
+    events: &[DynamicWhitelistEvent],
+    mut sender: F,
+) where
+    F: FnMut(&str, &[(&str, &str)]) -> Result<(), String>,
+{
+    if !config.notify_on_change
+        || !telegram_config.enabled
+        || telegram_config.bot_token.trim().is_empty()
+        || telegram_config.chat_id.trim().is_empty()
+    {
+        return;
+    }
+    for event in events {
+        let DynamicWhitelistEvent::Change {
+            name,
+            domain,
+            old_ips,
+            new_ips,
+        } = event
+        else {
+            continue;
+        };
+        let message = format!(
+            "dynamic whitelist changed\nname: {name}\ndomain: {domain}\nold: {}\nnew: {}",
+            format_ip_list(old_ips),
+            format_ip_list(new_ips)
+        );
+        if let Err(e) = traffic_stats::send_telegram_with(telegram_config, &message, &mut sender) {
+            warn!(
+                "dynamic whitelist Telegram 通知发送失败 token={} err={}",
+                traffic_stats::mask_bot_token(&telegram_config.bot_token),
+                e
+            );
+        }
+    }
+}
+
+fn format_ip_list(ips: &[String]) -> String {
+    if ips.is_empty() {
+        "(empty)".to_string()
+    } else {
+        ips.join(", ")
+    }
+}
+
+fn access_config_with_dynamic_whitelist(
+    access_config: &nat_common::AccessControlConfig,
+    dynamic_ips: &[String],
+) -> nat_common::AccessControlConfig {
+    let mut merged = access_config.clone();
+    if merged.mode != nat_common::AccessControlMode::Whitelist {
+        return merged;
+    }
+    for ip in dynamic_ips {
+        if !merged.entries.contains(ip) {
+            merged.entries.push(ip.clone());
+        }
+    }
+    merged
+}
+
+fn warn_dynamic_whitelist_policy(
+    access_config: &nat_common::AccessControlConfig,
+    dynamic_config: &DynamicWhitelistConfig,
+    dynamic_ips: &[String],
+) {
+    if !dynamic_config.enabled {
+        return;
+    }
+    if access_config.mode != nat_common::AccessControlMode::Whitelist {
+        warn!(
+            "dynamic_whitelist 已配置，但 access_control 未启用 whitelist 模式，因此不会参与来源放行"
+        );
+        return;
+    }
+    if access_config.entries.is_empty() && dynamic_ips.is_empty() {
+        warn!(
+            "dynamic_whitelist 当前没有可用 IP，且静态白名单为空；来源白名单为空时所有来源都可能被拒绝"
+        );
+    }
+}
+
 // v0.6.1：DDNS / Stats / quota 节拍辅助、collect_and_maybe_notify 已搬到 `runtime` 模块。
 // quota 自动禁用循环已搬到 `quota_loop` 模块。
 // Telegram curl / 通知发送已搬到 `telegram` 模块。
 use quota_loop::run_quota_check;
 use runtime::{
-    collect_and_maybe_notify, ddns_refresh_interval, next_loop_sleep, should_collect_stats_at,
-    should_refresh_ddns_at, should_run_quota_check, warn_short_ddns_interval_once,
+    collect_and_maybe_notify, ddns_refresh_interval, next_loop_sleep, remaining_seconds,
+    should_collect_stats_at, should_refresh_ddns_at, should_run_quota_check,
+    warn_short_ddns_interval_once,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -1259,6 +1577,196 @@ refresh_interval_seconds = 123
         .unwrap();
         assert!(script.contains("ip saddr { 1.2.3.4, 5.6.7.0/24 } tcp dport 30080 counter dnat"));
         assert!(!script.contains(" counter drop "));
+    }
+
+    #[test]
+    fn dynamic_whitelist_merges_with_static_whitelist_for_rules() {
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
+        })];
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Whitelist,
+            entries: vec!["1.2.3.4".to_string()],
+        };
+        let effective = access_config_with_dynamic_whitelist(
+            &access,
+            &["5.6.7.8".to_string(), "1.2.3.4".to_string()],
+        );
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &effective,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap();
+        assert!(script.contains("ip saddr { 1.2.3.4, 5.6.7.8 } tcp dport 30080 counter dnat"));
+    }
+
+    #[test]
+    fn dynamic_whitelist_empty_result_does_not_open_whitelist() {
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
+        })];
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Whitelist,
+            entries: Vec::new(),
+        };
+        let effective = access_config_with_dynamic_whitelist(&access, &[]);
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &effective,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap();
+        assert!(!script.contains("counter dnat"));
+        assert!(!script.contains("ip saddr {  }"));
+    }
+
+    #[test]
+    fn dynamic_whitelist_does_not_affect_access_control_off_or_blacklist() {
+        let off = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Off,
+            entries: Vec::new(),
+        };
+        let effective = access_config_with_dynamic_whitelist(&off, &["5.6.7.8".to_string()]);
+        assert!(effective.entries.is_empty());
+
+        let blacklist = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Blacklist,
+            entries: vec!["1.2.3.4".to_string()],
+        };
+        let effective = access_config_with_dynamic_whitelist(&blacklist, &["5.6.7.8".to_string()]);
+        assert_eq!(effective.entries, vec!["1.2.3.4"]);
+    }
+
+    #[test]
+    fn dynamic_whitelist_change_writes_audit() {
+        let dir = std::env::temp_dir().join(format!(
+            "dynamic-whitelist-audit-{}-{}",
+            std::process::id(),
+            Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let audit_file = dir.join("audit.log");
+        let audit_config = AuditConfig {
+            enabled: true,
+            file: audit_file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let events = vec![DynamicWhitelistEvent::Change {
+            name: "home".to_string(),
+            domain: "home.example.com".to_string(),
+            old_ips: vec!["203.0.113.10".to_string()],
+            new_ips: vec!["203.0.113.20".to_string()],
+        }];
+        audit_dynamic_whitelist_events(&audit_config, &events);
+        let raw = fs::read_to_string(&audit_file).unwrap();
+        assert!(raw.contains("\"action\":\"dynamic_whitelist.change\""));
+        assert!(raw.contains("203.0.113.20"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dynamic_whitelist_dns_failure_writes_audit() {
+        let dir = std::env::temp_dir().join(format!(
+            "dynamic-whitelist-audit-fail-{}-{}",
+            std::process::id(),
+            Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let audit_file = dir.join("audit.log");
+        let audit_config = AuditConfig {
+            enabled: true,
+            file: audit_file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let events = vec![DynamicWhitelistEvent::ResolveFail {
+            name: "home".to_string(),
+            domain: "home.example.com".to_string(),
+            error: "mock dns failure".to_string(),
+            using_last_good: true,
+        }];
+        audit_dynamic_whitelist_events(&audit_config, &events);
+        let raw = fs::read_to_string(&audit_file).unwrap();
+        assert!(raw.contains("\"action\":\"dynamic_whitelist.resolve.fail\""));
+        assert!(raw.contains("\"using_last_good\":true"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dynamic_whitelist_telegram_notifies_only_on_change_without_token_in_message() {
+        let config = DynamicWhitelistConfig {
+            enabled: true,
+            notify_on_change: true,
+            ..Default::default()
+        };
+        let telegram = TelegramConfig {
+            enabled: true,
+            bot_token: "1234567890:LEAKME_DYNAMIC".to_string(),
+            chat_id: "42".to_string(),
+            ..Default::default()
+        };
+        let events = vec![
+            DynamicWhitelistEvent::ResolveSuccess {
+                name: "home".to_string(),
+                domain: "home.example.com".to_string(),
+                ips: vec!["203.0.113.20".to_string()],
+                changed: true,
+            },
+            DynamicWhitelistEvent::Change {
+                name: "home".to_string(),
+                domain: "home.example.com".to_string(),
+                old_ips: vec!["203.0.113.10".to_string()],
+                new_ips: vec!["203.0.113.20".to_string()],
+            },
+        ];
+        let mut sent_messages = Vec::new();
+        maybe_notify_dynamic_whitelist_changes_with(&config, &telegram, &events, |url, params| {
+            assert!(url.contains("LEAKME_DYNAMIC"));
+            let text = params
+                .iter()
+                .find(|(key, _)| *key == "text")
+                .map(|(_, value)| value.to_string())
+                .unwrap();
+            sent_messages.push(text);
+            Ok(())
+        });
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("home.example.com"));
+        assert!(!sent_messages[0].contains("LEAKME_DYNAMIC"));
     }
 
     #[test]

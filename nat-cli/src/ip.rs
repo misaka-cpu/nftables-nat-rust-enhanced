@@ -13,6 +13,40 @@ pub fn remote_ip_with_dns(
     remote_ip_with_resolver(domain, ip_version, dns_config, system_resolve)
 }
 
+pub fn remote_ips_with_dns(domain: &str, dns_config: &DnsConfig) -> io::Result<Vec<IpAddr>> {
+    remote_ips_with_resolver(domain, dns_config, system_resolve)
+}
+
+fn remote_ips_with_resolver<F>(
+    domain: &str,
+    dns_config: &DnsConfig,
+    resolver: F,
+) -> io::Result<Vec<IpAddr>>
+where
+    F: Fn(&str) -> io::Result<Vec<IpAddr>>,
+{
+    if let Ok(ip) = domain.parse::<IpAddr>() {
+        reject_fake_ip_if_needed(domain, ip, dns_config)?;
+        return Ok(vec![ip]);
+    }
+    if dns_config.resolver_mode != "system" {
+        warn!(
+            "dns resolver_mode={} is not implemented yet, fallback to system resolver",
+            dns_config.resolver_mode
+        );
+    }
+    let mut resolved = resolver(domain)?;
+    resolved.sort();
+    resolved.dedup();
+    for ip in &resolved {
+        reject_fake_ip_if_needed(domain, *ip, dns_config)?;
+    }
+    if resolved.is_empty() {
+        return Err(io::Error::other("Failed to resolve any IP address"));
+    }
+    Ok(resolved)
+}
+
 fn remote_ip_with_resolver<F>(
     domain: &str,
     ip_version: &IpVersion,

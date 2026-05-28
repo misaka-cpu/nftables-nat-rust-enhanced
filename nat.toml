@@ -48,3 +48,11 @@ sport = 10003
 dport = 45678
 protocol = "all"
 ip_version = "all"
+
+[dynamic_whitelist]
+enabled = false
+refresh_interval_seconds = 300
+use_last_good_on_dns_failure = true
+resolve_ipv4 = true
+resolve_ipv6 = false
+notify_on_change = true
