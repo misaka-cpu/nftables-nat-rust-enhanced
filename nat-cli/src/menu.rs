@@ -1598,16 +1598,10 @@ fn has_out_without_in(state: &traffic_stats::StatsState) -> bool {
 fn access_control_menu(path: &str) -> Result<(), io::Error> {
     let mut config = load_toml_config(path)?;
     loop {
-        println!(
-            r#"====================================
-访问控制管理
-====================================
-当前模式：{}
-当前 entries："#,
-            config.access_control.mode
-        );
-        print_access_entries(&config);
-        for line in format_combined_policy_status(&config) {
+        println!("====================================");
+        println!("白名单 / 黑名单管理");
+        println!("====================================");
+        for line in format_access_control_brief_lines(&config) {
             println!("{line}");
         }
         println!(
@@ -1618,8 +1612,9 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
 5) 添加 IP/CIDR
 6) 删除 IP/CIDR
 7) 清空 entries
-8) 动态 DDNS 白名单管理
-9) 保存并应用
+8) 动态 DDNS 来源白名单
+9) 查看来源策略详情
+10) 保存并应用
 0) 返回主菜单
 ===================================="#
         );
@@ -1672,6 +1667,12 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
                 config = load_toml_config(path)?;
             }
             "9" => {
+                for line in format_source_policy_detail_lines(&config) {
+                    println!("{line}");
+                }
+                wait_enter_to_return()?;
+            }
+            "10" => {
                 config
                     .access_control
                     .validate()
@@ -1700,6 +1701,48 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
         }
     }
     Ok(())
+}
+
+/// 「白名单 / 黑名单管理」默认页摘要：只列来源访问控制相关字段，
+/// 不展开 SNAT / MSS / egress_control / 评估顺序等长文本（这些走「查看来源策略详情」）。
+pub(crate) fn format_access_control_brief_lines(config: &TomlConfig) -> Vec<String> {
+    let dynamic_label = if config.dynamic_whitelist.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let geoip_label = if config.geoip.enabled && config.geoip.forward.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let ssh_geoip_label = if config.geoip.enabled && config.geoip.ssh.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    vec![
+        "来源访问控制：".to_string(),
+        format!("  mode: {}", config.access_control.mode),
+        format!("  静态 entries: {}", config.access_control.entries.len()),
+        format!(
+            "  动态 DDNS: {}，domains={}",
+            dynamic_label,
+            config.dynamic_whitelist.domains.len()
+        ),
+        format!("  GeoIP: {geoip_label}"),
+        format!("  SSH GeoIP: {ssh_geoip_label}"),
+        String::new(),
+        "说明：".to_string(),
+        "  access_control / dynamic_whitelist / GeoIP 用于限制\"谁能访问入口\"。".to_string(),
+        "  egress_control 是目标 IP 限制，不在此处管理。".to_string(),
+    ]
+}
+
+/// 「查看来源策略详情」聚合页：复用 format_combined_policy_status 的完整组合策略文本，
+/// 让默认白名单 / 黑名单管理页面保持简洁，详情按需展开。
+pub(crate) fn format_source_policy_detail_lines(config: &TomlConfig) -> Vec<String> {
+    format_combined_policy_status(config)
 }
 
 fn print_access_entries(config: &TomlConfig) {
@@ -1756,13 +1799,15 @@ pub(crate) fn clear_access_entries(config: &mut TomlConfig) {
 fn dynamic_whitelist_menu(path: &str) -> Result<(), io::Error> {
     loop {
         let config = load_toml_config(path)?;
+        let state = DynamicWhitelistState::load(&config.dynamic_whitelist.state_file);
+        println!("====================================");
+        println!("动态 DDNS 来源白名单");
+        println!("====================================");
+        for line in format_dynamic_whitelist_brief_lines(&config, &state) {
+            println!("{line}");
+        }
         println!(
-            r#"====================================
-动态 DDNS 来源白名单管理
-====================================
-这是 access_control 的来源 IP 动态白名单；不是目标 IP 限制，也不是 egress_control。
-只有 access_control.mode = "whitelist" 时，解析出的 IP 才会参与来源放行。
-1) 查看动态白名单状态
+            r#"1) 查看动态白名单状态
 2) 添加 DDNS 白名单域名
 3) 删除 DDNS 白名单域名
 4) 启用 / 禁用某个 DDNS 域名
@@ -1819,6 +1864,67 @@ fn show_dynamic_whitelist_status(config: &TomlConfig) {
     for line in format_dynamic_whitelist_status_lines(config, &state) {
         println!("{line}");
     }
+}
+
+/// 「动态 DDNS 来源白名单」子菜单默认摘要：只显示 dynamic_whitelist 自己的字段，
+/// 不重复 access_control / GeoIP / egress / SNAT / MSS 的长段落，
+/// 并按 mode / domains / current_ips 状态触发 1 条情境化提示。
+pub(crate) fn format_dynamic_whitelist_brief_lines(
+    config: &TomlConfig,
+    state: &DynamicWhitelistState,
+) -> Vec<String> {
+    let dynamic_config = &config.dynamic_whitelist;
+    let current_ips = dynamic_whitelist::current_ips_for_config(dynamic_config, state);
+    let stale_count = dynamic_whitelist::stale_count_for_config(dynamic_config, state);
+    let ipv4_label = if dynamic_config.resolve_ipv4 {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let ipv6_label = if dynamic_config.resolve_ipv6 {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let mut lines = vec![
+        "状态：".to_string(),
+        format!("  enabled: {}", dynamic_config.enabled),
+        "  生效条件: access_control.mode = whitelist".to_string(),
+        format!("  domains: {}", dynamic_config.domains.len()),
+        format!("  current IPs: {}", current_ips.len()),
+        format!("  stale: {stale_count}"),
+        format!(
+            "  refresh interval: {}s",
+            dynamic_config.refresh_interval_seconds
+        ),
+        format!("  IPv4: {ipv4_label}"),
+        format!("  IPv6: {ipv6_label}"),
+        format!("  state: {}", dynamic_config.state_file),
+        String::new(),
+        "说明：".to_string(),
+        "  这是\"来源 IP 动态白名单\"，不是目标 IP 限制。".to_string(),
+        "  只有 access_control.mode = whitelist 时，解析出的 IP 才会参与来源放行。".to_string(),
+        String::new(),
+    ];
+    if dynamic_config.enabled && config.access_control.mode != AccessControlMode::Whitelist {
+        lines.push(format!(
+            "提示：当前 access_control.mode = {}，动态白名单只会解析和显示状态，不参与来源放行。",
+            config.access_control.mode
+        ));
+    }
+    if dynamic_config.enabled && dynamic_config.domains.is_empty() {
+        lines.push("提示：动态白名单已启用，但还没有配置 DDNS 域名。".to_string());
+    }
+    if dynamic_config.enabled
+        && config.access_control.mode == AccessControlMode::Whitelist
+        && current_ips.is_empty()
+    {
+        lines.push(
+            "警告：当前没有可用动态白名单 IP。若静态白名单也为空，可能导致所有来源被拒绝。"
+                .to_string(),
+        );
+    }
+    lines
 }
 
 pub(crate) fn format_dynamic_whitelist_status_lines(
@@ -8106,5 +8212,299 @@ HTTP/2 200
         assert!(!safe.contains(';'));
         // 全空字符串应有兜底
         assert_eq!(sanitize_backup_reason("   "), "config-write");
+    }
+
+    // ===== v0.8.1 草案：白名单 / 黑名单管理简化布局测试 =====
+
+    fn brief_layout_config(
+        mode: AccessControlMode,
+        entries: &[&str],
+        geoip_forward: bool,
+        geoip_ssh: bool,
+        dynamic_enabled: bool,
+        dynamic_domains: &[(&str, &str, bool)],
+    ) -> TomlConfig {
+        let mut cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        cfg.access_control.mode = mode;
+        cfg.access_control.entries = entries.iter().map(|s| s.to_string()).collect();
+        cfg.geoip.enabled = geoip_forward || geoip_ssh;
+        cfg.geoip.forward.enabled = geoip_forward;
+        cfg.geoip.ssh.enabled = geoip_ssh;
+        cfg.dynamic_whitelist.enabled = dynamic_enabled;
+        cfg.dynamic_whitelist.domains = dynamic_domains
+            .iter()
+            .map(|(name, domain, enabled)| DynamicWhitelistDomainConfig {
+                name: name.to_string(),
+                domain: domain.to_string(),
+                enabled: *enabled,
+            })
+            .collect();
+        cfg
+    }
+
+    #[test]
+    fn access_control_brief_lines_show_summary_not_long_combined_policy() {
+        let cfg = brief_layout_config(AccessControlMode::Off, &[], false, false, false, &[]);
+        let lines = format_access_control_brief_lines(&cfg).join("\n");
+        assert!(lines.contains("来源访问控制："));
+        assert!(lines.contains("mode: off"));
+        assert!(lines.contains("静态 entries: 0"));
+        assert!(lines.contains("动态 DDNS: disabled，domains=0"));
+        assert!(lines.contains("GeoIP: disabled"));
+        assert!(lines.contains("SSH GeoIP: disabled"));
+        // 简洁页面不应包含 SNAT / MSS / egress / 完整组合策略标题块
+        assert!(
+            !lines.contains("组合策略 (access_control + GeoIP + egress + SNAT + MSS)"),
+            "简洁页面不应展开完整组合策略标题: {lines}"
+        );
+        assert!(
+            !lines.contains("SNAT（源地址改写）"),
+            "简洁页面不应包含 SNAT 长段: {lines}"
+        );
+        assert!(
+            !lines.contains("MSS clamp（TCP MSS 调整）"),
+            "简洁页面不应包含 MSS 长段: {lines}"
+        );
+        assert!(
+            !lines.contains("egress_control（目标 IP / IP 段限制）"),
+            "简洁页面不应包含 egress 长段: {lines}"
+        );
+        assert!(
+            !lines.contains("评估顺序：黑名单 > 白名单"),
+            "简洁页面不应包含评估顺序长行: {lines}"
+        );
+        assert!(
+            !lines.contains("最终目标策略："),
+            "简洁页面不应包含最终目标策略行: {lines}"
+        );
+        // 但必须保留来源与目标限制的边界说明
+        assert!(lines.contains("egress_control 是目标 IP 限制，不在此处管理。"));
+    }
+
+    #[test]
+    fn access_control_brief_lines_reflect_whitelist_and_geoip_counts() {
+        let cfg = brief_layout_config(
+            AccessControlMode::Whitelist,
+            &["1.2.3.4", "5.6.7.0/24"],
+            true,
+            true,
+            true,
+            &[("home", "home.example.com", true)],
+        );
+        let lines = format_access_control_brief_lines(&cfg).join("\n");
+        assert!(lines.contains("mode: whitelist"));
+        assert!(lines.contains("静态 entries: 2"));
+        assert!(lines.contains("动态 DDNS: enabled，domains=1"));
+        assert!(lines.contains("GeoIP: enabled"));
+        assert!(lines.contains("SSH GeoIP: enabled"));
+    }
+
+    #[test]
+    fn access_control_menu_lists_detail_entry_and_save_apply_renumbered() {
+        let src = menu_src_non_test();
+        assert!(
+            src.contains("8) 动态 DDNS 来源白名单"),
+            "8) 仍指向动态 DDNS 来源白名单子菜单"
+        );
+        assert!(
+            src.contains("9) 查看来源策略详情"),
+            "白名单 / 黑名单管理应新增「查看来源策略详情」入口"
+        );
+        assert!(src.contains("10) 保存并应用"), "保存并应用顺延为 10)");
+        // 旧的 9) 保存并应用编号不应再出现在白名单/黑名单菜单文本块
+        assert!(
+            !src.contains("9) 保存并应用"),
+            "保存并应用不应继续占用 9 号位"
+        );
+    }
+
+    #[test]
+    fn source_policy_detail_lines_still_show_full_combined_policy() {
+        let cfg = brief_layout_config(
+            AccessControlMode::Whitelist,
+            &["1.2.3.4"],
+            true,
+            false,
+            true,
+            &[("home", "home.example.com", true)],
+        );
+        let detail = format_source_policy_detail_lines(&cfg).join("\n");
+        // 详情页应包含完整组合策略标题与评估顺序、SNAT、MSS、egress、说明
+        assert!(detail.contains("组合策略 (access_control + GeoIP + egress + SNAT + MSS)"));
+        assert!(detail.contains(
+            "评估顺序：黑名单 > 白名单（静态 + dynamic_whitelist）> GeoIP（同时启用 = AND）"
+        ));
+        assert!(detail.contains("SNAT（源地址改写）"));
+        assert!(detail.contains("MSS clamp（TCP MSS 调整）"));
+        assert!(detail.contains("egress_control（目标 IP / IP 段限制）"));
+        assert!(detail.contains(
+            "说明：access_control / dynamic_whitelist / GeoIP 是来源 IP 限制；egress_control 是目标 IP 限制；SNAT 是源地址改写；MSS clamp 是 TCP MSS 调整。"
+        ));
+    }
+
+    // ===== v0.8.1 草案：动态 DDNS 来源白名单子菜单简化测试 =====
+
+    fn dynamic_whitelist_brief_config(
+        mode: AccessControlMode,
+        dynamic_enabled: bool,
+        domains: &[(&str, &str, bool)],
+        resolve_ipv6: bool,
+    ) -> TomlConfig {
+        let mut cfg = brief_layout_config(mode, &[], false, false, dynamic_enabled, domains);
+        cfg.dynamic_whitelist.resolve_ipv6 = resolve_ipv6;
+        cfg
+    }
+
+    #[test]
+    fn dynamic_whitelist_brief_shows_summary_without_full_combined_policy() {
+        let cfg = dynamic_whitelist_brief_config(AccessControlMode::Off, false, &[], false);
+        let state = DynamicWhitelistState::default();
+        let lines = format_dynamic_whitelist_brief_lines(&cfg, &state).join("\n");
+        assert!(lines.contains("状态："));
+        assert!(lines.contains("enabled: false"));
+        assert!(lines.contains("生效条件: access_control.mode = whitelist"));
+        assert!(lines.contains("domains: 0"));
+        assert!(lines.contains("current IPs: 0"));
+        assert!(lines.contains("stale: 0"));
+        assert!(lines.contains("refresh interval: 300s"));
+        assert!(lines.contains("IPv4: enabled"));
+        assert!(lines.contains("IPv6: disabled"));
+        assert!(lines.contains("state: /var/lib/nftables-nat-rust/dynamic-whitelist-state.json"));
+        // 默认状态（disabled，mode=off）：不触发任何情境化提示
+        assert!(
+            !lines.contains("提示：当前 access_control.mode"),
+            "disabled 时不应触发 mode 提示: {lines}"
+        );
+        assert!(
+            !lines.contains("提示：动态白名单已启用，但还没有配置 DDNS 域名"),
+            "disabled 时不应触发 domains=0 提示: {lines}"
+        );
+        assert!(
+            !lines.contains("警告：当前没有可用动态白名单 IP"),
+            "disabled 时不应触发 zero IPs 警告: {lines}"
+        );
+    }
+
+    #[test]
+    fn dynamic_whitelist_brief_excludes_snat_mss_egress_long_text() {
+        let cfg = dynamic_whitelist_brief_config(
+            AccessControlMode::Whitelist,
+            true,
+            &[("home", "home.example.com", true)],
+            false,
+        );
+        let state = DynamicWhitelistState::default();
+        let lines = format_dynamic_whitelist_brief_lines(&cfg, &state).join("\n");
+        // 子菜单不应混入 SNAT / MSS / egress / 评估顺序等内容
+        assert!(
+            !lines.contains("SNAT（源地址改写）"),
+            "动态白名单子菜单不应包含 SNAT 长段: {lines}"
+        );
+        assert!(
+            !lines.contains("MSS clamp（TCP MSS 调整）"),
+            "动态白名单子菜单不应包含 MSS 长段: {lines}"
+        );
+        assert!(
+            !lines.contains("egress_control（目标 IP / IP 段限制）"),
+            "动态白名单子菜单不应包含 egress 长段: {lines}"
+        );
+        assert!(
+            !lines.contains("评估顺序：黑名单 > 白名单"),
+            "动态白名单子菜单不应包含评估顺序长行: {lines}"
+        );
+        assert!(
+            !lines.contains("组合策略 (access_control + GeoIP + egress + SNAT + MSS)"),
+            "动态白名单子菜单不应展开完整组合策略: {lines}"
+        );
+    }
+
+    #[test]
+    fn dynamic_whitelist_brief_hint_for_non_whitelist_mode() {
+        let cfg = dynamic_whitelist_brief_config(
+            AccessControlMode::Off,
+            true,
+            &[("home", "home.example.com", true)],
+            false,
+        );
+        let state = DynamicWhitelistState::default();
+        let lines = format_dynamic_whitelist_brief_lines(&cfg, &state).join("\n");
+        assert!(
+            lines.contains(
+                "提示：当前 access_control.mode = off，动态白名单只会解析和显示状态，不参与来源放行。"
+            ),
+            "mode != whitelist 时应给出 off 提示: {lines}"
+        );
+    }
+
+    #[test]
+    fn dynamic_whitelist_brief_hint_for_enabled_with_zero_domains() {
+        let cfg = dynamic_whitelist_brief_config(AccessControlMode::Whitelist, true, &[], false);
+        let state = DynamicWhitelistState::default();
+        let lines = format_dynamic_whitelist_brief_lines(&cfg, &state).join("\n");
+        assert!(
+            lines.contains("提示：动态白名单已启用，但还没有配置 DDNS 域名。"),
+            "enabled=true 且 domains=0 时应给出提示: {lines}"
+        );
+    }
+
+    #[test]
+    fn dynamic_whitelist_brief_warn_for_whitelist_zero_current_ips() {
+        let cfg = dynamic_whitelist_brief_config(
+            AccessControlMode::Whitelist,
+            true,
+            &[("home", "home.example.com", true)],
+            false,
+        );
+        let state = DynamicWhitelistState::default();
+        let lines = format_dynamic_whitelist_brief_lines(&cfg, &state).join("\n");
+        assert!(
+            lines.contains(
+                "警告：当前没有可用动态白名单 IP。若静态白名单也为空，可能导致所有来源被拒绝。"
+            ),
+            "whitelist 模式 + 0 dynamic IPs 时应给出警告: {lines}"
+        );
+    }
+
+    #[test]
+    fn dynamic_whitelist_brief_no_warning_when_current_ips_present() {
+        let cfg = dynamic_whitelist_brief_config(
+            AccessControlMode::Whitelist,
+            true,
+            &[("home", "home.example.com", true)],
+            false,
+        );
+        let state = DynamicWhitelistState {
+            domains: vec![nat_common::dynamic_whitelist::DynamicWhitelistDomainState {
+                name: "home".to_string(),
+                domain: "home.example.com".to_string(),
+                last_good_ips: vec!["203.0.113.10".to_string()],
+                current_ips: vec!["203.0.113.10".to_string()],
+                resolved_at: Some("2026-05-28T00:00:00Z".to_string()),
+                stale: false,
+                error: None,
+                ipv4: true,
+                ipv6: false,
+            }],
+        };
+        let lines = format_dynamic_whitelist_brief_lines(&cfg, &state).join("\n");
+        assert!(lines.contains("current IPs: 1"));
+        assert!(
+            !lines.contains("警告：当前没有可用动态白名单 IP"),
+            "current IPs 非零时不应触发零 IP 警告: {lines}"
+        );
+    }
+
+    #[test]
+    fn dynamic_whitelist_menu_title_uses_simplified_name() {
+        let src = menu_src_non_test();
+        assert!(
+            src.contains("动态 DDNS 来源白名单"),
+            "子菜单标题应统一为「动态 DDNS 来源白名单」"
+        );
+        // 旧标题 v0.8.0 用「动态 DDNS 来源白名单管理」；v0.8.1 简化后不再有「管理」后缀
+        assert!(
+            !src.contains("动态 DDNS 来源白名单管理\n===="),
+            "子菜单标题不应再带「管理」后缀"
+        );
     }
 }

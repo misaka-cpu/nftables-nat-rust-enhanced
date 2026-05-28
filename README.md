@@ -4,7 +4,7 @@
 
 > 命名约定：项目正式名为 **`nftables-nat-rust-enhanced`**（GitHub 仓库、安装命令、release 资产、README 标题、systemd 服务路径、配置 / 数据 / 日志目录均保持此名）；CLI 主菜单标题为简称 **`nft-nat-rust`**，仅用于交互界面显示。两者指向同一项目，未来不会重命名仓库或破坏安装/数据路径。
 
-当前功能版本：**v0.8.0**（新增动态 DDNS 来源白名单）。v0.7.0 维护性重构详见下面 [v0.7.0](#v070) 段落。
+当前稳定版本：**v0.8.1**（CLI 白名单 / 黑名单管理与动态 DDNS 来源白名单子菜单展示层级优化；不改 nft / safe apply / 组合策略）。当前功能版本：**v0.8.0**（新增动态 DDNS 来源白名单）。v0.7.0 维护性重构详见下面 [v0.7.0](#v070) 段落。
 
 核心原则：
 
@@ -239,7 +239,7 @@ allow = (来源不在黑名单)
 - GeoIP 开启且来源不属于 CN/LAN：即使不在黑名单，也会在 prerouting 被 drop。
 - 白名单 + GeoIP 同时启用：只有 **同时命中白名单 且 属于 CN/LAN** 的来源才会被转发。
 
-CLI 的「白名单 / 黑名单管理」和「GeoIP / CN IP 限制」状态页都会显示当前组合策略，方便核对预期。
+CLI 的「白名单 / 黑名单管理」默认页面只显示来源访问控制的简洁摘要（mode / 静态 entries 数量 / 动态 DDNS 状态 / GeoIP / SSH GeoIP），完整组合策略（含 SNAT / MSS / egress / 评估顺序 / 最终目标策略 / 各类警告与提示）通过子菜单「9) 查看来源策略详情」按需展开。子菜单「8) 动态 DDNS 来源白名单」只显示 dynamic_whitelist 自己的状态与情境化提示，不重复 SNAT / MSS / egress / 评估顺序长段；「保存并应用」顺延为 10) 号位。「GeoIP / CN IP 限制」状态页继续显示组合策略，方便和这里的简洁摘要互相核对。
 
 注意：上述组合不会 `flush ruleset`，不会修改用户其他 nftables 表；只在本项目的 `self-nat` / `self-filter` 表内叠加规则。
 
@@ -684,10 +684,10 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release
 ```
 
-指定版本（推荐使用当前功能版 `v0.8.0`，或省略 `--version` 跟随 latest release）：
+指定版本（推荐使用当前稳定版 `v0.8.1`，或省略 `--version` 跟随 latest release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.0
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.1
 ```
 
 不指定 `--version` 时使用 latest release。release 包是核心 CLI 版本，包含：
@@ -734,16 +734,16 @@ nat --version
 示例输出：
 
 ```text
-nat v0.8.0
+nat v0.8.1
 ```
 
-release 构建会显示 GitHub tag，例如 `v0.8.0`。源码编译如果没有注入 tag，会回退到 `Cargo.toml` 的 workspace version；两者都缺失时显示 `dev`，不会输出空字符串。
+release 构建会显示 GitHub tag，例如 `v0.8.1`。源码编译如果没有注入 tag，会回退到 `Cargo.toml` 的 workspace version；两者都缺失时显示 `dev`，不会输出空字符串。
 
 菜单（v0.4.2 起标题携带当前版本号，未注入版本时显示 `nft-nat-rust dev`）：
 
 ```text
 ====================================
-nft-nat-rust v0.8.0
+nft-nat-rust v0.8.1
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
@@ -986,10 +986,10 @@ journalctl -u nat -f
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release
 ```
 
-指定版本（推荐使用当前功能版 `v0.8.0`，或省略 `--version` 跟随 latest release）：
+指定版本（推荐使用当前稳定版 `v0.8.1`，或省略 `--version` 跟随 latest release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.0
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.1
 ```
 
 CLI 更新：
@@ -1114,7 +1114,7 @@ bash install.sh --core-only --build-from-source
 可指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.0
+bash install.sh --core-only --use-release --version v0.8.1
 bash install.sh --core-only --build-from-source
 ```
 
@@ -1126,7 +1126,7 @@ bash install.sh --core-only --build-from-source
 tmp="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh -o "$tmp" && bash "$tmp" --core-only --use-release --enter-menu
 ```
 
-## 项目结构（v0.8.0）
+## 项目结构（v0.8.1）
 
 `nat-cli/src/`
 
@@ -1156,7 +1156,7 @@ tmp="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftab
 
 ## 维护路线
 
-v0.8.0 是 dynamic_whitelist 功能版本。后续仍保持 CLI-first / core-only，不恢复 WebUI / nat-console，不引入多用户架构 / 数据库存储 / DNS 供应商接口。
+v0.8.0 是 dynamic_whitelist 功能版本；v0.8.1 在其之上做 CLI 白名单 / 黑名单管理与动态 DDNS 来源白名单子菜单的展示层级优化，不改 nft / safe apply / 组合策略。后续仍保持 CLI-first / core-only，不恢复 WebUI / nat-console，不引入多用户架构 / 数据库存储 / DNS 供应商接口。
 
 承诺**不**做：
 
