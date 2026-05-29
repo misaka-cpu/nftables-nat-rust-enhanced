@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DynamicWhitelistState {
@@ -25,6 +25,17 @@ pub struct DynamicWhitelistDomainState {
     pub last_good_ips: Vec<String>,
     #[serde(default)]
     pub current_ips: Vec<String>,
+    /// 上一次成功解析得到的原始 IP，便于排查；与 `last_good_ips` 同步更新。
+    #[serde(default)]
+    pub raw_ips: Vec<String>,
+    /// 当前生效的来源条目，已应用 `cidr_expand_ipv4` 扩展。
+    /// 用于 nft 规则生成与状态展示。
+    #[serde(default)]
+    pub effective_sources: Vec<String>,
+    /// 当前生效条目对应的 IPv4 CIDR 扩展模式，写入 state 便于排查。
+    /// 旧 state 缺失时反序列化为 0，会触发下一轮重算。
+    #[serde(default)]
+    pub cidr_expand_ipv4: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<String>,
     #[serde(default)]
@@ -51,6 +62,9 @@ pub enum DynamicWhitelistEvent {
         name: String,
         domain: String,
         ips: Vec<String>,
+        raw_ips: Vec<String>,
+        effective_sources: Vec<String>,
+        cidr_expand_ipv4: u8,
         changed: bool,
     },
     ResolveFail {
@@ -64,6 +78,9 @@ pub enum DynamicWhitelistEvent {
         domain: String,
         old_ips: Vec<String>,
         new_ips: Vec<String>,
+        old_effective_sources: Vec<String>,
+        new_effective_sources: Vec<String>,
+        cidr_expand_ipv4: u8,
     },
 }
 
@@ -148,6 +165,7 @@ where
         };
     }
 
+    let cidr_expand_ipv4 = config.cidr_expand_ipv4;
     let mut domains = Vec::new();
     let mut events = Vec::new();
     for domain_config in &config.domains {
@@ -173,11 +191,18 @@ where
                 let old_ips = previous_domain
                     .map(|state| state.current_ips.clone())
                     .unwrap_or_default();
-                let changed = old_ips != new_ips;
+                let old_effective_sources = previous_domain
+                    .map(|state| state.effective_sources.clone())
+                    .unwrap_or_default();
+                let new_effective_sources = expand_effective_sources(&new_ips, cidr_expand_ipv4);
+                let changed = old_effective_sources != new_effective_sources;
                 events.push(DynamicWhitelistEvent::ResolveSuccess {
                     name: domain_config.name.clone(),
                     domain: domain_config.domain.clone(),
                     ips: new_ips.clone(),
+                    raw_ips: new_ips.clone(),
+                    effective_sources: new_effective_sources.clone(),
+                    cidr_expand_ipv4,
                     changed,
                 });
                 if changed {
@@ -186,13 +211,19 @@ where
                         domain: domain_config.domain.clone(),
                         old_ips,
                         new_ips: new_ips.clone(),
+                        old_effective_sources,
+                        new_effective_sources: new_effective_sources.clone(),
+                        cidr_expand_ipv4,
                     });
                 }
                 domains.push(DynamicWhitelistDomainState {
                     name: domain_config.name.clone(),
                     domain: domain_config.domain.clone(),
                     last_good_ips: new_ips.clone(),
-                    current_ips: new_ips,
+                    current_ips: new_ips.clone(),
+                    raw_ips: new_ips,
+                    effective_sources: new_effective_sources,
+                    cidr_expand_ipv4,
                     resolved_at: Some(now.to_rfc3339()),
                     stale: false,
                     error: None,
@@ -206,10 +237,11 @@ where
                     .unwrap_or_default();
                 let using_last_good =
                     config.use_last_good_on_dns_failure && !last_good_ips.is_empty();
-                let current_ips = if using_last_good {
-                    last_good_ips.clone()
+                let (current_ips, effective_sources) = if using_last_good {
+                    let sources = expand_effective_sources(&last_good_ips, cidr_expand_ipv4);
+                    (last_good_ips.clone(), sources)
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
                 events.push(DynamicWhitelistEvent::ResolveFail {
                     name: domain_config.name.clone(),
@@ -217,11 +249,19 @@ where
                     error: error.clone(),
                     using_last_good,
                 });
+                let raw_ips = if using_last_good {
+                    last_good_ips.clone()
+                } else {
+                    Vec::new()
+                };
                 domains.push(DynamicWhitelistDomainState {
                     name: domain_config.name.clone(),
                     domain: domain_config.domain.clone(),
                     last_good_ips,
                     current_ips,
+                    raw_ips,
+                    effective_sources,
+                    cidr_expand_ipv4,
                     resolved_at: previous_domain.and_then(|state| state.resolved_at.clone()),
                     stale: using_last_good,
                     error: Some(error),
@@ -236,6 +276,38 @@ where
         state: DynamicWhitelistState { domains },
         events,
     }
+}
+
+/// 把原始 IP 列表按 IPv4 CIDR 扩展规则转换为最终生效来源条目。
+///
+/// - `cidr_expand_ipv4 = 32` 或其它非 24 值：保留原始 IPv4 字符串（IPv6 同样原样保留）。
+/// - `cidr_expand_ipv4 = 24`：把每个 IPv4 地址扩展为对应的 /24 网络字符串。
+/// - IPv6 不做扩展。
+/// - 结果去重并按字符串排序，避免输出顺序受输入顺序影响。
+pub fn expand_effective_sources(raw_ips: &[String], cidr_expand_ipv4: u8) -> Vec<String> {
+    let mut result = BTreeSet::new();
+    for raw in raw_ips {
+        if cidr_expand_ipv4 == 24
+            && let Ok(IpAddr::V4(ipv4)) = raw.parse::<IpAddr>()
+        {
+            result.insert(format_ipv4_network(ipv4, 24));
+            continue;
+        }
+        result.insert(raw.clone());
+    }
+    result.into_iter().collect()
+}
+
+fn format_ipv4_network(ip: Ipv4Addr, prefix: u8) -> String {
+    debug_assert!(prefix <= 32);
+    let host_bits = 32 - prefix;
+    let mask: u32 = if host_bits == 32 {
+        0
+    } else {
+        u32::MAX << host_bits
+    };
+    let network = Ipv4Addr::from(u32::from(ip) & mask);
+    format!("{network}/{prefix}")
 }
 
 pub fn current_ips_for_config(
@@ -257,6 +329,48 @@ pub fn current_ips_for_config(
         }
     }
     values.into_iter().collect()
+}
+
+/// 返回当前 enabled domains 的「生效来源条目」集合，已应用 `cidr_expand_ipv4` 扩展。
+///
+/// 为兼容旧 state（没有 `effective_sources` / `cidr_expand_ipv4` 字段），或配置中
+/// `cidr_expand_ipv4` 与 state 中记录的不一致时，会基于 `current_ips` 即时重算，
+/// 避免在两次刷新之间使用陈旧的扩展结果。
+pub fn effective_sources_for_config(
+    config: &DynamicWhitelistConfig,
+    state: &DynamicWhitelistState,
+) -> Vec<String> {
+    if !config.enabled {
+        return Vec::new();
+    }
+    let mut values = BTreeSet::new();
+    for domain_config in config.domains.iter().filter(|domain| domain.enabled) {
+        let Some(domain_state) =
+            state.find_domain_state(&domain_config.name, &domain_config.domain)
+        else {
+            continue;
+        };
+        let sources = effective_sources_view(domain_state, config.cidr_expand_ipv4);
+        for entry in sources {
+            values.insert(entry);
+        }
+    }
+    values.into_iter().collect()
+}
+
+/// 取单个 domain state 的「生效来源条目」视图。
+///
+/// 若 state 中的 `cidr_expand_ipv4` 与配置一致且 `effective_sources` 已经记录，
+/// 则直接返回；否则按配置即时基于 `current_ips` 重新扩展，保证旧 state 与
+/// 模式切换时的展示和 nft 规则生成都使用最新规则。
+pub fn effective_sources_view(
+    state: &DynamicWhitelistDomainState,
+    cidr_expand_ipv4: u8,
+) -> Vec<String> {
+    if state.cidr_expand_ipv4 == cidr_expand_ipv4 && !state.effective_sources.is_empty() {
+        return state.effective_sources.clone();
+    }
+    expand_effective_sources(&state.current_ips, cidr_expand_ipv4)
 }
 
 pub fn stale_count_for_config(
@@ -307,6 +421,9 @@ fn disabled_domain_state(
             .map(|state| state.last_good_ips.clone())
             .unwrap_or_default(),
         current_ips: Vec::new(),
+        raw_ips: Vec::new(),
+        effective_sources: Vec::new(),
+        cidr_expand_ipv4: config.cidr_expand_ipv4,
         resolved_at: previous_domain.and_then(|state| state.resolved_at.clone()),
         stale: false,
         error: None,
@@ -492,6 +609,9 @@ mod tests {
                     domain: "home.example.com".to_string(),
                     last_good_ips: vec![],
                     current_ips: vec!["203.0.113.2".to_string(), "203.0.113.1".to_string()],
+                    raw_ips: vec!["203.0.113.2".to_string(), "203.0.113.1".to_string()],
+                    effective_sources: vec!["203.0.113.1".to_string(), "203.0.113.2".to_string()],
+                    cidr_expand_ipv4: 32,
                     resolved_at: None,
                     stale: false,
                     error: None,
@@ -503,6 +623,9 @@ mod tests {
                     domain: "phone.example.com".to_string(),
                     last_good_ips: vec![],
                     current_ips: vec!["198.51.100.1".to_string()],
+                    raw_ips: vec!["198.51.100.1".to_string()],
+                    effective_sources: vec!["198.51.100.1".to_string()],
+                    cidr_expand_ipv4: 32,
                     resolved_at: None,
                     stale: false,
                     error: None,
@@ -542,5 +665,202 @@ mod tests {
         assert!(validate_dynamic_whitelist_domain("bad domain.example").is_err());
         assert!(validate_dynamic_whitelist_domain("https://example.com").is_err());
         assert!(validate_dynamic_whitelist_domain("-bad.example.com").is_err());
+    }
+
+    #[test]
+    fn expand_effective_sources_keeps_exact_ipv4_when_32() {
+        let sources = expand_effective_sources(&["1.2.3.4".to_string()], 32);
+        assert_eq!(sources, vec!["1.2.3.4"]);
+    }
+
+    #[test]
+    fn expand_effective_sources_expands_ipv4_to_24() {
+        let sources = expand_effective_sources(&["1.2.3.4".to_string()], 24);
+        assert_eq!(sources, vec!["1.2.3.0/24"]);
+    }
+
+    #[test]
+    fn expand_effective_sources_dedupes_same_24_network() {
+        let sources = expand_effective_sources(&["1.2.3.4".to_string(), "1.2.3.9".to_string()], 24);
+        assert_eq!(sources, vec!["1.2.3.0/24"]);
+    }
+
+    #[test]
+    fn expand_effective_sources_keeps_different_24_networks() {
+        let sources = expand_effective_sources(&["1.2.3.4".to_string(), "5.6.7.8".to_string()], 24);
+        assert_eq!(sources, vec!["1.2.3.0/24", "5.6.7.0/24"]);
+    }
+
+    #[test]
+    fn expand_effective_sources_ipv6_kept_as_is() {
+        let sources = expand_effective_sources(&["2001:db8::1".to_string()], 24);
+        assert_eq!(sources, vec!["2001:db8::1"]);
+    }
+
+    #[test]
+    fn refresh_success_records_effective_sources_for_24() {
+        let mut config = config_with_domain();
+        config.cidr_expand_ipv4 = 24;
+        let result = refresh_state_with_resolver(
+            &config,
+            &DynamicWhitelistState::default(),
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]),
+            Utc::now(),
+        );
+        let state = &result.state.domains[0];
+        assert_eq!(state.raw_ips, vec!["1.2.3.4"]);
+        assert_eq!(state.effective_sources, vec!["1.2.3.0/24"]);
+        assert_eq!(state.cidr_expand_ipv4, 24);
+    }
+
+    #[test]
+    fn refresh_change_event_uses_effective_sources_delta() {
+        let mut config = config_with_domain();
+        config.cidr_expand_ipv4 = 24;
+        let first = refresh_state_with_resolver(
+            &config,
+            &DynamicWhitelistState::default(),
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]),
+            Utc::now(),
+        );
+        // Different raw IP but same /24 — should NOT emit Change (effective_sources equal).
+        let same_net = refresh_state_with_resolver(
+            &config,
+            &first.state,
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 99))]),
+            Utc::now(),
+        );
+        assert!(
+            !same_net
+                .events
+                .iter()
+                .any(|event| matches!(event, DynamicWhitelistEvent::Change { .. }))
+        );
+        // Different /24 — Change should fire.
+        let other_net = refresh_state_with_resolver(
+            &config,
+            &same_net.state,
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))]),
+            Utc::now(),
+        );
+        let change = other_net
+            .events
+            .iter()
+            .find(|event| matches!(event, DynamicWhitelistEvent::Change { .. }))
+            .expect("/24 network change should emit Change event");
+        let DynamicWhitelistEvent::Change {
+            old_effective_sources,
+            new_effective_sources,
+            cidr_expand_ipv4,
+            ..
+        } = change
+        else {
+            unreachable!()
+        };
+        assert_eq!(old_effective_sources, &vec!["1.2.3.0/24".to_string()]);
+        assert_eq!(new_effective_sources, &vec!["5.6.7.0/24".to_string()]);
+        assert_eq!(*cidr_expand_ipv4, 24);
+    }
+
+    #[test]
+    fn old_state_without_effective_sources_loads_and_recomputes() {
+        // Old state shape: no raw_ips / effective_sources / cidr_expand_ipv4 keys.
+        let path = temp_path("legacy");
+        let body = r#"{
+  "domains": [
+    {
+      "name": "home",
+      "domain": "home.example.com",
+      "last_good_ips": ["1.2.3.4"],
+      "current_ips": ["1.2.3.4"],
+      "resolved_at": null,
+      "stale": false,
+      "error": null,
+      "ipv4": true,
+      "ipv6": false
+    }
+  ]
+}"#;
+        fs::write(&path, body).unwrap();
+        let loaded = DynamicWhitelistState::load(path.to_str().unwrap());
+        assert_eq!(loaded.domains.len(), 1);
+        assert!(loaded.domains[0].effective_sources.is_empty());
+        assert_eq!(loaded.domains[0].cidr_expand_ipv4, 0);
+
+        // With cidr_expand_ipv4=24, effective_sources_for_config should re-expand
+        // from current_ips even when the persisted effective_sources is empty.
+        let mut config = config_with_domain();
+        config.cidr_expand_ipv4 = 24;
+        let sources = effective_sources_for_config(&config, &loaded);
+        assert_eq!(sources, vec!["1.2.3.0/24"]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn switching_from_32_to_24_recomputes_effective_sources_on_next_refresh() {
+        let mut config = config_with_domain();
+        config.cidr_expand_ipv4 = 32;
+        let first = refresh_state_with_resolver(
+            &config,
+            &DynamicWhitelistState::default(),
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]),
+            Utc::now(),
+        );
+        assert_eq!(first.state.domains[0].effective_sources, vec!["1.2.3.4"]);
+
+        config.cidr_expand_ipv4 = 24;
+        let second = refresh_state_with_resolver(
+            &config,
+            &first.state,
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]),
+            Utc::now(),
+        );
+        assert_eq!(
+            second.state.domains[0].effective_sources,
+            vec!["1.2.3.0/24"]
+        );
+        assert_eq!(second.state.domains[0].cidr_expand_ipv4, 24);
+    }
+
+    #[test]
+    fn effective_sources_view_recomputes_when_mode_differs_from_state() {
+        let state = DynamicWhitelistDomainState {
+            name: "home".to_string(),
+            domain: "home.example.com".to_string(),
+            last_good_ips: vec!["1.2.3.4".to_string()],
+            current_ips: vec!["1.2.3.4".to_string()],
+            raw_ips: vec!["1.2.3.4".to_string()],
+            effective_sources: vec!["1.2.3.4".to_string()],
+            cidr_expand_ipv4: 32,
+            resolved_at: None,
+            stale: false,
+            error: None,
+            ipv4: true,
+            ipv6: false,
+        };
+        // Config wants /24 but state still records /32 — view should re-expand.
+        let view = effective_sources_view(&state, 24);
+        assert_eq!(view, vec!["1.2.3.0/24"]);
+    }
+
+    #[test]
+    fn dns_failure_keeps_effective_sources_under_24() {
+        let mut config = config_with_domain();
+        config.cidr_expand_ipv4 = 24;
+        let first = refresh_state_with_resolver(
+            &config,
+            &DynamicWhitelistState::default(),
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]),
+            Utc::now(),
+        );
+        let failed = refresh_state_with_resolver(
+            &config,
+            &first.state,
+            |_| Err("mock dns failure".to_string()),
+            Utc::now(),
+        );
+        let state = &failed.state.domains[0];
+        assert_eq!(state.effective_sources, vec!["1.2.3.0/24"]);
+        assert!(state.stale);
     }
 }

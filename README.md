@@ -4,7 +4,7 @@
 
 > 命名约定：项目正式名为 **`nftables-nat-rust-enhanced`**（GitHub 仓库、安装命令、release 资产、README 标题、systemd 服务路径、配置 / 数据 / 日志目录均保持此名）；CLI 主菜单标题为简称 **`nft-nat-rust`**，仅用于交互界面显示。两者指向同一项目，未来不会重命名仓库或破坏安装/数据路径。
 
-当前稳定版本：**v0.8.1**（CLI 白名单 / 黑名单管理与动态 DDNS 来源白名单子菜单展示层级优化；不改 nft / safe apply / 组合策略）。当前功能版本：**v0.8.0**（新增动态 DDNS 来源白名单）。v0.7.0 维护性重构详见下面 [v0.7.0](#v070) 段落。
+当前稳定版本：**v0.8.2**（dynamic_whitelist 新增可选 IPv4 `/24` 扩展模式 `cidr_expand_ipv4`，默认 `/32` 精确 IP 行为保持不变；不改 nft / safe apply / 组合策略）。v0.8.1 做了 CLI 白名单 / 黑名单管理与动态 DDNS 来源白名单子菜单展示层级优化；v0.8.0 新增动态 DDNS 来源白名单；v0.7.0 维护性重构详见下面 [v0.7.0](#v070) 段落。
 
 核心原则：
 
@@ -279,6 +279,7 @@ use_last_good_on_dns_failure = true
 resolve_ipv4 = true
 resolve_ipv6 = false
 notify_on_change = true
+cidr_expand_ipv4 = 32
 
 [[dynamic_whitelist.domains]]
 name = "home"
@@ -291,7 +292,7 @@ enabled = true
 - `enabled = false` 时完全不影响现有规则生成
 - `domains` 为空时不生成动态白名单
 - `access_control.mode = "off"` 或 `"blacklist"` 时，动态白名单可以解析和显示状态，但不会作为放行逻辑使用
-- `access_control.mode = "whitelist"` 时，最终来源白名单 = 静态 `access_control.entries` + 当前动态解析 IP
+- `access_control.mode = "whitelist"` 时，最终来源白名单 = 静态 `access_control.entries` + 当前动态解析得到的 effective sources（受 `cidr_expand_ipv4` 影响）
 - 如果动态解析为空且静态白名单也为空，不会自动开放所有来源；当前转发规则会因为无来源白名单而无法匹配，并输出 WARN
 - GeoIP 同时开启时仍是 AND：来源必须命中白名单逻辑，也必须满足 GeoIP 来源地区逻辑
 - 默认只解析 A 记录作为 IPv4 来源白名单；`resolve_ipv6 = true` 时才尝试使用 AAAA 结果
@@ -303,6 +304,46 @@ DNS 成功 / 失败：
 - DNS 成功：更新 `current_ips` 和 `last_good_ips`，旧 IP 会在下一次成功解析后自动移除
 - DNS 失败且 `use_last_good_on_dns_failure=true` 且存在上一次成功 IP：临时保留 last-good 来源 IP，状态标记 `stale=true`
 - DNS 失败且没有 last-good：该 domain 不产生动态白名单 IP，不会放行所有来源，也不会 panic
+
+### IPv4 CIDR 扩展模式
+
+默认：
+
+```toml
+cidr_expand_ipv4 = 32
+```
+
+含义：
+
+- `/32`（默认，推荐）：精确 IP 模式，A 记录解析到 `1.2.3.4`，就放行 `1.2.3.4/32`
+- `/24`：宽松网段模式，A 记录解析到 `1.2.3.4`，就放行 `1.2.3.0/24`
+
+合法值只有 `32` 与 `24`；其它值（例如 `0` / `16` / `25` / `33`）会被配置校验或 CLI 拒绝。第一版只支持 IPv4 扩展；`resolve_ipv6 = true` 时 AAAA 解析结果仍按精确 IPv6 地址处理，不做任何 prefix 扩展。
+
+安全提醒：
+
+- `/24` 会把单个 IP 扩展为 256 个 IPv4 地址，扩大来源白名单范围，等同于把整段运营商出口都放进白名单。
+- 只建议在你确认手机 / 家宽出口 IP 经常在同一 `/24` 内变化时启用。
+- 不要为了「省事」默认开启 `/24`。如果不确定，请保持默认的 `/32`。
+- CLI 切换到 `/24` 必须二次确认；默认按 `N` 拒绝，避免误操作放宽白名单。
+
+state 行为：
+
+- DNS 成功时按当前 `cidr_expand_ipv4` 重新计算 `effective_sources`，**不会** 无限累计历史网段。
+- DNS 失败且使用 last-good 时，会按 **当前** `cidr_expand_ipv4` 重新扩展 last-good 原始 IP，保证模式切换立刻生效。
+- 切换 `/32 ↔ /24` 后，下一次成功解析或下一次刷新会重算并替换 `effective_sources`；不会保留旧模式的网段。
+- 旧 state 文件（v0.8.2 之前，没有 `effective_sources` / `cidr_expand_ipv4` 字段）可以兼容读取；读取后会基于 `current_ips` 即时按当前配置扩展，再下一次成功解析时正式写入新字段。
+- `/24` 扩展只影响 dynamic_whitelist 来源白名单的最终生效条目；不影响静态 `access_control.entries`、`egress_control`、目标 DDNS / 目标 last-good、SSH GeoIP、SNAT、MSS、quota、stats。
+
+CLI / audit / Telegram：
+
+- 「白名单 / 黑名单管理 → 动态 DDNS 来源白名单」子菜单中：
+  - 状态页与详细解析结果会显示当前 `cidr_expand_ipv4`、原始 `raw_ips` 与扩展后的 `effective_sources`。
+  - 新增「设置 IPv4 CIDR 扩展模式」入口；选择 `/24` 会出现二次确认警告，确认前不会保存。
+- `dynamic_whitelist.resolve.success` 事件 detail 包含 `raw_ips` / `effective_sources` / `cidr_expand_ipv4`。
+- `dynamic_whitelist.change` 事件 detail 同时记录原始 IP 与 `old_effective_sources` / `new_effective_sources` / `cidr_expand_ipv4`，便于排查到底是「真实变化」还是「模式切换造成的网段变化」。
+- 切换模式时写 `dynamic_whitelist.cidr_expand.update` audit。
+- 启用 `notify_on_change = true` 时，只在 `effective_sources` 真正变化时发 Telegram 通知；同一 `/24` 内 IP 抖动不会刷屏。
 
 安全提醒：
 
@@ -684,10 +725,10 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release
 ```
 
-指定版本（推荐使用当前稳定版 `v0.8.1`，或省略 `--version` 跟随 latest release）：
+指定版本（推荐使用当前稳定版 `v0.8.2`，或省略 `--version` 跟随 latest release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.1
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.2
 ```
 
 不指定 `--version` 时使用 latest release。release 包是核心 CLI 版本，包含：
@@ -734,16 +775,16 @@ nat --version
 示例输出：
 
 ```text
-nat v0.8.1
+nat v0.8.2
 ```
 
-release 构建会显示 GitHub tag，例如 `v0.8.1`。源码编译如果没有注入 tag，会回退到 `Cargo.toml` 的 workspace version；两者都缺失时显示 `dev`，不会输出空字符串。
+release 构建会显示 GitHub tag，例如 `v0.8.2`。源码编译如果没有注入 tag，会回退到 `Cargo.toml` 的 workspace version；两者都缺失时显示 `dev`，不会输出空字符串。
 
 菜单（v0.4.2 起标题携带当前版本号，未注入版本时显示 `nft-nat-rust dev`）：
 
 ```text
 ====================================
-nft-nat-rust v0.8.1
+nft-nat-rust v0.8.2
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
@@ -884,6 +925,7 @@ use_last_good_on_dns_failure = true
 resolve_ipv4 = true
 resolve_ipv6 = false
 notify_on_change = true
+cidr_expand_ipv4 = 32
 state_file = "/var/lib/nftables-nat-rust/dynamic-whitelist-state.json"
 
 [[dynamic_whitelist.domains]]
@@ -986,10 +1028,10 @@ journalctl -u nat -f
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release
 ```
 
-指定版本（推荐使用当前稳定版 `v0.8.1`，或省略 `--version` 跟随 latest release）：
+指定版本（推荐使用当前稳定版 `v0.8.2`，或省略 `--version` 跟随 latest release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.1
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.2
 ```
 
 CLI 更新：
@@ -1114,7 +1156,7 @@ bash install.sh --core-only --build-from-source
 可指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.1
+bash install.sh --core-only --use-release --version v0.8.2
 bash install.sh --core-only --build-from-source
 ```
 
@@ -1126,7 +1168,7 @@ bash install.sh --core-only --build-from-source
 tmp="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh -o "$tmp" && bash "$tmp" --core-only --use-release --enter-menu
 ```
 
-## 项目结构（v0.8.1）
+## 项目结构（v0.8.2）
 
 `nat-cli/src/`
 

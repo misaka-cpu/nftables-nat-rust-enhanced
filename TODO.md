@@ -75,6 +75,14 @@
 - **audit / Telegram**：解析成功、失败、IP 变化、state prune 写 audit；IP 变化且 `notify_on_change=true` 且 Telegram 可用时通知，沿用 curl 超时和 bot_token 脱敏策略。
 - **未引入**：WebUI / nat-console / tc HTB / ifb / 多用户架构 / 分布式 agent / 数据库存储 / DNS 供应商接口。
 
+### v0.8.2
+
+- **dynamic_whitelist 可选 IPv4 /24 扩展模式**：新增 `dynamic_whitelist.cidr_expand_ipv4`（默认 `32`，可选 `24`）。`/32` 保持精确 IP 行为；`/24` 把 `1.2.3.4` 扩展为 `1.2.3.0/24`，最多放宽到 256 个 IPv4 地址，用于运营商出口经常在同一 `/24` 内变化的场景。第一版只支持 IPv4，IPv6 仍按精确地址处理；非 `32` / `24` 的值在配置校验和 CLI 入口两侧都会被拒绝。
+- **effective_sources 与 raw_ips state 字段**：state 文件新增 `raw_ips` / `effective_sources` / `cidr_expand_ipv4`，旧 state 兼容读取后会按当前 `cidr_expand_ipv4` 即时重算 `effective_sources`；模式切换不会保留旧网段，不会无限累计历史。
+- **CLI 二次确认**：动态 DDNS 来源白名单子菜单新增「设置 IPv4 CIDR 扩展模式」入口；选择 `/24` 会出现警告并默认按 `N` 拒绝；保存走 `safe_write_config`，reason `dynamic_whitelist.cidr_expand.update` 被识别为「影响 nft 规则」，提示 nat.service 将在检测周期内通过 safe apply 应用。
+- **audit / Telegram**：`dynamic_whitelist.resolve.success` 与 `dynamic_whitelist.change` 写入 `raw_ips` / `effective_sources` / `cidr_expand_ipv4`；模式切换写 `dynamic_whitelist.cidr_expand.update` audit；Telegram 仅在 `effective_sources` 变化时通知，沿用 bot_token 脱敏与 curl 超时策略；通知文本对超长列表做截断，避免刷屏。
+- **未引入**：per-domain 独立 `cidr_expand_ipv4`、`allowed_resolved_cidrs`、Cloudflare / DNSPod / DuckDNS 等 DNS 供应商 API、自动更新 DDNS、WebUI / nat-console、tc HTB / ifb、多租户 / server-agent、数据库存储；也不改 safe apply 主流程，不引入 `flush ruleset` / `sysctl --system` / `nft -f` 直刷。
+
 ---
 
 ## 待办（按风险 / 收益排序）
@@ -83,8 +91,9 @@
 
 ## 可选增强：dynamic_whitelist 后续项
 
-- IPv6 完整支持：当前默认 IPv4，后续可在 ip6 来源限制路径和文档验证充分后增强。
-- `allowed_resolved_cidrs`：限制 DDNS 解析结果必须落在用户指定来源 CIDR 内，降低 DDNS 账号被盗后的影响面。
+- IPv6 完整支持：当前默认 IPv4，`cidr_expand_ipv4` 也只支持 IPv4，后续可在 ip6 来源限制路径和文档验证充分后增强。
+- `allowed_resolved_cidrs`：限制 DDNS 解析结果必须落在用户指定来源 CIDR 内，降低 DDNS 账号被盗后的影响面；和 `cidr_expand_ipv4` 是不同维度的安全增强，可叠加使用。
+- per-domain 独立 `cidr_expand_ipv4`：第一版统一应用到全部 domains；后续可考虑按 domain 单独配置，例如手机出口 `/24`、机房专线 `/32`。需要先确认有真实场景再做，避免过度抽象。
 - DNS 失败通知节流：第一版只通知 IP 变化，避免 DNS 抖动刷屏；后续可加入失败通知但必须节流。
 
 不规划：多用户架构、WebUI、复杂 DNS 供应商接口、自动更新 DDNS 供应商。

@@ -1009,6 +1009,7 @@ pub(crate) fn reason_affects_nft(reason: &str) -> bool {
             | "dynamic_whitelist.domain.add"
             | "dynamic_whitelist.domain.delete"
             | "dynamic_whitelist.domain.toggle"
+            | "dynamic_whitelist.cidr_expand.update"
             | "geoip.forward.update"
             | "geoip.ssh.update"
             | "geoip.ssh.port.update"
@@ -1814,6 +1815,7 @@ fn dynamic_whitelist_menu(path: &str) -> Result<(), io::Error> {
 5) 设置刷新间隔
 6) 手动刷新动态白名单
 7) 查看详细解析结果
+8) 设置 IPv4 CIDR 扩展模式
 0) 返回上级菜单
 ===================================="#
         );
@@ -1847,6 +1849,10 @@ fn dynamic_whitelist_menu(path: &str) -> Result<(), io::Error> {
                 show_dynamic_whitelist_details(&config);
                 wait_enter_to_return()?;
             }
+            "8" => {
+                set_dynamic_whitelist_cidr_expand_interactive(path, &config)?;
+                wait_enter_to_return()?;
+            }
             "0" => break,
             value if is_menu_refresh_command(value) => break,
             "" => continue,
@@ -1875,6 +1881,7 @@ pub(crate) fn format_dynamic_whitelist_brief_lines(
 ) -> Vec<String> {
     let dynamic_config = &config.dynamic_whitelist;
     let current_ips = dynamic_whitelist::current_ips_for_config(dynamic_config, state);
+    let effective_sources = dynamic_whitelist::effective_sources_for_config(dynamic_config, state);
     let stale_count = dynamic_whitelist::stale_count_for_config(dynamic_config, state);
     let ipv4_label = if dynamic_config.resolve_ipv4 {
         "enabled"
@@ -1891,7 +1898,8 @@ pub(crate) fn format_dynamic_whitelist_brief_lines(
         format!("  enabled: {}", dynamic_config.enabled),
         "  生效条件: access_control.mode = whitelist".to_string(),
         format!("  domains: {}", dynamic_config.domains.len()),
-        format!("  current IPs: {}", current_ips.len()),
+        format!("  raw IPs: {}", current_ips.len()),
+        format!("  effective sources: {}", effective_sources.len()),
         format!("  stale: {stale_count}"),
         format!(
             "  refresh interval: {}s",
@@ -1899,6 +1907,10 @@ pub(crate) fn format_dynamic_whitelist_brief_lines(
         ),
         format!("  IPv4: {ipv4_label}"),
         format!("  IPv6: {ipv6_label}"),
+        format!(
+            "  IPv4 CIDR 扩展: {}",
+            format_cidr_expand_label(dynamic_config.cidr_expand_ipv4)
+        ),
         format!("  state: {}", dynamic_config.state_file),
         String::new(),
         "说明：".to_string(),
@@ -1933,6 +1945,7 @@ pub(crate) fn format_dynamic_whitelist_status_lines(
 ) -> Vec<String> {
     let dynamic_config = &config.dynamic_whitelist;
     let current_ips = dynamic_whitelist::current_ips_for_config(dynamic_config, state);
+    let effective_sources = dynamic_whitelist::effective_sources_for_config(dynamic_config, state);
     let stale_count = dynamic_whitelist::stale_count_for_config(dynamic_config, state);
     let latest_success = dynamic_whitelist::latest_success_at_for_config(dynamic_config, state)
         .map(|time| format_cli_time_from_rfc3339_with(&time, &config.ui))
@@ -1954,9 +1967,17 @@ pub(crate) fn format_dynamic_whitelist_status_lines(
         "notify_on_change: {}",
         dynamic_config.notify_on_change
     ));
+    lines.push(format!(
+        "cidr_expand_ipv4: {}",
+        format_cidr_expand_label(dynamic_config.cidr_expand_ipv4)
+    ));
     lines.push(format!("state file path: {}", dynamic_config.state_file));
     lines.push(format!("domains 数量: {}", dynamic_config.domains.len()));
-    lines.push(format!("当前解析 IP 数量: {}", current_ips.len()));
+    lines.push(format!("当前 raw IP 数量: {}", current_ips.len()));
+    lines.push(format!(
+        "当前 effective sources 数量: {}",
+        effective_sources.len()
+    ));
     lines.push(format!("stale 数量: {stale_count}"));
     lines.push(format!("最近成功解析时间: {latest_success}"));
     lines.push(format!(
@@ -1972,7 +1993,7 @@ pub(crate) fn format_dynamic_whitelist_status_lines(
     if dynamic_config.enabled
         && config.access_control.mode == AccessControlMode::Whitelist
         && config.access_control.entries.is_empty()
-        && current_ips.is_empty()
+        && effective_sources.is_empty()
     {
         lines.push(
             "WARN：当前动态白名单没有可用 IP，且静态白名单为空；来源白名单为空时所有来源可能被拒绝。"
@@ -2135,6 +2156,79 @@ fn set_dynamic_whitelist_interval_interactive(
     Ok(())
 }
 
+fn set_dynamic_whitelist_cidr_expand_interactive(
+    path: &str,
+    config: &TomlConfig,
+) -> Result<(), io::Error> {
+    let current = config.dynamic_whitelist.cidr_expand_ipv4;
+    println!(
+        "当前 IPv4 CIDR 扩展模式: {}",
+        format_cidr_expand_label(current)
+    );
+    println!("可选模式：");
+    println!("  1) /32 精确 IP，推荐，默认");
+    println!("  2) /24 宽松网段，适合手机/家宽 IP 经常在同一 C 段变化，但会扩大白名单范围");
+    let raw = prompt("请选择新的扩展模式 [1/2]: ")?;
+    let target: u8 = match raw.trim() {
+        "1" => 32,
+        "2" => 24,
+        "" => {
+            println!(
+                "未输入，保持当前模式 {}。",
+                format_cidr_expand_label(current)
+            );
+            return Ok(());
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("无法识别的选项: {other}（只允许 1 或 2）"),
+            ));
+        }
+    };
+    if target == current {
+        println!("当前已是 {}，无需修改。", format_cidr_expand_label(current));
+        return Ok(());
+    }
+    if target == 24 {
+        println!();
+        println!("警告：/24 会把 1.2.3.4 扩展为 1.2.3.0/24，最多放宽到 256 个 IPv4 地址。");
+        println!("这会降低来源白名单精度。只建议在你确认运营商出口经常在同一 /24 内变化时使用。");
+        if !confirm("确认启用 /24 扩展？[y/N]: ")? {
+            println!(
+                "已取消，保持当前模式 {}。",
+                format_cidr_expand_label(current)
+            );
+            return Ok(());
+        }
+    }
+    let mut updated = config.clone();
+    updated.dynamic_whitelist.cidr_expand_ipv4 = target;
+    updated
+        .dynamic_whitelist
+        .validate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    save_toml_config(path, &updated, "dynamic_whitelist.cidr_expand.update")?;
+    audit_cli(
+        path,
+        "dynamic_whitelist.cidr_expand.update",
+        AuditResult::Ok,
+        json!({
+            "reason": "dynamic_whitelist.cidr_expand.update",
+            "old_cidr_expand_ipv4": current,
+            "new_cidr_expand_ipv4": target,
+        }),
+    );
+    println!(
+        "IPv4 CIDR 扩展模式已更新：{} -> {}。",
+        format_cidr_expand_label(current),
+        format_cidr_expand_label(target)
+    );
+    println!("该配置会影响来源白名单生成，nat.service 将在检测周期内通过 safe apply 应用。");
+    print_config_saved_hint(path, "dynamic_whitelist.cidr_expand.update");
+    Ok(())
+}
+
 fn refresh_dynamic_whitelist_interactive(config: &TomlConfig) -> Result<(), io::Error> {
     println!("手动刷新只会解析 DDNS 来源白名单并更新 state，不会直接执行 nft -f。");
     println!("nat.service 下个周期会通过安全 apply 流程应用规则变化。");
@@ -2183,10 +2277,14 @@ fn format_dynamic_whitelist_refresh_result_lines(events: &[DynamicWhitelistEvent
                 name,
                 domain,
                 ips,
+                effective_sources,
+                cidr_expand_ipv4,
                 changed,
+                ..
             } => lines.push(format!(
-                "OK {name} ({domain}) -> {} changed={changed}",
-                format_cli_ip_list(ips)
+                "OK {name} ({domain}) raw={} effective={} /{cidr_expand_ipv4} changed={changed}",
+                format_cli_ip_list(ips),
+                format_cli_ip_list(effective_sources)
             )),
             DynamicWhitelistEvent::ResolveFail {
                 name,
@@ -2201,10 +2299,15 @@ fn format_dynamic_whitelist_refresh_result_lines(events: &[DynamicWhitelistEvent
                 domain,
                 old_ips,
                 new_ips,
+                old_effective_sources,
+                new_effective_sources,
+                cidr_expand_ipv4,
             } => lines.push(format!(
-                "CHANGE {name} ({domain}) {} -> {}",
+                "CHANGE {name} ({domain}) /{cidr_expand_ipv4} raw {} -> {}; sources {} -> {}",
                 format_cli_ip_list(old_ips),
-                format_cli_ip_list(new_ips)
+                format_cli_ip_list(new_ips),
+                format_cli_ip_list(old_effective_sources),
+                format_cli_ip_list(new_effective_sources),
             )),
         }
     }
@@ -2224,6 +2327,10 @@ pub(crate) fn format_dynamic_whitelist_detail_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push("动态 DDNS 来源白名单详细解析结果".to_string());
+    lines.push(format!(
+        "cidr_expand_ipv4: {}",
+        format_cidr_expand_label(config.dynamic_whitelist.cidr_expand_ipv4)
+    ));
     if config.dynamic_whitelist.domains.is_empty() {
         lines.push("  (domains empty)".to_string());
         return lines;
@@ -2233,6 +2340,26 @@ pub(crate) fn format_dynamic_whitelist_detail_lines(
         lines.push(format!("{index}) name: {}", domain.name));
         lines.push(format!("   domain: {}", domain.domain));
         lines.push(format!("   enabled: {}", domain.enabled));
+        let raw_ips_display = state_entry
+            .map(|state| {
+                if !state.raw_ips.is_empty() {
+                    format_cli_ip_list(&state.raw_ips)
+                } else {
+                    format_cli_ip_list(&state.current_ips)
+                }
+            })
+            .unwrap_or_else(|| "(empty)".to_string());
+        let effective_display = state_entry
+            .map(|state| {
+                let sources = dynamic_whitelist::effective_sources_view(
+                    state,
+                    config.dynamic_whitelist.cidr_expand_ipv4,
+                );
+                format_cli_ip_list(&sources)
+            })
+            .unwrap_or_else(|| "(empty)".to_string());
+        lines.push(format!("   raw_ips: {raw_ips_display}"));
+        lines.push(format!("   effective_sources: {effective_display}"));
         lines.push(format!(
             "   current_ips: {}",
             state_entry
@@ -2264,6 +2391,15 @@ pub(crate) fn format_dynamic_whitelist_detail_lines(
         ));
     }
     lines
+}
+
+/// 把 `cidr_expand_ipv4` 转换为用户可读的中文标签。
+fn format_cidr_expand_label(value: u8) -> String {
+    match value {
+        24 => "/24 宽松网段".to_string(),
+        32 => "/32 精确 IP（默认）".to_string(),
+        other => format!("/{other}（非法值）"),
+    }
 }
 
 fn print_dynamic_whitelist_domains(config: &TomlConfig) {
@@ -6004,6 +6140,9 @@ domain = "a.example.com"
                 domain: "home.example.com".to_string(),
                 last_good_ips: vec!["203.0.113.10".to_string()],
                 current_ips: vec!["203.0.113.10".to_string()],
+                raw_ips: vec!["203.0.113.10".to_string()],
+                effective_sources: vec!["203.0.113.10".to_string()],
+                cidr_expand_ipv4: 32,
                 resolved_at: Some("2026-05-28T00:00:00Z".to_string()),
                 stale: true,
                 error: Some("mock dns failure".to_string()),
@@ -6013,7 +6152,9 @@ domain = "a.example.com"
         };
         let lines = format_dynamic_whitelist_status_lines(&cfg, &state).join("\n");
         assert!(lines.contains("enabled: true"));
-        assert!(lines.contains("当前解析 IP 数量: 1"));
+        assert!(lines.contains("当前 raw IP 数量: 1"));
+        assert!(lines.contains("当前 effective sources 数量: 1"));
+        assert!(lines.contains("cidr_expand_ipv4: /32 精确 IP（默认）"));
         assert!(lines.contains("stale 数量: 1"));
         assert!(lines.contains("access_control 未启用 whitelist 模式"));
         assert!(lines.contains("不是目标 IP"));
@@ -6034,6 +6175,9 @@ domain = "a.example.com"
                 domain: "home.example.com".to_string(),
                 last_good_ips: vec!["203.0.113.10".to_string()],
                 current_ips: vec!["203.0.113.10".to_string()],
+                raw_ips: vec!["203.0.113.10".to_string()],
+                effective_sources: vec!["203.0.113.10".to_string()],
+                cidr_expand_ipv4: 32,
                 resolved_at: Some("2026-05-28T00:00:00Z".to_string()),
                 stale: true,
                 error: Some("mock dns failure".to_string()),
@@ -6044,6 +6188,9 @@ domain = "a.example.com"
         let lines = format_dynamic_whitelist_detail_lines(&cfg, &state).join("\n");
         assert!(lines.contains("current_ips: 203.0.113.10"));
         assert!(lines.contains("last_good_ips: 203.0.113.10"));
+        assert!(lines.contains("raw_ips: 203.0.113.10"));
+        assert!(lines.contains("effective_sources: 203.0.113.10"));
+        assert!(lines.contains("cidr_expand_ipv4: /32 精确 IP（默认）"));
         assert!(lines.contains("stale: true"));
         assert!(lines.contains("error: mock dns failure"));
     }
@@ -8364,11 +8511,13 @@ HTTP/2 200
         assert!(lines.contains("enabled: false"));
         assert!(lines.contains("生效条件: access_control.mode = whitelist"));
         assert!(lines.contains("domains: 0"));
-        assert!(lines.contains("current IPs: 0"));
+        assert!(lines.contains("raw IPs: 0"));
+        assert!(lines.contains("effective sources: 0"));
         assert!(lines.contains("stale: 0"));
         assert!(lines.contains("refresh interval: 300s"));
         assert!(lines.contains("IPv4: enabled"));
         assert!(lines.contains("IPv6: disabled"));
+        assert!(lines.contains("IPv4 CIDR 扩展: /32 精确 IP"));
         assert!(lines.contains("state: /var/lib/nftables-nat-rust/dynamic-whitelist-state.json"));
         // 默认状态（disabled，mode=off）：不触发任何情境化提示
         assert!(
@@ -8479,6 +8628,9 @@ HTTP/2 200
                 domain: "home.example.com".to_string(),
                 last_good_ips: vec!["203.0.113.10".to_string()],
                 current_ips: vec!["203.0.113.10".to_string()],
+                raw_ips: vec!["203.0.113.10".to_string()],
+                effective_sources: vec!["203.0.113.10".to_string()],
+                cidr_expand_ipv4: 32,
                 resolved_at: Some("2026-05-28T00:00:00Z".to_string()),
                 stale: false,
                 error: None,
@@ -8487,10 +8639,52 @@ HTTP/2 200
             }],
         };
         let lines = format_dynamic_whitelist_brief_lines(&cfg, &state).join("\n");
-        assert!(lines.contains("current IPs: 1"));
+        assert!(lines.contains("raw IPs: 1"));
+        assert!(lines.contains("effective sources: 1"));
+        assert!(lines.contains("IPv4 CIDR 扩展: /32 精确 IP"));
         assert!(
             !lines.contains("警告：当前没有可用动态白名单 IP"),
-            "current IPs 非零时不应触发零 IP 警告: {lines}"
+            "raw IPs 非零时不应触发零 IP 警告: {lines}"
+        );
+    }
+
+    #[test]
+    fn cidr_expand_label_renders_both_modes() {
+        assert!(format_cidr_expand_label(32).contains("/32"));
+        assert!(format_cidr_expand_label(32).contains("精确"));
+        assert!(format_cidr_expand_label(24).contains("/24"));
+        assert!(format_cidr_expand_label(24).contains("宽松"));
+        assert!(format_cidr_expand_label(16).contains("非法值"));
+    }
+
+    #[test]
+    fn cidr_expand_save_reason_is_in_nft_affecting_list() {
+        // CIDR mode change must trigger the "nft-affecting" save hint so the user knows
+        // nat.service will re-apply rules in the next detection cycle.
+        assert!(reason_affects_nft("dynamic_whitelist.cidr_expand.update"));
+    }
+
+    #[test]
+    fn cidr_expand_menu_lists_option_8_in_dynamic_whitelist_submenu() {
+        let src = menu_src_non_test();
+        // 子菜单必须暴露选项 8 (设置 IPv4 CIDR 扩展模式)，否则用户无入口切换 /32 ↔ /24。
+        assert!(
+            src.contains("8) 设置 IPv4 CIDR 扩展模式"),
+            "动态 DDNS 来源白名单子菜单需新增「8) 设置 IPv4 CIDR 扩展模式」选项"
+        );
+    }
+
+    #[test]
+    fn cidr_expand_warning_text_explains_256_addresses_and_double_confirm() {
+        let src = menu_src_non_test();
+        // /24 切换必须给出二次确认警告，明确说明影响范围（256 地址）和 [y/N] 默认拒绝。
+        assert!(
+            src.contains("最多放宽到 256 个 IPv4 地址"),
+            "/24 切换需提示最多 256 个 IPv4 地址的影响"
+        );
+        assert!(
+            src.contains("确认启用 /24 扩展？[y/N]"),
+            "/24 切换需要二次确认且默认为 N"
         );
     }
 

@@ -555,6 +555,8 @@ pub struct DynamicWhitelistConfig {
     pub notify_on_change: bool,
     #[serde(default = "default_dynamic_whitelist_state_file")]
     pub state_file: String,
+    #[serde(default = "default_dynamic_whitelist_cidr_expand_ipv4")]
+    pub cidr_expand_ipv4: u8,
     #[serde(default)]
     pub domains: Vec<DynamicWhitelistDomainConfig>,
 }
@@ -569,6 +571,7 @@ impl Default for DynamicWhitelistConfig {
             resolve_ipv6: false,
             notify_on_change: true,
             state_file: default_dynamic_whitelist_state_file(),
+            cidr_expand_ipv4: default_dynamic_whitelist_cidr_expand_ipv4(),
             domains: Vec::new(),
         }
     }
@@ -1239,6 +1242,10 @@ fn default_dynamic_whitelist_state_file() -> String {
     "/var/lib/nftables-nat-rust/dynamic-whitelist-state.json".to_string()
 }
 
+fn default_dynamic_whitelist_cidr_expand_ipv4() -> u8 {
+    32
+}
+
 fn default_stats_data_file() -> String {
     "/var/lib/nftables-nat-rust/stats.json".to_string()
 }
@@ -1567,6 +1574,12 @@ impl DynamicWhitelistConfig {
         }
         if self.state_file.trim().is_empty() {
             return Err("dynamic_whitelist.state_file 不能为空".to_string());
+        }
+        if self.cidr_expand_ipv4 != 32 && self.cidr_expand_ipv4 != 24 {
+            return Err(format!(
+                "dynamic_whitelist.cidr_expand_ipv4 只能是 32 或 24，当前值: {}",
+                self.cidr_expand_ipv4
+            ));
         }
         for (idx, domain) in self.domains.iter().enumerate() {
             domain
@@ -2265,6 +2278,7 @@ ip_version = "all"
         assert!(config.dynamic_whitelist.resolve_ipv4);
         assert!(!config.dynamic_whitelist.resolve_ipv6);
         assert!(config.dynamic_whitelist.notify_on_change);
+        assert_eq!(config.dynamic_whitelist.cidr_expand_ipv4, 32);
         assert!(config.dynamic_whitelist.domains.is_empty());
     }
 
@@ -2338,8 +2352,42 @@ domain = "home.example.com"
         assert!(config.dynamic_whitelist.resolve_ipv4);
         assert!(!config.dynamic_whitelist.resolve_ipv6);
         assert!(config.dynamic_whitelist.notify_on_change);
+        assert_eq!(config.dynamic_whitelist.cidr_expand_ipv4, 32);
         assert_eq!(config.dynamic_whitelist.domains.len(), 1);
         assert!(config.dynamic_whitelist.domains[0].enabled);
+    }
+
+    #[test]
+    fn dynamic_whitelist_cidr_expand_24_is_valid() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[dynamic_whitelist]
+enabled = true
+cidr_expand_ipv4 = 24
+
+[[dynamic_whitelist.domains]]
+name = "home"
+domain = "home.example.com"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.dynamic_whitelist.cidr_expand_ipv4, 24);
+    }
+
+    #[test]
+    fn dynamic_whitelist_cidr_expand_invalid_values_rejected() {
+        for value in [0u8, 16, 25, 33] {
+            let toml = format!(
+                "rules = []\n\n[dynamic_whitelist]\nenabled = true\ncidr_expand_ipv4 = {value}\n"
+            );
+            let err = TomlConfig::from_toml_str(&toml).unwrap_err();
+            assert!(
+                err.contains("cidr_expand_ipv4"),
+                "value {value} should be rejected, got: {err}"
+            );
+        }
     }
 
     #[test]

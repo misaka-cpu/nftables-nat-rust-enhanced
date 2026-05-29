@@ -56,3 +56,6 @@ use_last_good_on_dns_failure = true
 resolve_ipv4 = true
 resolve_ipv6 = false
 notify_on_change = true
+# IPv4 CIDR 扩展模式：32 = 精确 IP（默认，推荐），24 = 把单个 IP 扩展为 /24 网段。
+# 仅在确认运营商出口经常在同一 /24 内变化时再切换到 24。
+cidr_expand_ipv4 = 32

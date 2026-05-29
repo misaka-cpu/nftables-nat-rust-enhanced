@@ -253,7 +253,7 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
                 dynamic_whitelist_state = refreshed.state;
                 last_dynamic_whitelist_refresh = Some(loop_now);
             }
-            let dynamic_whitelist_ips = dynamic_whitelist::current_ips_for_config(
+            let dynamic_whitelist_ips = dynamic_whitelist::effective_sources_for_config(
                 &dynamic_whitelist_config,
                 &dynamic_whitelist_state,
             );
@@ -410,7 +410,7 @@ pub(crate) fn refresh_once(args: &Args) -> Result<(), io::Error> {
         );
         dynamic_whitelist_state = refreshed.state;
     }
-    let dynamic_whitelist_ips = dynamic_whitelist::current_ips_for_config(
+    let dynamic_whitelist_ips = dynamic_whitelist::effective_sources_for_config(
         &runtime_config.dynamic_whitelist,
         &dynamic_whitelist_state,
     );
@@ -677,6 +677,9 @@ fn audit_dynamic_whitelist_events(audit_config: &AuditConfig, events: &[DynamicW
                 name,
                 domain,
                 ips,
+                raw_ips,
+                effective_sources,
+                cidr_expand_ipv4,
                 changed,
             } => audit::log_event(
                 audit_config,
@@ -686,6 +689,9 @@ fn audit_dynamic_whitelist_events(audit_config: &AuditConfig, events: &[DynamicW
                     "name": name,
                     "domain": domain,
                     "ips": ips,
+                    "raw_ips": raw_ips,
+                    "effective_sources": effective_sources,
+                    "cidr_expand_ipv4": cidr_expand_ipv4,
                     "changed": changed,
                 }),
             ),
@@ -710,6 +716,9 @@ fn audit_dynamic_whitelist_events(audit_config: &AuditConfig, events: &[DynamicW
                 domain,
                 old_ips,
                 new_ips,
+                old_effective_sources,
+                new_effective_sources,
+                cidr_expand_ipv4,
             } => audit::log_event(
                 audit_config,
                 "dynamic_whitelist.change",
@@ -719,6 +728,9 @@ fn audit_dynamic_whitelist_events(audit_config: &AuditConfig, events: &[DynamicW
                     "domain": domain,
                     "old_ips": old_ips,
                     "new_ips": new_ips,
+                    "old_effective_sources": old_effective_sources,
+                    "new_effective_sources": new_effective_sources,
+                    "cidr_expand_ipv4": cidr_expand_ipv4,
                 }),
             ),
         }
@@ -759,14 +771,26 @@ fn maybe_notify_dynamic_whitelist_changes_with<F>(
             domain,
             old_ips,
             new_ips,
+            old_effective_sources,
+            new_effective_sources,
+            cidr_expand_ipv4,
         } = event
         else {
             continue;
         };
         let message = format!(
-            "dynamic whitelist changed\nname: {name}\ndomain: {domain}\nold: {}\nnew: {}",
-            format_ip_list(old_ips),
-            format_ip_list(new_ips)
+            "dynamic whitelist changed\n\
+             name: {name}\n\
+             domain: {domain}\n\
+             cidr_expand_ipv4: /{cidr_expand_ipv4}\n\
+             old raw: {}\n\
+             new raw: {}\n\
+             old sources: {}\n\
+             new sources: {}",
+            format_ip_list_truncated(old_ips, 8),
+            format_ip_list_truncated(new_ips, 8),
+            format_ip_list_truncated(old_effective_sources, 8),
+            format_ip_list_truncated(new_effective_sources, 8),
         );
         if let Err(e) = traffic_stats::send_telegram_with(telegram_config, &message, &mut sender) {
             warn!(
@@ -778,12 +802,17 @@ fn maybe_notify_dynamic_whitelist_changes_with<F>(
     }
 }
 
-fn format_ip_list(ips: &[String]) -> String {
+/// 把 IP / CIDR 列表渲染为人类可读字符串；超过 `max` 条时只显示前 `max` 条并附加
+/// 省略说明，避免 dynamic_whitelist Telegram 通知在解析结果很大时刷屏。
+fn format_ip_list_truncated(ips: &[String], max: usize) -> String {
     if ips.is_empty() {
-        "(empty)".to_string()
-    } else {
-        ips.join(", ")
+        return "(empty)".to_string();
     }
+    if ips.len() <= max {
+        return ips.join(", ");
+    }
+    let shown = ips[..max].join(", ");
+    format!("{shown}, … (+{} more)", ips.len() - max)
 }
 
 fn access_config_with_dynamic_whitelist(
@@ -1673,6 +1702,70 @@ refresh_interval_seconds = 123
     }
 
     #[test]
+    fn dynamic_whitelist_cidr_expand_24_generates_cidr_saddr_match() {
+        let cells = vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
+        })];
+        let mut dynamic_config = DynamicWhitelistConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        dynamic_config.cidr_expand_ipv4 = 24;
+        dynamic_config.domains = vec![nat_common::DynamicWhitelistDomainConfig {
+            name: "home".to_string(),
+            domain: "home.example.com".to_string(),
+            enabled: true,
+        }];
+        let refreshed = nat_common::dynamic_whitelist::refresh_state_with_resolver(
+            &dynamic_config,
+            &DynamicWhitelistState::default(),
+            |_| {
+                Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    1, 2, 3, 4,
+                ))])
+            },
+            chrono::Utc::now(),
+        );
+        let effective_sources = nat_common::dynamic_whitelist::effective_sources_for_config(
+            &dynamic_config,
+            &refreshed.state,
+        );
+        assert_eq!(effective_sources, vec!["1.2.3.0/24".to_string()]);
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Whitelist,
+            entries: Vec::new(),
+        };
+        let effective = access_config_with_dynamic_whitelist(&access, &effective_sources);
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &effective,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap();
+        assert!(
+            script.contains("ip saddr { 1.2.3.0/24 } tcp dport 30080 counter dnat"),
+            "expected /24 saddr match in script: {script}"
+        );
+    }
+
+    #[test]
     fn dynamic_whitelist_change_writes_audit() {
         let dir = std::env::temp_dir().join(format!(
             "dynamic-whitelist-audit-{}-{}",
@@ -1691,11 +1784,15 @@ refresh_interval_seconds = 123
             domain: "home.example.com".to_string(),
             old_ips: vec!["203.0.113.10".to_string()],
             new_ips: vec!["203.0.113.20".to_string()],
+            old_effective_sources: vec!["203.0.113.10".to_string()],
+            new_effective_sources: vec!["203.0.113.20".to_string()],
+            cidr_expand_ipv4: 32,
         }];
         audit_dynamic_whitelist_events(&audit_config, &events);
         let raw = fs::read_to_string(&audit_file).unwrap();
         assert!(raw.contains("\"action\":\"dynamic_whitelist.change\""));
         assert!(raw.contains("203.0.113.20"));
+        assert!(raw.contains("\"cidr_expand_ipv4\":32"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1744,6 +1841,9 @@ refresh_interval_seconds = 123
                 name: "home".to_string(),
                 domain: "home.example.com".to_string(),
                 ips: vec!["203.0.113.20".to_string()],
+                raw_ips: vec!["203.0.113.20".to_string()],
+                effective_sources: vec!["203.0.113.20".to_string()],
+                cidr_expand_ipv4: 32,
                 changed: true,
             },
             DynamicWhitelistEvent::Change {
@@ -1751,6 +1851,9 @@ refresh_interval_seconds = 123
                 domain: "home.example.com".to_string(),
                 old_ips: vec!["203.0.113.10".to_string()],
                 new_ips: vec!["203.0.113.20".to_string()],
+                old_effective_sources: vec!["203.0.113.10".to_string()],
+                new_effective_sources: vec!["203.0.113.20".to_string()],
+                cidr_expand_ipv4: 32,
             },
         ];
         let mut sent_messages = Vec::new();
