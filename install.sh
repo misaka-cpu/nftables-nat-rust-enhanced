@@ -170,6 +170,89 @@ cleanup_install_payload() {
     fi
 }
 
+validate_tar_asset() {
+    local archive_path="$1"
+    local source_name="$2"
+    local members verbose member normalized basename nat_candidates type line part member_parts
+
+    log_info "validating ${source_name} tar archive: $archive_path"
+    if ! members="$(tar -tzf "$archive_path")"; then
+        log_err "failed to list ${source_name} tar archive: $archive_path"
+        return 1
+    fi
+    if [ -z "$members" ]; then
+        log_err "${source_name} tar archive is empty: $archive_path"
+        return 1
+    fi
+
+    nat_candidates=0
+    while IFS= read -r member; do
+        [ -n "$member" ] || continue
+        case "$member" in
+            /*)
+                log_err "unsafe ${source_name} tar member uses absolute path: $member"
+                return 1
+                ;;
+        esac
+        IFS='/' read -r -a member_parts <<< "$member"
+        for part in "${member_parts[@]}"; do
+            if [ "$part" = ".." ]; then
+                log_err "unsafe ${source_name} tar member contains '..': $member"
+                return 1
+            fi
+        done
+        normalized="${member%/}"
+        basename="${normalized##*/}"
+        if [ "$member" = "$normalized" ] && [ "$basename" = "nat" ]; then
+            nat_candidates=$((nat_candidates + 1))
+        fi
+    done <<< "$members"
+
+    if [ "$nat_candidates" -eq 0 ]; then
+        log_err "${source_name} asset does not contain nat binary"
+        return 1
+    fi
+    if [ "$nat_candidates" -gt 1 ]; then
+        log_err "${source_name} asset contains multiple nat binaries; refusing to guess"
+        return 1
+    fi
+
+    if ! verbose="$(tar -tzvf "$archive_path")"; then
+        log_err "failed to inspect ${source_name} tar member types: $archive_path"
+        return 1
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        type="${line:0:1}"
+        case "$type" in
+            -|d) ;;
+            *)
+                log_err "unsafe ${source_name} tar member type: $line"
+                return 1
+                ;;
+        esac
+    done <<< "$verbose"
+
+    log_ok "${source_name} tar members validated"
+}
+
+find_unique_nat_binary() {
+    local payload_root="$1"
+    local source_name="$2"
+    local candidates
+
+    mapfile -t candidates < <(find "$payload_root" -type f -name nat -print)
+    if [ "${#candidates[@]}" -eq 0 ]; then
+        log_err "${source_name} payload does not contain nat binary"
+        return 1
+    fi
+    if [ "${#candidates[@]}" -gt 1 ]; then
+        log_err "${source_name} payload contains multiple nat binaries; refusing to guess"
+        return 1
+    fi
+    printf '%s' "${candidates[0]}"
+}
+
 download_release_from_base() {
     local source_name="$1"
     local base_url="$2"
@@ -239,6 +322,7 @@ prepare_release_payload() {
     done
 
     tmp_dir="$(mktemp -d)"
+    CLEANUP_PAYLOAD_DIR="$tmp_dir"
     archive_path="$tmp_dir/$RELEASE_ASSET"
     sums_path="$tmp_dir/SHA256SUMS"
     if [ -n "$MIRROR_BASE" ]; then
@@ -266,12 +350,13 @@ prepare_release_payload() {
         fi
     fi
 
+    validate_tar_asset "$archive_path" "release" || return 1
     mkdir -p "$tmp_dir/payload"
     if ! tar -xzf "$archive_path" -C "$tmp_dir/payload"; then
         log_err "failed to extract release asset: $archive_path"
         return 1
     fi
-    payload_nat="$(find "$tmp_dir/payload" -type f -name nat -print -quit)"
+    payload_nat="$(find_unique_nat_binary "$tmp_dir/payload" "release")" || return 1
     if [ -z "${payload_nat:-}" ] || [ ! -x "$payload_nat" ]; then
         log_err "release payload does not contain executable nat"
         return 1
@@ -283,7 +368,6 @@ prepare_release_payload() {
     export NAT_BINARY_DIR="$payload_dir"
     INSTALL_PAYLOAD_KIND="release"
     INSTALL_PAYLOAD_DESC="$RELEASE_ASSET"
-    CLEANUP_PAYLOAD_DIR="$tmp_dir"
     log_ok "release payload ready: $RELEASE_ASSET"
 }
 
@@ -335,34 +419,31 @@ prepare_local_asset_payload() {
     fi
     log_info "using local release asset source: $LOCAL_ASSET_PATH"
     tmp_dir="$(mktemp -d)"
+    CLEANUP_PAYLOAD_DIR="$tmp_dir"
+    validate_tar_asset "$LOCAL_ASSET_PATH" "local asset" || return 1
     mkdir -p "$tmp_dir/payload"
     if ! tar -xzf "$LOCAL_ASSET_PATH" -C "$tmp_dir/payload"; then
         log_err "failed to extract local asset: $LOCAL_ASSET_PATH"
-        rm -rf "$tmp_dir"
         return 1
     fi
-    payload_nat="$(find "$tmp_dir/payload" -type f -name nat -print -quit)"
+    payload_nat="$(find_unique_nat_binary "$tmp_dir/payload" "local asset")" || return 1
     if [ -z "${payload_nat:-}" ]; then
         log_err "local asset does not contain nat binary"
-        rm -rf "$tmp_dir"
         return 1
     fi
     if [ ! -x "$payload_nat" ]; then
         log_info "making extracted nat executable: $payload_nat"
         if ! chmod +x "$payload_nat"; then
             log_err "failed to chmod +x extracted nat binary"
-            rm -rf "$tmp_dir"
             return 1
         fi
     fi
     payload_dir="$(dirname "$payload_nat")"
     RELEASE_PAYLOAD_DIR="$payload_dir"
     select_install_source_dir "$payload_dir" || {
-        rm -rf "$tmp_dir"
         return 1
     }
     export NAT_BINARY_DIR="$payload_dir"
-    CLEANUP_PAYLOAD_DIR="$tmp_dir"
     log_ok "local release asset ready: $LOCAL_ASSET_PATH"
 }
 
@@ -633,6 +714,10 @@ run_uninstall() {
     fi
     systemctl daemon-reload || true
 }
+
+if [ "${NAT_TEST_SOURCE_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 if [ "$#" -eq 0 ]; then
     ACTION="--core-only"

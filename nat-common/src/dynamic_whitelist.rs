@@ -73,6 +73,11 @@ pub enum DynamicWhitelistEvent {
         error: String,
         using_last_good: bool,
     },
+    StalePruned {
+        name: String,
+        old_domain: String,
+        new_domain: String,
+    },
     Change {
         name: String,
         domain: String,
@@ -125,7 +130,10 @@ impl DynamicWhitelistState {
         self.domains
             .iter()
             .find(|state| state.name == name && state.domain == domain)
-            .or_else(|| self.domains.iter().find(|state| state.name == name))
+    }
+
+    pub fn find_domain_state_by_name(&self, name: &str) -> Option<&DynamicWhitelistDomainState> {
+        self.domains.iter().find(|state| state.name == name)
     }
 
     pub fn prune_for_config(
@@ -171,6 +179,16 @@ where
     for domain_config in &config.domains {
         let previous_domain =
             previous.find_domain_state(&domain_config.name, &domain_config.domain);
+        if previous_domain.is_none()
+            && let Some(stale_domain) = previous.find_domain_state_by_name(&domain_config.name)
+            && stale_domain.domain != domain_config.domain
+        {
+            events.push(DynamicWhitelistEvent::StalePruned {
+                name: domain_config.name.clone(),
+                old_domain: stale_domain.domain.clone(),
+                new_domain: domain_config.domain.clone(),
+            });
+        }
         if !domain_config.enabled {
             domains.push(disabled_domain_state(
                 config,
@@ -232,9 +250,7 @@ where
                 });
             }
             Err(error) => {
-                let last_good_ips = previous_domain
-                    .map(|state| state.last_good_ips.clone())
-                    .unwrap_or_default();
+                let last_good_ips = last_good_ips_for_config(config, previous_domain);
                 let using_last_good =
                     config.use_last_good_on_dns_failure && !last_good_ips.is_empty();
                 let (current_ips, effective_sources) = if using_last_good {
@@ -276,6 +292,26 @@ where
         state: DynamicWhitelistState { domains },
         events,
     }
+}
+
+fn last_good_ips_for_config(
+    config: &DynamicWhitelistConfig,
+    previous_domain: Option<&DynamicWhitelistDomainState>,
+) -> Vec<String> {
+    previous_domain
+        .map(|state| {
+            state
+                .last_good_ips
+                .iter()
+                .filter(|raw| match raw.parse::<IpAddr>() {
+                    Ok(IpAddr::V4(_)) => config.resolve_ipv4,
+                    Ok(IpAddr::V6(_)) => config.resolve_ipv6,
+                    Err(_) => false,
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 把原始 IP 列表按 IPv4 CIDR 扩展规则转换为最终生效来源条目。
@@ -484,12 +520,259 @@ mod tests {
         }
     }
 
+    fn config_with_domain_name(name: &str, domain: &str) -> DynamicWhitelistConfig {
+        DynamicWhitelistConfig {
+            enabled: true,
+            domains: vec![DynamicWhitelistDomainConfig {
+                name: name.to_string(),
+                domain: domain.to_string(),
+                enabled: true,
+            }],
+            ..Default::default()
+        }
+    }
+
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "dynamic-whitelist-{name}-{}-{}",
             std::process::id(),
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn same_name_same_domain_dns_failure_reuses_last_good() {
+        let config = config_with_domain_name("home", "home.example.com");
+        let first = refresh_state_with_resolver(
+            &config,
+            &DynamicWhitelistState::default(),
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]),
+            Utc::now(),
+        );
+        let failed = refresh_state_with_resolver(
+            &config,
+            &first.state,
+            |_| Err("mock dns failure".to_string()),
+            Utc::now(),
+        );
+
+        let state = &failed.state.domains[0];
+        assert_eq!(state.domain, "home.example.com");
+        assert_eq!(state.current_ips, vec!["203.0.113.10"]);
+        assert_eq!(state.last_good_ips, vec!["203.0.113.10"]);
+        assert!(state.stale);
+        assert!(matches!(
+            failed.events[0],
+            DynamicWhitelistEvent::ResolveFail {
+                using_last_good: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn same_name_domain_change_dns_failure_does_not_reuse_old_last_good() {
+        let old_config = config_with_domain_name("home", "old.example.com");
+        let old_state = refresh_state_with_resolver(
+            &old_config,
+            &DynamicWhitelistState::default(),
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]),
+            Utc::now(),
+        )
+        .state;
+        let new_config = config_with_domain_name("home", "new.example.com");
+        let failed = refresh_state_with_resolver(
+            &new_config,
+            &old_state,
+            |_| Err("mock dns failure".to_string()),
+            Utc::now(),
+        );
+
+        let state = &failed.state.domains[0];
+        assert_eq!(state.name, "home");
+        assert_eq!(state.domain, "new.example.com");
+        assert!(state.current_ips.is_empty());
+        assert!(state.last_good_ips.is_empty());
+        assert!(state.effective_sources.is_empty());
+        assert!(!state.stale);
+        assert!(failed.events.iter().any(|event| matches!(
+            event,
+            DynamicWhitelistEvent::StalePruned {
+                name,
+                old_domain,
+                new_domain
+            } if name == "home"
+                && old_domain == "old.example.com"
+                && new_domain == "new.example.com"
+        )));
+        assert!(failed.events.iter().any(|event| matches!(
+            event,
+            DynamicWhitelistEvent::ResolveFail {
+                using_last_good: false,
+                ..
+            }
+        )));
+        assert!(!failed.state.domains.iter().any(|state| {
+            state.domain == "old.example.com"
+                || state.current_ips.contains(&"203.0.113.10".to_string())
+        }));
+    }
+
+    #[test]
+    fn dns_failure_does_not_reuse_last_good_from_disabled_ip_family() {
+        let old_config = config_with_domain_name("home", "home.example.com");
+        let old_state = refresh_state_with_resolver(
+            &old_config,
+            &DynamicWhitelistState::default(),
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]),
+            Utc::now(),
+        )
+        .state;
+        let mut new_config = config_with_domain_name("home", "home.example.com");
+        new_config.resolve_ipv4 = false;
+        new_config.resolve_ipv6 = true;
+
+        let failed = refresh_state_with_resolver(
+            &new_config,
+            &old_state,
+            |_| Err("mock dns failure".to_string()),
+            Utc::now(),
+        );
+
+        let state = &failed.state.domains[0];
+        assert!(state.current_ips.is_empty());
+        assert!(state.last_good_ips.is_empty());
+        assert!(state.effective_sources.is_empty());
+        assert!(!state.stale);
+        assert!(failed.events.iter().any(|event| matches!(
+            event,
+            DynamicWhitelistEvent::ResolveFail {
+                using_last_good: false,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn same_name_domain_change_dns_success_writes_new_last_good() {
+        let old_config = config_with_domain_name("home", "old.example.com");
+        let old_state = refresh_state_with_resolver(
+            &old_config,
+            &DynamicWhitelistState::default(),
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]),
+            Utc::now(),
+        )
+        .state;
+        let new_config = config_with_domain_name("home", "new.example.com");
+        let refreshed = refresh_state_with_resolver(
+            &new_config,
+            &old_state,
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20))]),
+            Utc::now(),
+        );
+
+        let state = &refreshed.state.domains[0];
+        assert_eq!(state.name, "home");
+        assert_eq!(state.domain, "new.example.com");
+        assert_eq!(state.current_ips, vec!["198.51.100.20"]);
+        assert_eq!(state.last_good_ips, vec!["198.51.100.20"]);
+        assert_eq!(state.effective_sources, vec!["198.51.100.20"]);
+        assert!(!state.current_ips.contains(&"203.0.113.10".to_string()));
+        assert!(refreshed.events.iter().any(|event| matches!(
+            event,
+            DynamicWhitelistEvent::StalePruned {
+                name,
+                old_domain,
+                new_domain
+            } if name == "home"
+                && old_domain == "old.example.com"
+                && new_domain == "new.example.com"
+        )));
+    }
+
+    #[test]
+    fn prune_removes_same_name_domain_mismatch() {
+        let config = config_with_domain_name("home", "new.example.com");
+        let mut state = DynamicWhitelistState {
+            domains: vec![DynamicWhitelistDomainState {
+                name: "home".to_string(),
+                domain: "old.example.com".to_string(),
+                last_good_ips: vec!["203.0.113.10".to_string()],
+                current_ips: vec!["203.0.113.10".to_string()],
+                raw_ips: vec!["203.0.113.10".to_string()],
+                effective_sources: vec!["203.0.113.10".to_string()],
+                cidr_expand_ipv4: 32,
+                resolved_at: None,
+                stale: false,
+                error: None,
+                ipv4: true,
+                ipv6: false,
+            }],
+        };
+
+        let pruned = state.prune_for_config(&config);
+        assert!(pruned.changed);
+        assert_eq!(pruned.removed, 1);
+        assert!(state.domains.is_empty());
+    }
+
+    #[test]
+    fn domain_change_success_keeps_exact_ipv4_when_expand_disabled() {
+        let old_config = config_with_domain_name("home", "old.example.com");
+        let old_state = refresh_state_with_resolver(
+            &old_config,
+            &DynamicWhitelistState::default(),
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]),
+            Utc::now(),
+        )
+        .state;
+        let mut new_config = config_with_domain_name("home", "new.example.com");
+        new_config.cidr_expand_ipv4 = 32;
+
+        let refreshed = refresh_state_with_resolver(
+            &new_config,
+            &old_state,
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20))]),
+            Utc::now(),
+        );
+
+        assert_eq!(
+            refreshed.state.domains[0].effective_sources,
+            vec!["198.51.100.20"]
+        );
+        assert_eq!(refreshed.state.domains[0].cidr_expand_ipv4, 32);
+    }
+
+    #[test]
+    fn domain_change_success_expands_only_new_domain_ipv4_to_24() {
+        let old_config = config_with_domain_name("home", "old.example.com");
+        let old_state = refresh_state_with_resolver(
+            &old_config,
+            &DynamicWhitelistState::default(),
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]),
+            Utc::now(),
+        )
+        .state;
+        let mut new_config = config_with_domain_name("home", "new.example.com");
+        new_config.cidr_expand_ipv4 = 24;
+
+        let refreshed = refresh_state_with_resolver(
+            &new_config,
+            &old_state,
+            |_| Ok(vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20))]),
+            Utc::now(),
+        );
+
+        assert_eq!(
+            refreshed.state.domains[0].effective_sources,
+            vec!["198.51.100.0/24"]
+        );
+        assert_eq!(refreshed.state.domains[0].cidr_expand_ipv4, 24);
+        assert!(
+            !refreshed.state.domains[0]
+                .effective_sources
+                .contains(&"203.0.113.0/24".to_string())
+        );
     }
 
     #[test]

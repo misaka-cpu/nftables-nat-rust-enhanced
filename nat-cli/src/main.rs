@@ -711,6 +711,21 @@ fn audit_dynamic_whitelist_events(audit_config: &AuditConfig, events: &[DynamicW
                     "using_last_good": using_last_good,
                 }),
             ),
+            DynamicWhitelistEvent::StalePruned {
+                name,
+                old_domain,
+                new_domain,
+            } => audit::log_event(
+                audit_config,
+                "dynamic_whitelist.prune",
+                AuditResult::Warn,
+                serde_json::json!({
+                    "name": name,
+                    "old_domain": old_domain,
+                    "new_domain": new_domain,
+                    "reason": "domain_changed",
+                }),
+            ),
             DynamicWhitelistEvent::Change {
                 name,
                 domain,

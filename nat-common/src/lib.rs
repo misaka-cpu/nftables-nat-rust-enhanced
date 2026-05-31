@@ -20,16 +20,16 @@ pub mod uninstall;
 pub use hash::stable_script_hash;
 
 pub fn build_version() -> &'static str {
-    // release CI 注入 NAT_BUILD_VERSION=<tag>；源码编译没有注入时回退 Cargo 包版本。
-    // 两者都为空（极端情况，例如手动 unset 后编译）时退回 "dev"，避免 `nat --version`
-    // 和主菜单标题出现空字符串。
-    let injected = option_env!("NAT_BUILD_VERSION").unwrap_or("");
+    // release CI 注入 NAT_BUILD_VERSION=<tag>；源码编译没有注入时显示 dev。
+    // 不回退 Cargo workspace package version，避免 `nat --version` 显示与 release tag
+    // 无关的内部版本号。
+    resolve_build_version(option_env!("NAT_BUILD_VERSION"))
+}
+
+fn resolve_build_version(injected: Option<&'static str>) -> &'static str {
+    let injected = injected.unwrap_or("").trim();
     if !injected.is_empty() {
         return injected;
-    }
-    let pkg = env!("CARGO_PKG_VERSION");
-    if !pkg.is_empty() {
-        return pkg;
     }
     "dev"
 }
@@ -2033,6 +2033,25 @@ pub fn validate_legacy_config(content: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_version_without_injected_tag_does_not_show_workspace_package_version() {
+        let version = build_version();
+        assert_ne!(version, "2.0.0");
+        assert!(!version.trim().is_empty());
+    }
+
+    #[test]
+    fn resolve_build_version_prefers_injected_release_tag() {
+        assert_eq!(resolve_build_version(Some("v0.8.4")), "v0.8.4");
+    }
+
+    #[test]
+    fn resolve_build_version_uses_dev_without_tag() {
+        assert_eq!(resolve_build_version(None), "dev");
+        assert_eq!(resolve_build_version(Some("")), "dev");
+        assert_eq!(resolve_build_version(Some("   ")), "dev");
+    }
 
     #[test]
     fn format_cli_time_renders_shanghai_24h_without_nanos() {

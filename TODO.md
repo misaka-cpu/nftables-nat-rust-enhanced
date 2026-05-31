@@ -2,7 +2,7 @@
 
 本文件记录在历次「稳定版架构体检」中被识别、但本轮不修复的低优先级改进项。
 
-> v0.8.0 是 dynamic_whitelist 功能版本；v0.8.1 在其之上做 CLI 白名单 / 黑名单管理与动态 DDNS 来源白名单子菜单的展示层级优化，不改 nft / safe apply / 组合策略。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
+> 当前稳定版本 v0.8.4 是 bugfix-only 发布；v0.8.0 是 dynamic_whitelist 功能版本；v0.8.1 在其之上做 CLI 白名单 / 黑名单管理与动态 DDNS 来源白名单子菜单的展示层级优化，不改 nft / safe apply / 组合策略。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
 > 真正会动结构的改造请挪到独立 minor 版本规划，并先在本文件提案。
 
 不属于本文件的内容：
@@ -82,6 +82,18 @@
 - **CLI 二次确认**：动态 DDNS 来源白名单子菜单新增「设置 IPv4 CIDR 扩展模式」入口；选择 `/24` 会出现警告并默认按 `N` 拒绝；保存走 `safe_write_config`，reason `dynamic_whitelist.cidr_expand.update` 被识别为「影响 nft 规则」，提示 nat.service 将在检测周期内通过 safe apply 应用。
 - **audit / Telegram**：`dynamic_whitelist.resolve.success` 与 `dynamic_whitelist.change` 写入 `raw_ips` / `effective_sources` / `cidr_expand_ipv4`；模式切换写 `dynamic_whitelist.cidr_expand.update` audit；Telegram 仅在 `effective_sources` 变化时通知，沿用 bot_token 脱敏与 curl 超时策略；通知文本对超长列表做截断，避免刷屏。
 - **未引入**：per-domain 独立 `cidr_expand_ipv4`、`allowed_resolved_cidrs`、Cloudflare / DNSPod / DuckDNS 等 DNS 供应商 API、自动更新 DDNS、WebUI / nat-console、tc HTB / ifb、多租户 / server-agent、数据库存储；也不改 safe apply 主流程，不引入 `flush ruleset` / `sysctl --system` / `nft -f` 直刷。
+
+### v0.8.3
+
+- **离线 / mirror 安装路径**：install.sh 新增 `--mirror-base`、`--local-binary`、`--local-asset`；支持自建 mirror 或手动上传安装文件，`--update --core-only` 同样支持。
+- **供应链提示**：README 增加国内机器无法访问 GitHub 时的安装方式，提醒 mirror / local 安装路径需要校验来源和 SHA256。
+
+### v0.8.4
+
+- **prepare 边界修复**：检测到 Docker v28 / FORWARD policy 风险时只 WARN，不再自动修改非 `self-*` 表。
+- **版本显示修复**：本地源码构建未注入 release tag 时显示 `dev`，避免显示内部 package version。
+- **release/local asset 校验**：解压前拒绝危险 tar 成员和多个 `nat` 候选。
+- **dynamic_whitelist last-good 修复**：同名域名变更后 DNS 失败不复用旧域名 last-good 来源 IP。
 
 ---
 

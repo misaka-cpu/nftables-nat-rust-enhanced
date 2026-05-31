@@ -2294,6 +2294,13 @@ fn format_dynamic_whitelist_refresh_result_lines(events: &[DynamicWhitelistEvent
             } => lines.push(format!(
                 "WARN {name} ({domain}) DNS 失败: {error}; using_last_good={using_last_good}"
             )),
+            DynamicWhitelistEvent::StalePruned {
+                name,
+                old_domain,
+                new_domain,
+            } => lines.push(format!(
+                "WARN {name} domain changed {old_domain} -> {new_domain}; old last-good ignored"
+            )),
             DynamicWhitelistEvent::Change {
                 name,
                 domain,

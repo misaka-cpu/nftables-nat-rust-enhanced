@@ -2,9 +2,36 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TMP_ROOT"' EXIT
 
 run_install() {
     (cd "$ROOT_DIR" && bash install.sh "$@")
+}
+
+run_tar_validator() {
+    local archive_path="$1"
+    (
+        cd "$ROOT_DIR"
+        NAT_TEST_SOURCE_ONLY=1 source "$ROOT_DIR/install.sh"
+        validate_tar_asset "$archive_path" "test asset"
+    )
+}
+
+assert_validator_fails() {
+    local archive_path="$1"
+    local expected="$2"
+    local output status
+    set +e
+    output="$(run_tar_validator "$archive_path" 2>&1)"
+    status=$?
+    set -e
+    if [ "$status" -eq 0 ]; then
+        echo "tar validator unexpectedly succeeded: $archive_path" >&2
+        echo "$output" >&2
+        exit 1
+    fi
+    assert_contains "$output" "$expected"
 }
 
 assert_contains() {
@@ -151,6 +178,10 @@ assert_contains "$menu_script" "notify_interval_minutes = minutes"
 assert_contains "$menu_script" "set_enabled(false)"
 assert_contains "$menu_script" "rule.enabled()"
 assert_contains "$menu_script" "不会自动放行或封禁来源 IP"
+assert_contains "$install_script" "validate_tar_asset \"\$archive_path\" \"release\""
+assert_contains "$install_script" "validate_tar_asset \"\$LOCAL_ASSET_PATH\" \"local asset\""
+assert_contains "$install_script" "find_unique_nat_binary \"\$tmp_dir/payload\" \"release\""
+assert_contains "$install_script" "find_unique_nat_binary \"\$tmp_dir/payload\" \"local asset\""
 assert_contains "$update_script" "current_version_for_update"
 assert_contains "$update_script" "installed_nat_version"
 assert_contains "$update_script" "parse_nat_version_output"
@@ -173,6 +204,45 @@ for deprecated in --with-console --console-only --assets-only; do
     assert_contains "$output" "--core-only"
     assert_contains "$output" "--update --core-only"
 done
+
+mkdir -p "$TMP_ROOT/normal/pkg"
+printf '#!/bin/sh\n' > "$TMP_ROOT/normal/pkg/nat"
+chmod +x "$TMP_ROOT/normal/pkg/nat"
+tar -C "$TMP_ROOT/normal" -czf "$TMP_ROOT/normal.tar.gz" pkg
+run_tar_validator "$TMP_ROOT/normal.tar.gz" >/dev/null
+
+mkdir -p "$TMP_ROOT/abs"
+printf '#!/bin/sh\n' > "$TMP_ROOT/abs/nat"
+tar -C "$TMP_ROOT/abs" --transform='s#^nat#/usr/local/bin/nat#' -czf "$TMP_ROOT/abs.tar.gz" nat >/dev/null 2>&1
+assert_validator_fails "$TMP_ROOT/abs.tar.gz" "unsafe test asset tar member uses absolute path"
+
+mkdir -p "$TMP_ROOT/dotdot"
+printf '#!/bin/sh\n' > "$TMP_ROOT/dotdot/nat"
+tar -C "$TMP_ROOT/dotdot" --transform='s#^nat#../nat#' -czf "$TMP_ROOT/dotdot.tar.gz" nat
+assert_validator_fails "$TMP_ROOT/dotdot.tar.gz" "unsafe test asset tar member contains '..'"
+
+mkdir -p "$TMP_ROOT/symlink/pkg"
+printf '#!/bin/sh\n' > "$TMP_ROOT/symlink/pkg/target"
+ln -s target "$TMP_ROOT/symlink/pkg/nat"
+tar -C "$TMP_ROOT/symlink" -czf "$TMP_ROOT/symlink.tar.gz" pkg
+assert_validator_fails "$TMP_ROOT/symlink.tar.gz" "unsafe test asset tar member type"
+
+mkdir -p "$TMP_ROOT/hardlink/pkg"
+printf '#!/bin/sh\n' > "$TMP_ROOT/hardlink/pkg/target"
+ln "$TMP_ROOT/hardlink/pkg/target" "$TMP_ROOT/hardlink/pkg/nat"
+tar -C "$TMP_ROOT/hardlink" -czf "$TMP_ROOT/hardlink.tar.gz" pkg
+assert_validator_fails "$TMP_ROOT/hardlink.tar.gz" "unsafe test asset tar member type"
+
+mkdir -p "$TMP_ROOT/multiple/pkg" "$TMP_ROOT/multiple/other"
+printf '#!/bin/sh\n' > "$TMP_ROOT/multiple/pkg/nat"
+printf '#!/bin/sh\n' > "$TMP_ROOT/multiple/other/nat"
+tar -C "$TMP_ROOT/multiple" -czf "$TMP_ROOT/multiple.tar.gz" pkg other
+assert_validator_fails "$TMP_ROOT/multiple.tar.gz" "contains multiple nat binaries"
+
+mkdir -p "$TMP_ROOT/none/pkg"
+printf '#!/bin/sh\n' > "$TMP_ROOT/none/pkg/not-nat"
+tar -C "$TMP_ROOT/none" -czf "$TMP_ROOT/none.tar.gz" pkg
+assert_validator_fails "$TMP_ROOT/none.tar.gz" "does not contain nat binary"
 
 output="$(run_install --dry-run --update --core-only --use-release)"
 assert_contains "$output" "would update only core nat binary and nat.service"

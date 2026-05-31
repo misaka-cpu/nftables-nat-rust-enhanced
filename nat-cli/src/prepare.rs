@@ -1,65 +1,42 @@
 #![allow(dead_code)]
-use std::{
-    fs::File,
-    io::{self, Write},
-    process::Command,
-};
+use std::{io, process::Command};
 
-use log::info;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
-// Docker v28 set type filter hook forward chain policy drop
-// we need set it to accept
+// Docker v28 may set type filter hook forward chain policy drop. This project only warns:
+// it must not modify non-managed nft tables outside self-nat/self-filter.
 pub(crate) fn check_and_prepare() -> Result<(), io::Error> {
-    if let Some(prepare_script) = prepare_script()? {
-        let final_prepare_script = format!("#!/usr/sbin/nft -f\n\n{prepare_script}\n");
-        info!(
-            "执行 nft -f {FILE_NAME_PREPARE}\n\
-            {final_prepare_script}",
-        );
-        File::create(FILE_NAME_PREPARE)
-            .and_then(|mut file| file.write_all(final_prepare_script.as_bytes()))?;
-        let output = Command::new("/usr/sbin/nft")
-            .arg("-f")
-            .arg(FILE_NAME_PREPARE)
-            .output()?;
-        info!("执行结果: {}", output.status);
-        log::info!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-        log::error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-    }
+    let check_result = check_current_ruleset()?;
+    warn_forward_policy_if_needed(&check_result);
     Ok(())
 }
 
-fn prepare_script() -> Result<Option<String>, io::Error> {
-    // 检查当前 nftables 中表、链和规则的存在情况
-    let check_result = check_current_ruleset()?;
-
-    let mut prepare_script = String::new();
-    let mut needs_script = false;
-
-    // 检查IPv4 FORWARD链策略
-    if check_result.ip_forward_drop {
-        prepare_script.push_str("# 修改 IPv4 type filter hook forward的默认策略为accept \n");
-        prepare_script.push_str("chain ip filter FORWARD { policy accept ; }\n");
-        needs_script = true;
-    }
-
-    // 检查IPv6 FORWARD链策略
-    if check_result.ip6_forward_drop {
-        prepare_script.push_str("# 修改 IPv6 type filter hook forward的默认策略为accept \n");
-        prepare_script.push_str("chain ip6 filter FORWARD { policy accept ; }\n");
-        needs_script = true;
-    }
-
-    if needs_script {
-        Ok(Some(prepare_script))
-    } else {
-        Ok(None)
+fn warn_forward_policy_if_needed(check_result: &CheckResult) {
+    for line in forward_policy_warning_lines(check_result) {
+        warn!("{line}");
     }
 }
 
+fn forward_policy_warning_lines(check_result: &CheckResult) -> Vec<&'static str> {
+    if !check_result.ip_forward_drop && !check_result.ip6_forward_drop {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        "检测到系统 FORWARD policy 可能影响转发。",
+        "本项目不会自动修改非 self-* 表。",
+        "如你确认需要修改，请手动检查：",
+    ];
+    if check_result.ip_forward_drop {
+        lines.push("  nft list chain ip filter FORWARD");
+    }
+    if check_result.ip6_forward_drop {
+        lines.push("  nft list chain ip6 filter FORWARD");
+    }
+    lines
+}
+
 fn check_current_ruleset() -> Result<CheckResult, io::Error> {
-    let mut res = CheckResult::default();
     let output = Command::new("/usr/sbin/nft")
         .arg("-j")
         .arg("list")
@@ -72,7 +49,12 @@ fn check_current_ruleset() -> Result<CheckResult, io::Error> {
     }
 
     let json_str = String::from_utf8_lossy(&output.stdout);
-    let nftables_output: NftablesOutput = match serde_json::from_str(&json_str) {
+    check_ruleset_json(&json_str)
+}
+
+fn check_ruleset_json(json_str: &str) -> Result<CheckResult, io::Error> {
+    let mut res = CheckResult::default();
+    let nftables_output: NftablesOutput = match serde_json::from_str(json_str) {
         Ok(output) => output,
         Err(e) => {
             info!("解析 nft 输出的 JSON 失败: {e}");
@@ -138,8 +120,6 @@ fn check_current_ruleset() -> Result<CheckResult, io::Error> {
 
     Ok(res)
 }
-
-const FILE_NAME_PREPARE: &str = "/etc/nftables-nat/nat-prepare.nft";
 
 // 用于解析 nft -j list ruleset 输出的数据结构
 #[derive(Debug, Serialize, Deserialize)]
@@ -500,5 +480,75 @@ mod tests {
             }
             _ => panic!("Expected Unknown entry"),
         }
+    }
+
+    #[test]
+    fn forward_policy_drop_only_emits_warning_lines() {
+        let json_data = r#"{
+    "nftables": [
+        {
+            "chain": {
+                "family": "ip",
+                "table": "filter",
+                "name": "FORWARD",
+                "handle": 1,
+                "type": "filter",
+                "hook": "forward",
+                "prio": 0,
+                "policy": "drop"
+            }
+        },
+        {
+            "chain": {
+                "family": "ip6",
+                "table": "filter",
+                "name": "FORWARD",
+                "handle": 2,
+                "type": "filter",
+                "hook": "forward",
+                "prio": 0,
+                "policy": "drop"
+            }
+        }
+    ]
+}"#;
+
+        let result = check_ruleset_json(json_data).unwrap();
+        assert!(result.ip_forward_drop);
+        assert!(result.ip6_forward_drop);
+
+        let lines = forward_policy_warning_lines(&result);
+        let joined = lines.join("\n");
+        assert!(joined.contains("检测到系统 FORWARD policy 可能影响转发。"));
+        assert!(joined.contains("本项目不会自动修改非 self-* 表。"));
+        assert!(joined.contains("nft list chain ip filter FORWARD"));
+        assert!(joined.contains("nft list chain ip6 filter FORWARD"));
+        assert!(!joined.contains("policy accept"));
+        assert!(!joined.contains("chain ip filter FORWARD {"));
+    }
+
+    #[test]
+    fn forward_policy_accept_emits_no_warning() {
+        let json_data = r#"{
+    "nftables": [
+        {
+            "chain": {
+                "family": "ip",
+                "table": "filter",
+                "name": "FORWARD",
+                "handle": 1,
+                "type": "filter",
+                "hook": "forward",
+                "prio": 0,
+                "policy": "accept"
+            }
+        }
+    ]
+}"#;
+
+        let result = check_ruleset_json(json_data).unwrap();
+        assert!(!result.ip_forward_drop);
+        assert!(!result.ip6_forward_drop);
+        assert!(forward_policy_warning_lines(&result).is_empty());
     }
 }
