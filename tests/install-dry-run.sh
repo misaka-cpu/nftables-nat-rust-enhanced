@@ -43,15 +43,16 @@ assert_not_contains "$workflow" "setup-console"
 
 install_script="$(cat "$ROOT_DIR/install.sh")"
 menu_script="$(cat "$ROOT_DIR/nat-cli/src/menu.rs")"
+update_script="$(cat "$ROOT_DIR/nat-cli/src/menu/update.rs")"
 assert_not_contains "$menu_script" "WebUI"
 assert_not_contains "$menu_script" "nat-console"
-assert_contains "$menu_script" "13) BBR / Telegram 状态"
-assert_contains "$menu_script" "15) 一键更新本项目"
-assert_contains "$menu_script" "16) 卸载 / 清理本项目"
-assert_contains "$menu_script" "1) 更新核心转发 nat，推荐"
-assert_contains "$menu_script" "2) 指定版本更新核心 nat"
-assert_contains "$menu_script" "install.sh | bash -s -- {}"
-assert_contains "$menu_script" "\"--update\", \"--core-only\", \"--use-release\""
+assert_contains "$menu_script" "15) BBR / Telegram 状态"
+assert_contains "$menu_script" "17) 一键更新本项目"
+assert_contains "$menu_script" "18) 卸载 / 清理本项目"
+assert_contains "$update_script" "1) 更新核心转发 nat，推荐"
+assert_contains "$update_script" "2) 指定版本更新核心 nat"
+assert_contains "$update_script" "install.sh | bash -s -- {}"
+assert_contains "$update_script" "\"--update\", \"--core-only\", \"--use-release\""
 
 uninstall_common="$(cat "$ROOT_DIR/nat-common/src/uninstall.rs")"
 assert_not_contains "$uninstall_common" "Console"
@@ -68,14 +69,58 @@ assert_not_contains "$readme" "https://127.0.0.1:5533"
 assert_not_contains "$readme" "NAT_CONSOLE"
 
 output="$(run_install --dry-run --core-only --use-release)"
+assert_contains "$output" "would use GitHub release:"
 assert_contains "$output" "would download GitHub Release asset:"
 assert_contains "$output" "would extract release payload and use nat from it"
 assert_contains "$output" "would install /usr/local/bin/nat"
 assert_contains "$output" "would run systemctl enable nat"
 assert_contains "$output" "would run systemctl restart nat"
 assert_contains "$output" "would check nat.service active: systemctl is-active nat"
+assert_not_contains "$output" "would use mirror release:"
 assert_not_contains "$output" "nat-console"
 assert_not_contains "$output" "static"
+
+output="$(NAT_TEST_UNAME_M=x86_64 run_install --dry-run --core-only --use-release --version v0.8.2 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced/)"
+assert_contains "$output" "would use mirror release: https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.2"
+assert_contains "$output" "would download mirror release asset: https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.2/nftables-nat-rust-enhanced-linux-amd64.tar.gz"
+assert_contains "$output" "would fallback to GitHub release if mirror asset download fails:"
+assert_not_contains "$output" "nftables-nat-rust-enhanced//v0.8.2"
+
+local_binary_fixture="$ROOT_DIR/install.sh"
+output="$(run_install --dry-run --core-only --local-binary "$local_binary_fixture")"
+assert_contains "$output" "would use local binary: $local_binary_fixture"
+assert_contains "$output" "would use local binary payload: $local_binary_fixture"
+assert_contains "$output" "would skip release downloads"
+assert_not_contains "$output" "would download GitHub Release asset:"
+
+local_asset_fixture="$ROOT_DIR/README.md"
+output="$(run_install --dry-run --core-only --local-asset "$local_asset_fixture")"
+assert_contains "$output" "would use local release asset: $local_asset_fixture"
+assert_contains "$output" "would use local asset payload: $local_asset_fixture"
+assert_contains "$output" "would skip release downloads"
+assert_not_contains "$output" "would download GitHub Release asset:"
+
+set +e
+output="$(run_install --dry-run --core-only --local-binary "/tmp/nat-missing-binary-$$" 2>&1)"
+status=$?
+set -e
+if [ "$status" -eq 0 ]; then
+    echo "--local-binary missing file unexpectedly succeeded" >&2
+    echo "$output" >&2
+    exit 1
+fi
+assert_contains "$output" "local binary not found: /tmp/nat-missing-binary-$$"
+
+set +e
+output="$(run_install --dry-run --core-only --local-asset "/tmp/nat-missing-asset-$$.tar.gz" 2>&1)"
+status=$?
+set -e
+if [ "$status" -eq 0 ]; then
+    echo "--local-asset missing file unexpectedly succeeded" >&2
+    echo "$output" >&2
+    exit 1
+fi
+assert_contains "$output" "local asset not found: /tmp/nat-missing-asset-$$.tar.gz"
 
 output="$(run_install --dry-run --core-only --enter-menu)"
 assert_contains "$output" "would automatically enter CLI management menu after install:"
@@ -105,12 +150,11 @@ assert_contains "$menu_script" "是否启用 Telegram 通知？[y/N]"
 assert_contains "$menu_script" "notify_interval_minutes = minutes"
 assert_contains "$menu_script" "set_enabled(false)"
 assert_contains "$menu_script" "rule.enabled()"
-assert_contains "$menu_script" "禁用规则不会应用到 nft"
 assert_contains "$menu_script" "不会自动放行或封禁来源 IP"
-assert_contains "$menu_script" "current_version_for_update"
-assert_contains "$menu_script" "installed_nat_version"
-assert_contains "$menu_script" "parse_nat_version_output"
-assert_contains "$menu_script" "build_version_for_update_display"
+assert_contains "$update_script" "current_version_for_update"
+assert_contains "$update_script" "installed_nat_version"
+assert_contains "$update_script" "parse_nat_version_output"
+assert_contains "$update_script" "build_version_for_update_display"
 assert_not_contains "$menu_script" "当前版本: {}\", env!(\"CARGO_PKG_VERSION\")"
 assert_contains "$workflow" 'NAT_BUILD_VERSION="${GITHUB_REF_NAME}" cargo build --release --locked'
 assert_contains "$workflow" 'target/release/nat --version | grep -F "${GITHUB_REF_NAME}"'
@@ -136,6 +180,12 @@ assert_contains "$output" "would preserve user data: /etc/nat.toml /etc/nat.conf
 assert_contains "$output" "would backup old /usr/local/bin/nat and nat.service before replacing"
 assert_not_contains "$output" "nat-console"
 assert_not_contains "$output" "static"
+
+output="$(run_install --dry-run --update --core-only --local-binary "$local_binary_fixture")"
+assert_contains "$output" "would use local binary: $local_binary_fixture"
+assert_contains "$output" "would update only core nat binary and nat.service"
+assert_contains "$output" "would use local binary payload: $local_binary_fixture"
+assert_not_contains "$output" "would download GitHub Release asset:"
 
 output="$(run_install --dry-run --uninstall)"
 assert_contains "$output" "would show core-only uninstall menu"

@@ -50,6 +50,17 @@ check_binary_glibc_compat() {
     rm -f "$err_file"
 }
 
+check_installed_nat_version() {
+    local version_output
+    if version_output="$(/usr/local/bin/nat --version 2>&1)"; then
+        log_ok "nat --version: $version_output"
+    else
+        log_err "nat --version failed after install"
+        log_err "$version_output"
+        exit 1
+    fi
+}
+
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
         log_err "Please run as root"
@@ -205,11 +216,16 @@ fi
 
 preflight_dependencies
 
-LOCAL_NAT_BIN="${NAT_BINARY_DIR:-$SCRIPT_DIR/target/release}/nat"
+if [ -n "${NAT_BINARY_PATH:-}" ]; then
+    LOCAL_NAT_BIN="$NAT_BINARY_PATH"
+else
+    LOCAL_NAT_BIN="${NAT_BINARY_DIR:-$SCRIPT_DIR/target/release}/nat"
+fi
 if [ -x "$LOCAL_NAT_BIN" ]; then
     log_info "using nat binary: $LOCAL_NAT_BIN"
     install -m 755 "$LOCAL_NAT_BIN" /usr/local/bin/nat
     check_binary_glibc_compat /usr/local/bin/nat nat
+    check_installed_nat_version
 else
     log_err "nat binary not found: $LOCAL_NAT_BIN"
     log_err "run install.sh with --use-release or build first with: cargo build --release"

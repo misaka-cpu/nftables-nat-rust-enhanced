@@ -9,6 +9,12 @@ INSTALL_MODE="auto"
 RELEASE_ASSET=""
 RELEASE_PAYLOAD_DIR=""
 INSTALL_SOURCE_DIR="$SCRIPT_DIR"
+MIRROR_BASE=""
+LOCAL_BINARY_PATH=""
+LOCAL_ASSET_PATH=""
+CLEANUP_PAYLOAD_DIR=""
+INSTALL_PAYLOAD_KIND=""
+INSTALL_PAYLOAD_DESC=""
 USE_RELEASE_SEEN=0
 BUILD_SOURCE_SEEN=0
 ENTER_MENU=0
@@ -36,6 +42,12 @@ usage() {
   --version TAG    指定 GitHub Release 版本，默认 latest
   --repo OWNER/REPO
                    指定 GitHub 仓库，默认 $RELEASE_REPO
+  --mirror-base URL
+                   使用自建 mirror 下载 release asset，路径为 URL/VERSION/ASSET
+  --local-binary PATH
+                   使用已上传 nat 二进制安装，不下载 release
+  --local-asset PATH
+                   使用已上传 release tar.gz 解压安装，不下载 release
   --enter-menu     安装完成后自动进入 CLI 管理菜单
   --update         更新核心组件
   --uninstall      交互卸载/清理核心组件
@@ -104,22 +116,115 @@ release_download_base_url() {
     fi
 }
 
+absolute_path() {
+    case "$1" in
+        /*) printf '%s' "$1" ;;
+        *) printf '%s/%s' "$PWD" "$1" ;;
+    esac
+}
+
+join_url() {
+    local base="$1"
+    shift
+    while [ "${base%/}" != "$base" ]; do
+        base="${base%/}"
+    done
+    printf '%s' "$base"
+    local segment
+    for segment in "$@"; do
+        while [ "${segment#/}" != "$segment" ]; do
+            segment="${segment#/}"
+        done
+        while [ "${segment%/}" != "$segment" ]; do
+            segment="${segment%/}"
+        done
+        printf '/%s' "$segment"
+    done
+}
+
+mirror_release_download_base_url() {
+    [ -n "$MIRROR_BASE" ] || return 1
+    join_url "$MIRROR_BASE" "$RELEASE_VERSION"
+}
+
 local_binary_available() {
     [ -x "$SCRIPT_DIR/target/release/nat" ]
 }
 
+select_install_source_dir() {
+    local payload_dir="$1"
+    if [ -f "$payload_dir/setup.sh" ]; then
+        INSTALL_SOURCE_DIR="$payload_dir"
+    elif [ -f "$SCRIPT_DIR/setup.sh" ]; then
+        INSTALL_SOURCE_DIR="$SCRIPT_DIR"
+    else
+        log_err "payload does not contain setup.sh and local setup.sh is unavailable"
+        return 1
+    fi
+}
+
+cleanup_install_payload() {
+    if [ -n "${CLEANUP_PAYLOAD_DIR:-}" ] && [ -d "$CLEANUP_PAYLOAD_DIR" ]; then
+        rm -rf "$CLEANUP_PAYLOAD_DIR"
+        CLEANUP_PAYLOAD_DIR=""
+    fi
+}
+
+download_release_from_base() {
+    local source_name="$1"
+    local base_url="$2"
+    local archive_path="$3"
+    local sums_path="$4"
+    local asset_url sums_url
+    asset_url="$(join_url "$base_url" "$RELEASE_ASSET")"
+    sums_url="$(join_url "$base_url" "SHA256SUMS")"
+
+    log_info "using ${source_name} release: $base_url"
+    log_info "downloading ${source_name} release asset: $asset_url"
+    if ! curl -fsSL "$asset_url" -o "$archive_path"; then
+        log_err "failed to download ${source_name} release asset: ${RELEASE_ASSET}"
+        return 10
+    fi
+
+    if curl -fsSL "$sums_url" -o "$sums_path"; then
+        if grep -F "  ${RELEASE_ASSET}" "$sums_path" >/dev/null 2>&1 || grep -F " *${RELEASE_ASSET}" "$sums_path" >/dev/null 2>&1; then
+            if ! (cd "$(dirname "$archive_path")" && sha256sum -c --ignore-missing SHA256SUMS); then
+                log_err "SHA256 verification failed for ${RELEASE_ASSET}"
+                return 11
+            fi
+            log_ok "SHA256 verified: ${RELEASE_ASSET}"
+        else
+            log_err "SHA256SUMS does not list ${RELEASE_ASSET}; refusing to trust a mismatched checksum file"
+            return 12
+        fi
+    else
+        log_warn "${source_name} SHA256SUMS not available; continuing without checksum verification"
+    fi
+}
+
 prepare_release_payload() {
-    local platform base_url tmp_dir archive_path sums_path payload_dir
+    local platform github_base_url mirror_base_url tmp_dir archive_path sums_path payload_dir payload_nat status
     if ! platform="$(detect_release_platform)"; then
         return 2
     fi
 
     RELEASE_ASSET="nftables-nat-rust-enhanced-${platform}.tar.gz"
-    base_url="$(release_download_base_url)"
+    github_base_url="$(release_download_base_url)"
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        log_dry_run "would download GitHub Release asset: ${base_url}/${RELEASE_ASSET}"
-        log_dry_run "would download SHA256SUMS if available: ${base_url}/SHA256SUMS"
+        INSTALL_PAYLOAD_KIND="release"
+        INSTALL_PAYLOAD_DESC="$RELEASE_ASSET"
+        if [ -n "$MIRROR_BASE" ]; then
+            mirror_base_url="$(mirror_release_download_base_url)"
+            log_dry_run "would use mirror release: $mirror_base_url"
+            log_dry_run "would download mirror release asset: $(join_url "$mirror_base_url" "$RELEASE_ASSET")"
+            log_dry_run "would download SHA256SUMS if available: $(join_url "$mirror_base_url" "SHA256SUMS")"
+            log_dry_run "would fallback to GitHub release if mirror asset download fails: $(join_url "$github_base_url" "$RELEASE_ASSET")"
+        else
+            log_dry_run "would use GitHub release: $github_base_url"
+            log_dry_run "would download GitHub Release asset: $(join_url "$github_base_url" "$RELEASE_ASSET")"
+            log_dry_run "would download SHA256SUMS if available: $(join_url "$github_base_url" "SHA256SUMS")"
+        fi
         log_dry_run "would verify ${RELEASE_ASSET} with SHA256SUMS when the asset is listed"
         log_dry_run "would extract release payload and use nat from it"
         return 0
@@ -136,50 +241,129 @@ prepare_release_payload() {
     tmp_dir="$(mktemp -d)"
     archive_path="$tmp_dir/$RELEASE_ASSET"
     sums_path="$tmp_dir/SHA256SUMS"
-    log_info "downloading GitHub Release asset: ${base_url}/${RELEASE_ASSET}"
-    if ! curl -fsSL "${base_url}/${RELEASE_ASSET}" -o "$archive_path"; then
-        log_err "failed to download release asset: ${RELEASE_ASSET}"
-        return 1
-    fi
-
-    if curl -fsSL "${base_url}/SHA256SUMS" -o "$sums_path"; then
-        if grep -F "  ${RELEASE_ASSET}" "$sums_path" >/dev/null 2>&1 || grep -F " *${RELEASE_ASSET}" "$sums_path" >/dev/null 2>&1; then
-            (cd "$tmp_dir" && sha256sum -c --ignore-missing SHA256SUMS) || {
-                log_err "SHA256 verification failed for ${RELEASE_ASSET}"
-                return 1
-            }
-            log_ok "SHA256 verified: ${RELEASE_ASSET}"
+    if [ -n "$MIRROR_BASE" ]; then
+        mirror_base_url="$(mirror_release_download_base_url)"
+        if download_release_from_base "mirror" "$mirror_base_url" "$archive_path" "$sums_path"; then
+            :
         else
-            log_err "SHA256SUMS does not list ${RELEASE_ASSET}; refusing to trust a mismatched checksum file"
-            return 1
+            status=$?
+            if [ "$status" -eq 10 ]; then
+                log_warn "mirror release asset download failed; falling back to GitHub release"
+                if download_release_from_base "GitHub" "$github_base_url" "$archive_path" "$sums_path"; then
+                    :
+                else
+                    return $?
+                fi
+            else
+                return "$status"
+            fi
         fi
     else
-        log_warn "SHA256SUMS not available; continuing without checksum verification"
+        if download_release_from_base "GitHub" "$github_base_url" "$archive_path" "$sums_path"; then
+            :
+        else
+            return $?
+        fi
     fi
 
     mkdir -p "$tmp_dir/payload"
-    tar -xzf "$archive_path" -C "$tmp_dir/payload"
-    if [ -x "$tmp_dir/payload/nat" ]; then
-        payload_dir="$tmp_dir/payload"
-    else
-        payload_dir="$(find "$tmp_dir/payload" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    if ! tar -xzf "$archive_path" -C "$tmp_dir/payload"; then
+        log_err "failed to extract release asset: $archive_path"
+        return 1
     fi
-    if [ -z "${payload_dir:-}" ] || [ ! -x "$payload_dir/nat" ]; then
+    payload_nat="$(find "$tmp_dir/payload" -type f -name nat -print -quit)"
+    if [ -z "${payload_nat:-}" ] || [ ! -x "$payload_nat" ]; then
         log_err "release payload does not contain executable nat"
         return 1
     fi
+    payload_dir="$(dirname "$payload_nat")"
 
     RELEASE_PAYLOAD_DIR="$payload_dir"
-    if [ -f "$payload_dir/setup.sh" ]; then
-        INSTALL_SOURCE_DIR="$payload_dir"
-    elif [ -f "$SCRIPT_DIR/setup.sh" ]; then
-        INSTALL_SOURCE_DIR="$SCRIPT_DIR"
-    else
-        log_err "release payload does not contain setup.sh and local setup.sh is unavailable"
+    select_install_source_dir "$payload_dir" || return 1
+    export NAT_BINARY_DIR="$payload_dir"
+    INSTALL_PAYLOAD_KIND="release"
+    INSTALL_PAYLOAD_DESC="$RELEASE_ASSET"
+    CLEANUP_PAYLOAD_DIR="$tmp_dir"
+    log_ok "release payload ready: $RELEASE_ASSET"
+}
+
+prepare_local_binary_payload() {
+    if [ ! -f "$LOCAL_BINARY_PATH" ]; then
+        log_err "local binary not found: $LOCAL_BINARY_PATH"
         return 1
     fi
+    INSTALL_PAYLOAD_KIND="local-binary"
+    INSTALL_PAYLOAD_DESC="$LOCAL_BINARY_PATH"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_dry_run "would use local binary: $LOCAL_BINARY_PATH"
+        if [ ! -x "$LOCAL_BINARY_PATH" ]; then
+            log_dry_run "would chmod +x local binary: $LOCAL_BINARY_PATH"
+        fi
+        log_dry_run "would skip release downloads"
+        return 0
+    fi
+    log_info "using local binary source: $LOCAL_BINARY_PATH"
+    if [ ! -x "$LOCAL_BINARY_PATH" ]; then
+        log_info "making local binary executable: $LOCAL_BINARY_PATH"
+        if ! chmod +x "$LOCAL_BINARY_PATH"; then
+            log_err "failed to chmod +x local binary: $LOCAL_BINARY_PATH"
+            return 1
+        fi
+    fi
+    select_install_source_dir "$SCRIPT_DIR" || return 1
+    export NAT_BINARY_PATH="$LOCAL_BINARY_PATH"
+    log_ok "local binary ready: $LOCAL_BINARY_PATH"
+}
+
+prepare_local_asset_payload() {
+    local tmp_dir payload_dir payload_nat
+    if [ ! -f "$LOCAL_ASSET_PATH" ]; then
+        log_err "local asset not found: $LOCAL_ASSET_PATH"
+        return 1
+    fi
+    INSTALL_PAYLOAD_KIND="local-asset"
+    INSTALL_PAYLOAD_DESC="$LOCAL_ASSET_PATH"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_dry_run "would use local release asset: $LOCAL_ASSET_PATH"
+        log_dry_run "would extract local asset to a temporary directory and use nat from it"
+        log_dry_run "would skip release downloads"
+        return 0
+    fi
+    if ! command -v tar >/dev/null 2>&1; then
+        log_err "tar not found; install lightweight dependencies first"
+        return 1
+    fi
+    log_info "using local release asset source: $LOCAL_ASSET_PATH"
+    tmp_dir="$(mktemp -d)"
+    mkdir -p "$tmp_dir/payload"
+    if ! tar -xzf "$LOCAL_ASSET_PATH" -C "$tmp_dir/payload"; then
+        log_err "failed to extract local asset: $LOCAL_ASSET_PATH"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    payload_nat="$(find "$tmp_dir/payload" -type f -name nat -print -quit)"
+    if [ -z "${payload_nat:-}" ]; then
+        log_err "local asset does not contain nat binary"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if [ ! -x "$payload_nat" ]; then
+        log_info "making extracted nat executable: $payload_nat"
+        if ! chmod +x "$payload_nat"; then
+            log_err "failed to chmod +x extracted nat binary"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+    fi
+    payload_dir="$(dirname "$payload_nat")"
+    RELEASE_PAYLOAD_DIR="$payload_dir"
+    select_install_source_dir "$payload_dir" || {
+        rm -rf "$tmp_dir"
+        return 1
+    }
     export NAT_BINARY_DIR="$payload_dir"
-    log_ok "release payload ready: $RELEASE_ASSET"
+    CLEANUP_PAYLOAD_DIR="$tmp_dir"
+    log_ok "local release asset ready: $LOCAL_ASSET_PATH"
 }
 
 build_from_source() {
@@ -205,6 +389,14 @@ prepare_install_payload() {
     if [ "$ACTION" = "--uninstall" ] || [ "$ACTION" = "--help" ] || [ "$ACTION" = "-h" ]; then
         return 0
     fi
+    if [ -n "$LOCAL_BINARY_PATH" ]; then
+        prepare_local_binary_payload
+        return $?
+    fi
+    if [ -n "$LOCAL_ASSET_PATH" ]; then
+        prepare_local_asset_payload
+        return $?
+    fi
     if [ "$INSTALL_MODE" = "source" ]; then
         build_from_source
         return $?
@@ -227,7 +419,11 @@ dry_run_core_install() {
     local config_type="$1"
     log_dry_run "would install core nat"
     log_dry_run "would check core runtime dependencies: curl ca-certificates nftables iproute2 iptables procps systemd openssl tar"
-    if [ -n "$RELEASE_ASSET" ]; then
+    if [ "$INSTALL_PAYLOAD_KIND" = "local-binary" ]; then
+        log_dry_run "would use local binary payload: $INSTALL_PAYLOAD_DESC"
+    elif [ "$INSTALL_PAYLOAD_KIND" = "local-asset" ]; then
+        log_dry_run "would use local asset payload: $INSTALL_PAYLOAD_DESC"
+    elif [ -n "$RELEASE_ASSET" ]; then
         log_dry_run "would use release payload: $RELEASE_ASSET"
     elif [ -x "$SCRIPT_DIR/target/release/nat" ]; then
         log_dry_run "would use local build: target/release/nat"
@@ -277,9 +473,7 @@ run_core_install() {
 }
 
 dry_run_update() {
-    if [ "$INSTALL_MODE" = "release" ]; then
-        prepare_release_payload || true
-    fi
+    prepare_install_payload
     log_dry_run "would update only core nat binary and nat.service"
     log_dry_run "would preserve user data: /etc/nat.toml /etc/nat.conf /var/lib/nftables-nat-rust/stats.json /etc/nftables-nat/backups"
     log_dry_run "would create backup directory: /etc/nftables-nat/backups/update-YYYYmmdd-HHMMSS"
@@ -297,15 +491,18 @@ run_update() {
     log_info "creating update backup: $backup_dir"
     backup_update_files "$backup_dir"
     if ! prepare_install_payload; then
+        cleanup_install_payload
         log_err "更新 payload 准备失败，保留旧版本"
         return 1
     fi
     if ! run_core_install "${NAT_CONFIG_TYPE:-toml}"; then
+        cleanup_install_payload
         log_err "更新失败，尝试回滚旧二进制和 service 文件"
         rollback_update_files "$backup_dir"
         log_warn "回滚已执行，请检查服务状态和日志"
         return 1
     fi
+    cleanup_install_payload
     log_ok "更新完成，备份目录: $backup_dir"
 }
 
@@ -469,6 +666,21 @@ while [ "$#" -gt 0 ]; do
             esac
             shift
             ;;
+        --mirror-base)
+            [ "$#" -lt 2 ] || [ -z "$2" ] && { log_err "--mirror-base requires URL"; exit 1; }
+            MIRROR_BASE="$2"
+            shift
+            ;;
+        --local-binary)
+            [ "$#" -lt 2 ] || [ -z "$2" ] && { log_err "--local-binary requires PATH"; exit 1; }
+            LOCAL_BINARY_PATH="$(absolute_path "$2")"
+            shift
+            ;;
+        --local-asset)
+            [ "$#" -lt 2 ] || [ -z "$2" ] && { log_err "--local-asset requires PATH"; exit 1; }
+            LOCAL_ASSET_PATH="$(absolute_path "$2")"
+            shift
+            ;;
         --uninstall)
             [ -n "$ACTION" ] && { log_err "只能指定一个动作参数"; exit 1; }
             ACTION="--uninstall"
@@ -490,6 +702,16 @@ if [ "$USE_RELEASE_SEEN" -eq 1 ] && [ "$BUILD_SOURCE_SEEN" -eq 1 ]; then
     exit 1
 fi
 
+if [ -n "$LOCAL_BINARY_PATH" ] && [ -n "$LOCAL_ASSET_PATH" ]; then
+    log_err "--local-binary and --local-asset cannot be used together"
+    exit 1
+fi
+
+if [ "$BUILD_SOURCE_SEEN" -eq 1 ] && { [ -n "$LOCAL_BINARY_PATH" ] || [ -n "$LOCAL_ASSET_PATH" ]; }; then
+    log_err "--build-from-source cannot be used with --local-binary or --local-asset"
+    exit 1
+fi
+
 if [ "$UPDATE_MODE" -eq 1 ]; then
     ACTION="${ACTION:-"--core-only"}"
     if [ "$ACTION" != "--core-only" ]; then
@@ -502,8 +724,20 @@ fi
 
 case "$ACTION" in
     --core-only|"")
-        prepare_install_payload
-        run_core_install "${NAT_CONFIG_TYPE:-toml}"
+        if prepare_install_payload; then
+            :
+        else
+            status=$?
+            cleanup_install_payload
+            exit "$status"
+        fi
+        if run_core_install "${NAT_CONFIG_TYPE:-toml}"; then
+            cleanup_install_payload
+        else
+            status=$?
+            cleanup_install_payload
+            exit "$status"
+        fi
         maybe_enter_cli_menu
         ;;
     --uninstall)

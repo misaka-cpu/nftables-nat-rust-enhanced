@@ -11,7 +11,7 @@
 - 支持 Stats、quota、audit log、Telegram、last-good、dynamic_whitelist
 - 不提供 WebUI，不做多租户，不做 tc/ifb 限速
 
-当前稳定版本：**v0.8.2**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
+当前稳定版本：**v0.8.3**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
 
 ## 快速安装
 
@@ -30,13 +30,13 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 指定版本安装（省略 `--version` 则跟随 latest release）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.2
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.3
 ```
 
 更新到指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.2
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.3
 ```
 
 安装完成后会安装 `/usr/local/bin/nat` 与 `nat.service`，保留或创建 `/etc/nat.toml`，并启动服务。
@@ -53,6 +53,42 @@ apt update && apt install -y curl ca-certificates nftables iproute2 iptables pro
 tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nftables-nat-rust-enhanced/archive/refs/heads/main.tar.gz | tar xz --strip-components=1 && cargo build --release && bash install.sh --core-only
 ```
 
+## 国内机器无法访问 GitHub 时的安装方式
+
+如果机器无法访问 `raw.githubusercontent.com`、GitHub Releases 或 GitHub 仓库归档，可以先通过可信渠道把 `install.sh` 和需要的安装文件上传到服务器，再用下面方式安装。本项目不内置任何第三方公共 GitHub proxy，也不会关闭 TLS 校验。
+
+### 1. 使用自建 mirror
+
+mirror 需要按 `MIRROR_BASE/VERSION/ASSET` 存放 release asset，例如 `https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.3/nftables-nat-rust-enhanced-linux-amd64.tar.gz`。
+
+```bash
+bash install.sh --core-only --use-release --version v0.8.3 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced
+```
+
+`--mirror-base` 只在下载 release asset 时生效；mirror asset 下载失败时会明确报错并 fallback 到 GitHub Release。不要使用不可信第三方镜像，mirror 属于供应链敏感路径。
+
+### 2. 手动上传 binary
+
+```bash
+scp nat root@server:/root/nat
+ssh root@server
+bash install.sh --core-only --local-binary /root/nat
+```
+
+脚本会检查 `/root/nat` 是否存在，不可执行时自动 `chmod +x`，然后安装到 `/usr/local/bin/nat`，继续创建或更新 `nat.service`，并保留已有 `/etc/nat.toml`。
+
+### 3. 手动上传 release asset
+
+```bash
+scp nftables-nat-rust-enhanced-linux-amd64.tar.gz root@server:/root/
+ssh root@server
+bash install.sh --core-only --local-asset /root/nftables-nat-rust-enhanced-linux-amd64.tar.gz
+```
+
+脚本会从本地 tar.gz 解压出 `nat` binary，安装到 `/usr/local/bin/nat`，并清理临时目录。`--local-binary` 和 `--local-asset` 都不会执行 GitHub 下载，`--update --core-only` 也支持这两种来源。
+
+mirror、local binary、local asset 都是供应链敏感路径。建议在安装前用 `sha256sum` 校验文件来源和哈希；如果后续 release 提供独立 checksums，请优先按官方 checksums 校验。
+
 ## 快速使用
 
 进入交互菜单：
@@ -65,7 +101,7 @@ nat --menu
 
 ```bash
 nat --version
-# 示例输出：nat v0.8.2
+# 示例输出：nat v0.8.3
 ```
 
 常用流程：`nat --menu` → `添加单端口转发` / `添加端口段转发` → 等待一个检测周期或手动 `systemctl restart nat`。
@@ -244,7 +280,7 @@ CLI 兼容旧版 `/etc/nat.conf` 读取逻辑。
 
 ```text
 ====================================
-nft-nat-rust v0.8.2
+nft-nat-rust v0.8.3
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
@@ -730,7 +766,7 @@ bash install.sh --core-only --build-from-source
 指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.2
+bash install.sh --core-only --use-release --version v0.8.3
 bash install.sh --core-only --build-from-source
 ```
 
@@ -784,7 +820,13 @@ apt update && apt install -y git curl wget ca-certificates build-essential pkg-c
 
 ## 版本说明
 
-### v0.8.2（当前稳定版）
+### v0.8.3（当前稳定版）
+
+- install.sh 新增 `--mirror-base`，支持使用自建 mirror 下载 release asset，mirror 下载失败会明确提示并 fallback GitHub
+- install.sh 新增 `--local-binary` / `--local-asset`，支持手动上传二进制或 release tar.gz 后离线安装，`--update --core-only` 同样支持
+- README 增加国内机器无法访问 GitHub 时的安装方式，并提醒 mirror / local 安装路径需要校验来源和 SHA256
+
+### v0.8.2
 
 - dynamic_whitelist 新增可选 IPv4 `/24` 扩展模式 `cidr_expand_ipv4`，默认 `/32` 精确 IP 行为不变；非 `32` / `24` 的值在配置校验和 CLI 两侧都会被拒绝
 - state 文件新增 `raw_ips` / `effective_sources` / `cidr_expand_ipv4` 字段，旧 state 兼容读取、即时重算，模式切换不保留旧网段、不无限累计
