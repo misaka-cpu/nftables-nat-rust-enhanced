@@ -9,25 +9,32 @@
 - 应用前执行 `nft -c`，失败自动回滚
 - 支持单端口 / 端口段 / IPv4 / IPv6 / TCP / UDP / all
 - 支持 Stats、quota、audit log、Telegram、last-good、dynamic_whitelist
-- 不提供 WebUI，不做多租户，不做 tc/ifb 限速
 
 当前稳定版本：**v0.8.4**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
 
 ## 快速安装
 
-安装并进入 CLI 菜单（推荐）：
+推荐安装并进入 CLI 菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --enter-menu
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.4 --enter-menu
 ```
+
+安装完成后会安装 `/usr/local/bin/nat` 与 `nat.service`，保留或创建 `/etc/nat.toml`，并启动服务。
+
+常用命令：
+
+```bash
+nat --menu
+nat --version
+systemctl status nat --no-pager -l
+```
+
+常用流程：`nat --menu` → `添加单端口转发` / `添加端口段转发` → 等待一个检测周期或手动 `systemctl restart nat`。
+
+## 更多安装方式
 
 安装但不自动进入菜单：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release
-```
-
-指定版本安装（省略 `--version` 则跟随 latest release）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.4
@@ -38,8 +45,6 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 ```bash
 curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.4
 ```
-
-安装完成后会安装 `/usr/local/bin/nat` 与 `nat.service`，保留或创建 `/etc/nat.toml`，并启动服务。
 
 推荐系统：Debian 11 / 12、Ubuntu 20.04 / 22.04 / 24.04。轻量安装依赖：
 
@@ -88,31 +93,6 @@ bash install.sh --core-only --local-asset /root/nftables-nat-rust-enhanced-linux
 脚本会从本地 tar.gz 解压出 `nat` binary，安装到 `/usr/local/bin/nat`，并清理临时目录。`--local-binary` 和 `--local-asset` 都不会执行 GitHub 下载，`--update --core-only` 也支持这两种来源。
 
 mirror、local binary、local asset 都是供应链敏感路径。安装脚本会拒绝危险 tar 成员（绝对路径、`..`、链接、特殊文件、多个 `nat` 候选），但仍建议在安装前用 `sha256sum` 校验文件来源和哈希；如果后续 release 提供独立 checksums，请优先按官方 checksums 校验。
-
-## 快速使用
-
-进入交互菜单：
-
-```bash
-nat --menu
-```
-
-查看版本：
-
-```bash
-nat --version
-# 示例输出：nat v0.8.4
-```
-
-常用流程：`nat --menu` → `添加单端口转发` / `添加端口段转发` → 等待一个检测周期或手动 `systemctl restart nat`。
-
-服务管理：
-
-```bash
-systemctl status nat --no-pager -l
-systemctl restart nat
-journalctl -u nat -f
-```
 
 ## 适合场景
 
