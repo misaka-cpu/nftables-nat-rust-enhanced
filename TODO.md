@@ -2,7 +2,7 @@
 
 本文件记录在历次「稳定版架构体检」中被识别、但本轮不修复的低优先级改进项。
 
-> 当前稳定版本 v0.8.4 是 bugfix-only 发布；v0.8.0 是 dynamic_whitelist 功能版本；v0.8.1 在其之上做 CLI 白名单 / 黑名单管理与动态 DDNS 来源白名单子菜单的展示层级优化，不改 nft / safe apply / 组合策略。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
+> 当前稳定版本 v0.8.5 是 CLI 观测与安全提示增强发布；v0.8.0 是 dynamic_whitelist 功能版本；v0.8.1 在其之上做 CLI 白名单 / 黑名单管理与动态 DDNS 来源白名单子菜单的展示层级优化，不改 nft / safe apply / 组合策略。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
 > 真正会动结构的改造请挪到独立 minor 版本规划，并先在本文件提案。
 
 不属于本文件的内容：
@@ -94,6 +94,14 @@
 - **版本显示修复**：本地源码构建未注入 release tag 时显示 `dev`，避免显示内部 package version。
 - **release/local asset 校验**：解压前拒绝危险 tar 成员和多个 `nat` 候选。
 - **dynamic_whitelist last-good 修复**：同名域名变更后 DNS 失败不复用旧域名 last-good 来源 IP。
+
+### v0.8.5
+
+- **来源 IP 命中查询**：白名单 / 黑名单管理新增只读诊断入口，按当前 `access_control`、`dynamic_whitelist` effective sources、GeoIP forward 给出命中与最终判断。
+- **来源策略摘要优化**：默认页显示静态 entries、dynamic_whitelist current/stale、`cidr_expand_ipv4`、GeoIP forward / SSH GeoIP，并保留来源 / 目标限制边界提示。
+- **whitelist 防锁死提示**：启用 whitelist 时若没有静态 entries 且没有可用动态来源，默认取消；用户强制继续写 `access_control.whitelist.empty_override` audit warning。
+- **README 排查说明**：新增「来源白名单排查」，明确 dynamic_whitelist 是来源白名单、`egress_control` 是目标限制。
+- **未改动**：nft 规则生成 / safe apply / access_control、GeoIP、dynamic_whitelist 组合策略；未新增省市白名单、WebUI、Bot 面板或数据库。
 
 ---
 

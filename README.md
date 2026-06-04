@@ -10,14 +10,14 @@
 - 支持单端口 / 端口段 / IPv4 / IPv6 / TCP / UDP / all
 - 支持 Stats、quota、audit log、Telegram、last-good、dynamic_whitelist
 
-当前稳定版本：**v0.8.4**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
+当前稳定版本：**v0.8.5**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
 
 ## 快速安装
 
 推荐安装并进入 CLI 菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.4 --enter-menu
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.5 --enter-menu
 ```
 
 安装完成后会安装 `/usr/local/bin/nat` 与 `nat.service`，保留或创建 `/etc/nat.toml`，并启动服务。
@@ -37,13 +37,13 @@ systemctl status nat --no-pager -l
 安装但不自动进入菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.4
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.5
 ```
 
 更新到指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.4
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.5
 ```
 
 推荐系统：Debian 11 / 12、Ubuntu 20.04 / 22.04 / 24.04。轻量安装依赖：
@@ -64,10 +64,10 @@ tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nfta
 
 ### 1. 使用自建 mirror
 
-mirror 需要按 `MIRROR_BASE/VERSION/ASSET` 存放 release asset，例如 `https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.4/nftables-nat-rust-enhanced-linux-amd64.tar.gz`。
+mirror 需要按 `MIRROR_BASE/VERSION/ASSET` 存放 release asset，例如 `https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.5/nftables-nat-rust-enhanced-linux-amd64.tar.gz`。
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.4 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced
+bash install.sh --core-only --use-release --version v0.8.5 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced
 ```
 
 `--mirror-base` 只在下载 release asset 时生效；mirror asset 下载失败时会明确报错并 fallback 到 GitHub Release。不要使用不可信第三方镜像，mirror 属于供应链敏感路径。
@@ -260,7 +260,7 @@ CLI 兼容旧版 `/etc/nat.conf` 读取逻辑。
 
 ```text
 ====================================
-nft-nat-rust v0.8.4
+nft-nat-rust v0.8.5
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
@@ -289,6 +289,7 @@ nft-nat-rust v0.8.4
 
 - **查看当前转发规则**：默认展示每条规则的核心字段（index / 状态 / type / sport / target / resolved / dport / protocol / ip_version / access_control / quota / egress），以及一行组合策略摘要和一行 last-good 摘要。页面尾部输入 `d` 展开完整组合策略 + 完整 last-good 状态缓存。
 - **添加单端口 / 端口段转发**：会尽力用 `ss -lntup` 检测入口端口是否已被本机服务占用，发现占用时默认取消，输入 `y` 才继续并写 `port_conflict.override` audit。没有 `ss` 时只 warning，不阻塞，也不会自动安装依赖或 kill 进程。
+- **白名单 / 黑名单管理**：默认页只显示来源访问控制摘要；可用「查询来源 IP 命中情况」检查某个来源 IP 是否命中当前 `access_control` / `dynamic_whitelist` / GeoIP 来源限制。
 - **测试转发规则连通性**：扫描 `ip/ip6 self-nat / self-filter`，结论分 `已应用` / `部分匹配` / `未确认` / `未应用`；不依赖 counter 非零，不会因检测未确认就自动重启 nat。CLI 默认只展示简短测试提示（`SERVER_IP:入口端口` + 协议提示），详细 `curl` / `nc` / SNI 示例可在测试页面输入 h 查看（按 `protocol` / `target` 分支生成）。
 - **高级网络设置**：查看 / 设置 SNAT 模式、fixed SNAT 源 IP、MSS clamp、时间 / NTP 状态检查、查看全局诊断状态（完整组合策略 + 完整 last-good 状态缓存，仅查看不修改）。
 - **查看审计日志**：默认按展示时区显示最近 50 行格式化日志，子菜单可切换原始 JSON。文件路径默认 `audit.file = /var/log/nftables-nat-rust-audit.log`，可用 `tail -F` / `grep` 直接查看。
@@ -392,7 +393,7 @@ allow = (来源不在黑名单)
 
 不要理解为 OR：白名单不会绕过 GeoIP，GeoIP 也不会绕过白名单。GeoIP 与 access_control 两者可以同时启用，叠加生效，不是互相覆盖。组合不会 `flush ruleset`，只在本项目 `self-nat` / `self-filter` 表内叠加规则。
 
-CLI 的「白名单 / 黑名单管理」默认页只显示来源访问控制的简洁摘要（mode / 静态 entries 数量 / 动态 DDNS 状态 / GeoIP / SSH GeoIP），完整组合策略通过子菜单「查看来源策略详情」按需展开。
+CLI 的「白名单 / 黑名单管理」默认页只显示来源访问控制的简洁摘要（mode / 静态 entries 数量 / 动态 DDNS 状态 / GeoIP / SSH GeoIP），完整组合策略通过子菜单「查看来源策略详情」按需展开；「查询来源 IP 命中情况」只读检查单个来源 IP，不修改配置、不应用 nft。
 
 ### dynamic_whitelist / DDNS 来源白名单
 
@@ -468,6 +469,16 @@ state 行为：
 - `/24` 扩展只影响 dynamic_whitelist 来源白名单的最终条目，不影响静态 `entries`、`egress_control`、目标 DDNS / last-good、SSH GeoIP、SNAT、MSS、quota、stats
 
 CLI / audit / Telegram：状态页与详细结果显示当前 `cidr_expand_ipv4`、原始 `raw_ips` 与扩展后的 `effective_sources`；`dynamic_whitelist.resolve.success` / `dynamic_whitelist.change` 事件记录 `raw_ips` / `effective_sources` / `cidr_expand_ipv4`；切换模式写 `dynamic_whitelist.cidr_expand.update` audit；`notify_on_change = true` 时只在 `effective_sources` 真正变化时通知，同一 `/24` 内 IP 抖动不会刷屏。
+
+## 来源白名单排查
+
+在「白名单 / 黑名单管理」里使用「查询来源 IP 命中情况」，可以检查某个来源 IP 是否会被当前 `access_control` / `dynamic_whitelist` / GeoIP 来源限制放行。这个入口只读诊断，不会添加白名单、不会切换模式、不会执行 `nft -f`。
+
+- `dynamic_whitelist` 是来源 IP 动态白名单，不是目标 IP 限制。
+- 启用 `access_control.mode = "whitelist"` 时，建议保留至少一个静态白名单 IP/CIDR 作为兜底。
+- 不建议使用省/市级大范围 IP 段作为来源白名单；范围越大，入口暴露面越大。
+- 如果需要大范围地域防火墙，建议使用独立工具，不并入本项目。
+- `egress_control` 用于限制目标 IP，不用于判断来源是否允许访问。
 
 ### egress_control（出口目标限制）
 
@@ -746,7 +757,7 @@ bash install.sh --core-only --build-from-source
 指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.4
+bash install.sh --core-only --use-release --version v0.8.5
 bash install.sh --core-only --build-from-source
 ```
 
@@ -800,7 +811,15 @@ apt update && apt install -y git curl wget ca-certificates build-essential pkg-c
 
 ## 版本说明
 
-### v0.8.4（当前稳定版）
+### v0.8.5（当前稳定版）
+
+- 白名单 / 黑名单管理新增「查询来源 IP 命中情况」只读诊断入口
+- 来源策略摘要显示静态 entries、dynamic_whitelist current/stale、`cidr_expand_ipv4`、GeoIP forward / SSH GeoIP
+- 设置 whitelist 时增加空白名单防锁死提示，强制继续会写 `access_control.whitelist.empty_override` audit warning
+- README 增加「来源白名单排查」，明确来源限制与 `egress_control` 目标限制的边界
+- 不改 nft 规则生成、safe apply、access_control / GeoIP / dynamic_whitelist 组合策略
+
+### v0.8.4
 
 - `prepare::check_and_prepare` 对 Docker v28 / FORWARD policy 只检测并 WARN，不再自动修改非 `self-*` 表
 - 本地源码构建未注入 release tag 时 `nat --version` 显示 `dev`，release 构建仍显示注入的 tag

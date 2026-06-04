@@ -18,6 +18,7 @@ use nat_common::{
 use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
 
@@ -1614,8 +1615,9 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
 6) 删除 IP/CIDR
 7) 清空 entries
 8) 动态 DDNS 来源白名单
-9) 查看来源策略详情
-10) 保存并应用
+9) 查询来源 IP 命中情况
+10) 查看来源策略详情
+11) 保存并应用
 0) 返回主菜单
 ===================================="#
         );
@@ -1634,8 +1636,26 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
                 println!(
                     "白名单只影响本项目转发端口，不影响 SSH；请确认需要访问转发端口的来源 IP 已加入白名单。"
                 );
-                if confirm("确认切换到 whitelist? [y/N]: ")? {
+                let state = DynamicWhitelistState::load(&config.dynamic_whitelist.state_file);
+                if whitelist_empty_lock_warning_needed(&config, &state) {
+                    print_whitelist_empty_lock_warning(&config, &state);
+                    let continue_on_empty = confirm("是否仍继续？[y/N]: ")?;
+                    match apply_whitelist_mode_with_empty_guard(
+                        path,
+                        &mut config,
+                        &state,
+                        continue_on_empty,
+                    ) {
+                        WhitelistModeApplyResult::Applied => {
+                            println!("访问控制模式已设为 whitelist。");
+                        }
+                        WhitelistModeApplyResult::CancelledByEmptyWarning => {
+                            println!("已取消切换到 whitelist。");
+                        }
+                    }
+                } else if confirm("确认切换到 whitelist? [y/N]: ")? {
                     config.access_control.mode = AccessControlMode::Whitelist;
+                    println!("访问控制模式已设为 whitelist。");
                 }
                 wait_enter_to_return()?;
             }
@@ -1668,12 +1688,16 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
                 config = load_toml_config(path)?;
             }
             "9" => {
+                query_source_ip_match_interactive(&config)?;
+                wait_enter_to_return()?;
+            }
+            "10" => {
                 for line in format_source_policy_detail_lines(&config) {
                     println!("{line}");
                 }
                 wait_enter_to_return()?;
             }
-            "10" => {
+            "11" => {
                 config
                     .access_control
                     .validate()
@@ -1707,11 +1731,21 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
 /// 「白名单 / 黑名单管理」默认页摘要：只列来源访问控制相关字段，
 /// 不展开 SNAT / MSS / egress_control / 评估顺序等长文本（这些走「查看来源策略详情」）。
 pub(crate) fn format_access_control_brief_lines(config: &TomlConfig) -> Vec<String> {
+    let state = DynamicWhitelistState::load(&config.dynamic_whitelist.state_file);
+    format_access_control_brief_lines_with_state(config, &state)
+}
+
+pub(crate) fn format_access_control_brief_lines_with_state(
+    config: &TomlConfig,
+    state: &DynamicWhitelistState,
+) -> Vec<String> {
     let dynamic_label = if config.dynamic_whitelist.enabled {
         "enabled"
     } else {
         "disabled"
     };
+    let current_ips = dynamic_whitelist::current_ips_for_config(&config.dynamic_whitelist, state);
+    let stale_count = dynamic_whitelist::stale_count_for_config(&config.dynamic_whitelist, state);
     let geoip_label = if config.geoip.enabled && config.geoip.forward.enabled {
         "enabled"
     } else {
@@ -1727,17 +1761,479 @@ pub(crate) fn format_access_control_brief_lines(config: &TomlConfig) -> Vec<Stri
         format!("  mode: {}", config.access_control.mode),
         format!("  静态 entries: {}", config.access_control.entries.len()),
         format!(
-            "  动态 DDNS: {}，domains={}",
-            dynamic_label,
-            config.dynamic_whitelist.domains.len()
+            "  dynamic_whitelist: {dynamic_label}, domains={}, current_ips={}, stale={stale_count}",
+            config.dynamic_whitelist.domains.len(),
+            current_ips.len()
         ),
-        format!("  GeoIP: {geoip_label}"),
+        format!(
+            "  cidr_expand_ipv4: {}",
+            if config.dynamic_whitelist.cidr_expand_ipv4 == 24 {
+                "true"
+            } else {
+                "false"
+            }
+        ),
+        format!("  GeoIP forward: {geoip_label}"),
         format!("  SSH GeoIP: {ssh_geoip_label}"),
         String::new(),
-        "说明：".to_string(),
-        "  access_control / dynamic_whitelist / GeoIP 用于限制\"谁能访问入口\"。".to_string(),
+        "最终来源判断：".to_string(),
+        "  黑名单优先拒绝".to_string(),
+        "  whitelist 模式：静态 entries OR dynamic_whitelist".to_string(),
+        "  GeoIP 同时启用时继续 AND 叠加".to_string(),
+        String::new(),
+        "提示：".to_string(),
+        "  dynamic_whitelist 只有在 access_control.mode = whitelist 时才参与放行。".to_string(),
         "  egress_control 是目标 IP 限制，不在此处管理。".to_string(),
     ]
+}
+
+fn query_source_ip_match_interactive(config: &TomlConfig) -> Result<(), io::Error> {
+    let input = prompt("请输入来源 IP: ")?;
+    let state = DynamicWhitelistState::load(&config.dynamic_whitelist.state_file);
+    match format_source_ip_match_lines(config, &state, &input) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+        }
+        Err(e) => {
+            println!("输入错误: {e}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn format_source_ip_match_lines(
+    config: &TomlConfig,
+    state: &DynamicWhitelistState,
+    input: &str,
+) -> Result<Vec<String>, String> {
+    let ip: IpAddr = input
+        .trim()
+        .parse()
+        .map_err(|_| "请输入合法 IPv4 / IPv6 地址".to_string())?;
+    let static_hit = find_matching_source_entry(ip, &config.access_control.entries);
+    let blacklist_hit = if config.access_control.mode == AccessControlMode::Blacklist {
+        static_hit.clone()
+    } else {
+        None
+    };
+    let dynamic_hits = dynamic_source_matches(config, state, ip);
+    let geoip_result = evaluate_geoip_source_match(config, ip);
+    let final_assessment = assess_final_source_decision(
+        config,
+        static_hit.as_ref(),
+        blacklist_hit.as_ref(),
+        &dynamic_hits,
+        geoip_result,
+    );
+    let dynamic_match_label = dynamic_match_label(config, ip, &dynamic_hits);
+
+    let mut lines = vec![
+        "================================".to_string(),
+        "来源 IP 命中查询".to_string(),
+        "================================".to_string(),
+        String::new(),
+        format!("输入 IP：{ip}"),
+        String::new(),
+        "1. access_control".to_string(),
+        format!("- mode: {}", config.access_control.mode),
+        format!(
+            "- 静态 entries: {}",
+            match &static_hit {
+                Some(entry) => format!("命中 {entry}"),
+                None => "未命中".to_string(),
+            }
+        ),
+        format!(
+            "- blacklist: {}",
+            match (&config.access_control.mode, &blacklist_hit) {
+                (AccessControlMode::Blacklist, Some(entry)) => format!("命中 {entry}"),
+                (AccessControlMode::Blacklist, None) => "未命中".to_string(),
+                _ => "未启用".to_string(),
+            }
+        ),
+        String::new(),
+        "2. dynamic_whitelist".to_string(),
+        format!("- enabled: {}", config.dynamic_whitelist.enabled),
+        "- 生效条件: access_control.mode = whitelist".to_string(),
+        format!("- 当前动态 IP: {dynamic_match_label}"),
+        format!(
+            "- 命中来源: {}",
+            if dynamic_hits.is_empty() {
+                "无".to_string()
+            } else {
+                dynamic_hits
+                    .iter()
+                    .map(|hit| hit.domain.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ),
+        format!(
+            "- cidr_expand_ipv4: {}",
+            if config.dynamic_whitelist.cidr_expand_ipv4 == 24 {
+                "true"
+            } else {
+                "false"
+            }
+        ),
+    ];
+    let expanded_hits = dynamic_hits
+        .iter()
+        .filter(|hit| hit.entry.contains('/'))
+        .map(|hit| hit.entry.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if !expanded_hits.is_empty() {
+        lines.push(format!(
+            "- 扩展网段: {}",
+            expanded_hits.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    lines.extend([
+        String::new(),
+        "3. GeoIP 来源限制".to_string(),
+        format!(
+            "- forward: {}",
+            if config.geoip.enabled && config.geoip.forward.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        format!("- 结果: {}", geoip_source_result_label(geoip_result)),
+        "- 说明：GeoIP 与 access_control 是 AND 叠加".to_string(),
+        String::new(),
+        "4. 最终判断".to_string(),
+        format!("- 允许：{}", final_assessment.allow_label),
+        "- 原因：".to_string(),
+    ]);
+    for reason in final_assessment.reasons {
+        lines.push(format!("  - {reason}"));
+    }
+    Ok(lines)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DynamicSourceMatch {
+    domain: String,
+    entry: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeoipSourceResult {
+    Disabled,
+    Unchecked,
+    Hit,
+    Miss,
+    DataUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceFinalAssessment {
+    allow_label: &'static str,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhitelistModeApplyResult {
+    Applied,
+    CancelledByEmptyWarning,
+}
+
+fn find_matching_source_entry(ip: IpAddr, entries: &[String]) -> Option<String> {
+    entries
+        .iter()
+        .find(|entry| source_entry_matches_ip(ip, entry))
+        .cloned()
+}
+
+fn source_entry_matches_ip(ip: IpAddr, entry: &str) -> bool {
+    if let Ok(addr) = entry.parse::<IpAddr>() {
+        return addr == ip;
+    }
+    entry
+        .parse::<ipnetwork::IpNetwork>()
+        .map(|network| network.contains(ip))
+        .unwrap_or(false)
+}
+
+fn dynamic_source_matches(
+    config: &TomlConfig,
+    state: &DynamicWhitelistState,
+    ip: IpAddr,
+) -> Vec<DynamicSourceMatch> {
+    if !config.dynamic_whitelist.enabled {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for domain_config in config
+        .dynamic_whitelist
+        .domains
+        .iter()
+        .filter(|domain| domain.enabled)
+    {
+        let Some(domain_state) =
+            state.find_domain_state(&domain_config.name, &domain_config.domain)
+        else {
+            continue;
+        };
+        for entry in dynamic_whitelist::effective_sources_view(
+            domain_state,
+            config.dynamic_whitelist.cidr_expand_ipv4,
+        ) {
+            if source_entry_matches_ip(ip, &entry) {
+                hits.push(DynamicSourceMatch {
+                    domain: domain_config.domain.clone(),
+                    entry,
+                });
+                break;
+            }
+        }
+    }
+    hits
+}
+
+fn dynamic_match_label(
+    config: &TomlConfig,
+    ip: IpAddr,
+    dynamic_hits: &[DynamicSourceMatch],
+) -> &'static str {
+    if !config.dynamic_whitelist.enabled {
+        return "未启用";
+    }
+    if matches!(ip, IpAddr::V6(_)) && !config.dynamic_whitelist.resolve_ipv6 {
+        return "不适用 / 未启用 IPv6 dynamic whitelist";
+    }
+    if dynamic_hits.is_empty() {
+        "未命中"
+    } else {
+        "命中"
+    }
+}
+
+fn evaluate_geoip_source_match(config: &TomlConfig, ip: IpAddr) -> GeoipSourceResult {
+    if !(config.geoip.enabled && config.geoip.forward.enabled) {
+        return GeoipSourceResult::Disabled;
+    }
+    if !matches!(ip, IpAddr::V4(_)) {
+        return GeoipSourceResult::Unchecked;
+    }
+    if config.geoip.allow_lan
+        && find_matching_source_entry(ip, &config.geoip.lan_ipv4_cidrs()).is_some()
+    {
+        return GeoipSourceResult::Hit;
+    }
+    let Ok(content) = fs::read_to_string(&config.geoip.cn4_file) else {
+        return GeoipSourceResult::DataUnavailable;
+    };
+    if geoip::validate_cn4_content(&content).is_err() {
+        return GeoipSourceResult::DataUnavailable;
+    }
+    let cidrs = geoip::extract_ipv4_cidrs(&content);
+    if cidrs.is_empty() {
+        return GeoipSourceResult::DataUnavailable;
+    }
+    if find_matching_source_entry(ip, &cidrs).is_some() {
+        GeoipSourceResult::Hit
+    } else {
+        GeoipSourceResult::Miss
+    }
+}
+
+fn geoip_source_result_label(result: GeoipSourceResult) -> &'static str {
+    match result {
+        GeoipSourceResult::Disabled | GeoipSourceResult::Unchecked => "未检查",
+        GeoipSourceResult::Hit => "命中",
+        GeoipSourceResult::Miss => "不命中",
+        GeoipSourceResult::DataUnavailable => "数据不可用",
+    }
+}
+
+fn assess_final_source_decision(
+    config: &TomlConfig,
+    static_hit: Option<&String>,
+    blacklist_hit: Option<&String>,
+    dynamic_hits: &[DynamicSourceMatch],
+    geoip_result: GeoipSourceResult,
+) -> SourceFinalAssessment {
+    let mut reasons = Vec::new();
+    let access_allowed = match config.access_control.mode {
+        AccessControlMode::Off => {
+            reasons.push("access_control=off，来源未受白名单限制".to_string());
+            true
+        }
+        AccessControlMode::Blacklist => {
+            if blacklist_hit.is_some() {
+                reasons.push("blacklist 命中，优先拒绝".to_string());
+                false
+            } else {
+                reasons.push("blacklist 未命中".to_string());
+                true
+            }
+        }
+        AccessControlMode::Whitelist => {
+            let static_allowed = static_hit.is_some();
+            let dynamic_allowed = !dynamic_hits.is_empty();
+            if static_allowed {
+                reasons.push("whitelist 模式下命中静态白名单".to_string());
+            }
+            if dynamic_allowed {
+                reasons.push("whitelist 模式下命中 dynamic_whitelist".to_string());
+            }
+            if static_allowed || dynamic_allowed {
+                true
+            } else {
+                reasons.push("whitelist 模式下未命中静态白名单或 dynamic_whitelist".to_string());
+                false
+            }
+        }
+    };
+
+    if !access_allowed {
+        return SourceFinalAssessment {
+            allow_label: "否",
+            reasons,
+        };
+    }
+
+    match geoip_result {
+        GeoipSourceResult::Hit => {
+            reasons.push("GeoIP 命中".to_string());
+            SourceFinalAssessment {
+                allow_label: "是",
+                reasons,
+            }
+        }
+        GeoipSourceResult::Miss => {
+            reasons.push("GeoIP 未命中，最终拒绝".to_string());
+            SourceFinalAssessment {
+                allow_label: "否",
+                reasons,
+            }
+        }
+        GeoipSourceResult::DataUnavailable => {
+            reasons.push("GeoIP 数据不可用，无法完全判断".to_string());
+            SourceFinalAssessment {
+                allow_label: "无法完全判断",
+                reasons,
+            }
+        }
+        GeoipSourceResult::Disabled | GeoipSourceResult::Unchecked => SourceFinalAssessment {
+            allow_label: "是",
+            reasons,
+        },
+    }
+}
+
+fn dynamic_whitelist_usable_sources_for_lock_check(
+    config: &TomlConfig,
+    state: &DynamicWhitelistState,
+) -> Vec<String> {
+    if !config.dynamic_whitelist.enabled {
+        return Vec::new();
+    }
+    let mut values = std::collections::BTreeSet::new();
+    for domain_config in config
+        .dynamic_whitelist
+        .domains
+        .iter()
+        .filter(|domain| domain.enabled)
+    {
+        let Some(domain_state) =
+            state.find_domain_state(&domain_config.name, &domain_config.domain)
+        else {
+            continue;
+        };
+        let mut raw_ips = domain_state.current_ips.clone();
+        if raw_ips.is_empty() && config.dynamic_whitelist.use_last_good_on_dns_failure {
+            raw_ips = domain_state.last_good_ips.clone();
+        }
+        for source in dynamic_whitelist::expand_effective_sources(
+            &raw_ips,
+            config.dynamic_whitelist.cidr_expand_ipv4,
+        ) {
+            values.insert(source);
+        }
+    }
+    values.into_iter().collect()
+}
+
+fn whitelist_empty_lock_warning_needed(config: &TomlConfig, state: &DynamicWhitelistState) -> bool {
+    if !config.access_control.entries.is_empty() {
+        return false;
+    }
+    let enabled_domains = config
+        .dynamic_whitelist
+        .domains
+        .iter()
+        .filter(|domain| domain.enabled)
+        .count();
+    if !config.dynamic_whitelist.enabled || enabled_domains == 0 {
+        return true;
+    }
+    dynamic_whitelist_usable_sources_for_lock_check(config, state).is_empty()
+}
+
+fn print_whitelist_empty_lock_warning(config: &TomlConfig, state: &DynamicWhitelistState) {
+    let enabled_domains = config
+        .dynamic_whitelist
+        .domains
+        .iter()
+        .filter(|domain| domain.enabled)
+        .count();
+    let usable_sources = dynamic_whitelist_usable_sources_for_lock_check(config, state);
+    println!();
+    println!("警告：你正在启用 whitelist 模式，但当前没有可用来源白名单。");
+    println!("这可能导致所有来源都无法访问转发入口。");
+    println!("建议先添加至少一个静态 IP/CIDR，或配置 dynamic_whitelist 并确认解析成功。");
+    println!(
+        "当前检查：静态 entries={}，dynamic_whitelist.enabled={}，enabled domains={}，可用动态来源={}",
+        config.access_control.entries.len(),
+        config.dynamic_whitelist.enabled,
+        enabled_domains,
+        usable_sources.len()
+    );
+    println!("不会自动添加当前 SSH IP，也不会自动放开来源。");
+    println!();
+}
+
+fn apply_whitelist_mode_with_empty_guard(
+    path: &str,
+    config: &mut TomlConfig,
+    state: &DynamicWhitelistState,
+    continue_on_empty_warning: bool,
+) -> WhitelistModeApplyResult {
+    let empty_warning = whitelist_empty_lock_warning_needed(config, state);
+    if empty_warning && !continue_on_empty_warning {
+        return WhitelistModeApplyResult::CancelledByEmptyWarning;
+    }
+    config.access_control.mode = AccessControlMode::Whitelist;
+    if empty_warning {
+        audit_whitelist_empty_override(path, config, state);
+    }
+    WhitelistModeApplyResult::Applied
+}
+
+fn audit_whitelist_empty_override(path: &str, config: &TomlConfig, state: &DynamicWhitelistState) {
+    let enabled_domains = config
+        .dynamic_whitelist
+        .domains
+        .iter()
+        .filter(|domain| domain.enabled)
+        .count();
+    audit_cli(
+        path,
+        "access_control.whitelist.empty_override",
+        AuditResult::Warn,
+        json!({
+            "mode": config.access_control.mode.to_string(),
+            "entries": config.access_control.entries.len(),
+            "dynamic_whitelist_enabled": config.dynamic_whitelist.enabled,
+            "dynamic_whitelist_enabled_domains": enabled_domains,
+            "dynamic_whitelist_usable_sources": dynamic_whitelist_usable_sources_for_lock_check(config, state).len(),
+        }),
+    );
 }
 
 /// 「查看来源策略详情」聚合页：复用 format_combined_policy_status 的完整组合策略文本，
@@ -8399,13 +8895,17 @@ HTTP/2 200
     #[test]
     fn access_control_brief_lines_show_summary_not_long_combined_policy() {
         let cfg = brief_layout_config(AccessControlMode::Off, &[], false, false, false, &[]);
-        let lines = format_access_control_brief_lines(&cfg).join("\n");
+        let state = DynamicWhitelistState::default();
+        let lines = format_access_control_brief_lines_with_state(&cfg, &state).join("\n");
         assert!(lines.contains("来源访问控制："));
         assert!(lines.contains("mode: off"));
         assert!(lines.contains("静态 entries: 0"));
-        assert!(lines.contains("动态 DDNS: disabled，domains=0"));
-        assert!(lines.contains("GeoIP: disabled"));
+        assert!(lines.contains("dynamic_whitelist: disabled, domains=0, current_ips=0, stale=0"));
+        assert!(lines.contains("cidr_expand_ipv4: false"));
+        assert!(lines.contains("GeoIP forward: disabled"));
         assert!(lines.contains("SSH GeoIP: disabled"));
+        assert!(lines.contains("最终来源判断："));
+        assert!(lines.contains("whitelist 模式：静态 entries OR dynamic_whitelist"));
         // 简洁页面不应包含 SNAT / MSS / egress / 完整组合策略标题块
         assert!(
             !lines.contains("组合策略 (access_control + GeoIP + egress + SNAT + MSS)"),
@@ -8445,11 +8945,27 @@ HTTP/2 200
             true,
             &[("home", "home.example.com", true)],
         );
-        let lines = format_access_control_brief_lines(&cfg).join("\n");
+        let state = DynamicWhitelistState {
+            domains: vec![nat_common::dynamic_whitelist::DynamicWhitelistDomainState {
+                name: "home".to_string(),
+                domain: "home.example.com".to_string(),
+                last_good_ips: vec!["203.0.113.10".to_string()],
+                current_ips: vec!["203.0.113.10".to_string()],
+                raw_ips: vec!["203.0.113.10".to_string()],
+                effective_sources: vec!["203.0.113.10".to_string()],
+                cidr_expand_ipv4: 32,
+                resolved_at: Some("2026-05-28T00:00:00Z".to_string()),
+                stale: true,
+                error: None,
+                ipv4: true,
+                ipv6: false,
+            }],
+        };
+        let lines = format_access_control_brief_lines_with_state(&cfg, &state).join("\n");
         assert!(lines.contains("mode: whitelist"));
         assert!(lines.contains("静态 entries: 2"));
-        assert!(lines.contains("动态 DDNS: enabled，domains=1"));
-        assert!(lines.contains("GeoIP: enabled"));
+        assert!(lines.contains("dynamic_whitelist: enabled, domains=1, current_ips=1, stale=1"));
+        assert!(lines.contains("GeoIP forward: enabled"));
         assert!(lines.contains("SSH GeoIP: enabled"));
     }
 
@@ -8461,10 +8977,14 @@ HTTP/2 200
             "8) 仍指向动态 DDNS 来源白名单子菜单"
         );
         assert!(
-            src.contains("9) 查看来源策略详情"),
-            "白名单 / 黑名单管理应新增「查看来源策略详情」入口"
+            src.contains("9) 查询来源 IP 命中情况"),
+            "白名单 / 黑名单管理应新增「查询来源 IP 命中情况」入口"
         );
-        assert!(src.contains("10) 保存并应用"), "保存并应用顺延为 10)");
+        assert!(
+            src.contains("10) 查看来源策略详情"),
+            "查看来源策略详情应顺延为 10)"
+        );
+        assert!(src.contains("11) 保存并应用"), "保存并应用顺延为 11)");
         // 旧的 9) 保存并应用编号不应再出现在白名单/黑名单菜单文本块
         assert!(
             !src.contains("9) 保存并应用"),
@@ -8494,6 +9014,218 @@ HTTP/2 200
         assert!(detail.contains(
             "说明：access_control / dynamic_whitelist / GeoIP 是来源 IP 限制；egress_control 是目标 IP 限制；SNAT 是源地址改写；MSS clamp 是 TCP MSS 调整。"
         ));
+    }
+
+    fn source_query_config(
+        mode: AccessControlMode,
+        entries: &[&str],
+        dynamic_enabled: bool,
+        cidr_expand_ipv4: u8,
+    ) -> TomlConfig {
+        let mut cfg = brief_layout_config(
+            mode,
+            entries,
+            false,
+            false,
+            dynamic_enabled,
+            &[("home", "home.example.com", true)],
+        );
+        cfg.dynamic_whitelist.cidr_expand_ipv4 = cidr_expand_ipv4;
+        cfg
+    }
+
+    fn dynamic_state_with_home(
+        current_ips: &[&str],
+        effective_sources: &[&str],
+    ) -> DynamicWhitelistState {
+        DynamicWhitelistState {
+            domains: vec![nat_common::dynamic_whitelist::DynamicWhitelistDomainState {
+                name: "home".to_string(),
+                domain: "home.example.com".to_string(),
+                last_good_ips: current_ips.iter().map(|ip| ip.to_string()).collect(),
+                current_ips: current_ips.iter().map(|ip| ip.to_string()).collect(),
+                raw_ips: current_ips.iter().map(|ip| ip.to_string()).collect(),
+                effective_sources: effective_sources
+                    .iter()
+                    .map(|source| source.to_string())
+                    .collect(),
+                cidr_expand_ipv4: if effective_sources
+                    .iter()
+                    .any(|source| source.contains("/24"))
+                {
+                    24
+                } else {
+                    32
+                },
+                resolved_at: Some("2026-05-28T00:00:00Z".to_string()),
+                stale: false,
+                error: None,
+                ipv4: true,
+                ipv6: false,
+            }],
+        }
+    }
+
+    fn query_lines(config: &TomlConfig, state: &DynamicWhitelistState, ip: &str) -> String {
+        format_source_ip_match_lines(config, state, ip)
+            .unwrap()
+            .join("\n")
+    }
+
+    #[test]
+    fn source_ip_query_hits_static_whitelist() {
+        let cfg = source_query_config(AccessControlMode::Whitelist, &["1.2.3.0/24"], false, 32);
+        let lines = query_lines(&cfg, &DynamicWhitelistState::default(), "1.2.3.4");
+        assert!(lines.contains("来源 IP 命中查询"));
+        assert!(lines.contains("静态 entries: 命中 1.2.3.0/24"));
+        assert!(lines.contains("允许：是"));
+        assert!(lines.contains("whitelist 模式下命中静态白名单"));
+    }
+
+    #[test]
+    fn source_ip_query_misses_static_whitelist() {
+        let cfg = source_query_config(AccessControlMode::Whitelist, &["5.6.7.0/24"], false, 32);
+        let lines = query_lines(&cfg, &DynamicWhitelistState::default(), "1.2.3.4");
+        assert!(lines.contains("静态 entries: 未命中"));
+        assert!(lines.contains("允许：否"));
+        assert!(lines.contains("未命中静态白名单或 dynamic_whitelist"));
+    }
+
+    #[test]
+    fn source_ip_query_hits_dynamic_current_ip() {
+        let cfg = source_query_config(AccessControlMode::Whitelist, &[], true, 32);
+        let state = dynamic_state_with_home(&["203.0.113.10"], &["203.0.113.10"]);
+        let lines = query_lines(&cfg, &state, "203.0.113.10");
+        assert!(lines.contains("当前动态 IP: 命中"));
+        assert!(lines.contains("命中来源: home.example.com"));
+        assert!(lines.contains("whitelist 模式下命中 dynamic_whitelist"));
+        assert!(lines.contains("允许：是"));
+    }
+
+    #[test]
+    fn source_ip_query_dynamic_cidr_expand_false_matches_only_32() {
+        let cfg = source_query_config(AccessControlMode::Whitelist, &[], true, 32);
+        let state = dynamic_state_with_home(&["203.0.113.10"], &["203.0.113.10"]);
+        let lines = query_lines(&cfg, &state, "203.0.113.11");
+        assert!(lines.contains("cidr_expand_ipv4: false"));
+        assert!(lines.contains("当前动态 IP: 未命中"));
+        assert!(lines.contains("允许：否"));
+    }
+
+    #[test]
+    fn source_ip_query_dynamic_cidr_expand_true_matches_24() {
+        let cfg = source_query_config(AccessControlMode::Whitelist, &[], true, 24);
+        let state = dynamic_state_with_home(&["203.0.113.10"], &["203.0.113.0/24"]);
+        let lines = query_lines(&cfg, &state, "203.0.113.99");
+        assert!(lines.contains("cidr_expand_ipv4: true"));
+        assert!(lines.contains("当前动态 IP: 命中"));
+        assert!(lines.contains("扩展网段: 203.0.113.0/24"));
+        assert!(lines.contains("允许：是"));
+    }
+
+    #[test]
+    fn source_ip_query_blacklist_hit_refuses_first() {
+        let cfg = source_query_config(AccessControlMode::Blacklist, &["1.2.3.4"], true, 32);
+        let state = dynamic_state_with_home(&["1.2.3.4"], &["1.2.3.4"]);
+        let lines = query_lines(&cfg, &state, "1.2.3.4");
+        assert!(lines.contains("blacklist: 命中 1.2.3.4"));
+        assert!(lines.contains("blacklist 命中，优先拒绝"));
+        assert!(lines.contains("允许：否"));
+    }
+
+    #[test]
+    fn source_ip_query_access_control_off_reports_unrestricted_source() {
+        let cfg = source_query_config(AccessControlMode::Off, &[], false, 32);
+        let lines = query_lines(&cfg, &DynamicWhitelistState::default(), "1.2.3.4");
+        assert!(lines.contains("mode: off"));
+        assert!(lines.contains("access_control=off，来源未受白名单限制"));
+        assert!(lines.contains("允许：是"));
+    }
+
+    #[test]
+    fn source_ip_query_geoip_enabled_but_data_unavailable_is_unknown() {
+        let dir = std::env::temp_dir().join(format!(
+            "nat-source-query-geoip-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = source_query_config(AccessControlMode::Off, &[], false, 32);
+        cfg.geoip.enabled = true;
+        cfg.geoip.forward.enabled = true;
+        cfg.geoip.cn4_file = dir.join("missing-cn4.nft").to_string_lossy().to_string();
+        let lines = query_lines(&cfg, &DynamicWhitelistState::default(), "1.2.3.4");
+        assert!(lines.contains("forward: enabled"));
+        assert!(lines.contains("结果: 数据不可用"));
+        assert!(lines.contains("允许：无法完全判断"));
+        assert!(lines.contains("GeoIP 数据不可用，无法完全判断"));
+    }
+
+    #[test]
+    fn source_ip_query_ipv6_dynamic_whitelist_not_enabled_is_explicit() {
+        let mut cfg = source_query_config(AccessControlMode::Whitelist, &[], true, 32);
+        cfg.dynamic_whitelist.resolve_ipv6 = false;
+        let state = dynamic_state_with_home(&["203.0.113.10"], &["203.0.113.10"]);
+        let lines = query_lines(&cfg, &state, "2001:db8::1");
+        assert!(lines.contains("当前动态 IP: 不适用 / 未启用 IPv6 dynamic whitelist"));
+    }
+
+    #[test]
+    fn whitelist_empty_lock_warning_triggers_without_static_or_dynamic_ip() {
+        let cfg = source_query_config(AccessControlMode::Off, &[], true, 32);
+        assert!(whitelist_empty_lock_warning_needed(
+            &cfg,
+            &DynamicWhitelistState::default()
+        ));
+    }
+
+    #[test]
+    fn whitelist_empty_lock_warning_cancel_keeps_mode_unchanged() {
+        let mut cfg = source_query_config(AccessControlMode::Off, &[], true, 32);
+        let result = apply_whitelist_mode_with_empty_guard(
+            "/tmp/not-used-nat.toml",
+            &mut cfg,
+            &DynamicWhitelistState::default(),
+            false,
+        );
+        assert_eq!(result, WhitelistModeApplyResult::CancelledByEmptyWarning);
+        assert_eq!(cfg.access_control.mode, AccessControlMode::Off);
+    }
+
+    #[test]
+    fn whitelist_empty_lock_warning_override_writes_audit_warn() {
+        let dir = std::env::temp_dir().join(format!(
+            "nat-whitelist-empty-override-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.log");
+        let toml_path = dir.join("nat.toml");
+        let mut cfg = source_query_config(AccessControlMode::Off, &[], true, 32);
+        cfg.audit.enabled = true;
+        cfg.audit.file = audit_path.to_string_lossy().to_string();
+        std::fs::write(&toml_path, cfg.to_toml_string().unwrap()).unwrap();
+        let result = apply_whitelist_mode_with_empty_guard(
+            toml_path.to_str().unwrap(),
+            &mut cfg,
+            &DynamicWhitelistState::default(),
+            true,
+        );
+        assert_eq!(result, WhitelistModeApplyResult::Applied);
+        assert_eq!(cfg.access_control.mode, AccessControlMode::Whitelist);
+        let raw = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(raw.contains("\"action\":\"access_control.whitelist.empty_override\""));
+        assert!(raw.contains("\"result\":\"warn\""));
+    }
+
+    #[test]
+    fn readme_documents_source_whitelist_troubleshooting() {
+        let readme = include_str!("../../README.md");
+        assert!(readme.contains("## 来源白名单排查"));
+        assert!(readme.contains("查询来源 IP 命中情况"));
+        assert!(readme.contains("dynamic_whitelist` 是来源 IP 动态白名单"));
+        assert!(readme.contains("egress_control` 用于限制目标 IP"));
     }
 
     // ===== v0.8.1 草案：动态 DDNS 来源白名单子菜单简化测试 =====
