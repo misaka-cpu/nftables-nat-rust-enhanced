@@ -2,7 +2,7 @@
 
 本文件记录在历次「稳定版架构体检」中被识别、但本轮不修复的低优先级改进项。
 
-> 当前稳定版本 v0.8.6 是全局转发开关、SSH 来源检测提示和来源策略摘要增强发布；v0.8.5 是 CLI 观测与安全提示增强发布；v0.8.0 是 dynamic_whitelist 功能版本。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
+> 当前稳定版本 v0.8.7 是 disabled 规则在前时 Stats/quota rule_id 对齐的 bugfix 发布；v0.8.6 是全局转发开关、SSH 来源检测提示和来源策略摘要增强发布；v0.8.5 是 CLI 观测与安全提示增强发布；v0.8.0 是 dynamic_whitelist 功能版本。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
 > 真正会动结构的改造请挪到独立 minor 版本规划，并先在本文件提案。
 
 不属于本文件的内容：
@@ -110,6 +110,11 @@
 - **SSH 来源检测提示**：白名单 / 黑名单管理新增「检测当前 SSH 来源 IP」，从 `SSH_CONNECTION` / `SSH_CLIENT` 读取来源，只在用户确认后加入静态 entries；blacklist 模式拒绝添加避免误封。
 - **来源摘要继续优化**：摘要新增 `global forwarding`、global disabled 明显提示、whitelist 空来源 warning、dynamic_whitelist 非 whitelist 模式提示；详情仍保留在「来源策略详情」。
 - **连通性测试**：global disabled 时直接提示规则不会生效，不继续做误导性的 nft 应用判断。
+
+### v0.8.7
+
+- **bugfix**：修复 disabled 规则位于启用规则之前时 Stats / quota 的 `rule_id` 对齐问题。`compute_usages` / `rule_labels_from_config` 改为「启用规则序号」（先 `filter(enabled)` 再编号，与 nft 计数器口径一致）；`QuotaUsage` 新增 `original_index` 供 `apply_disable_actions` 精确写回正确规则。
+- **未改动**：nft 规则生成 / safe apply / access_control、GeoIP、dynamic_whitelist、egress_control、last-good、Telegram 超时；未新增功能。
 
 ---
 

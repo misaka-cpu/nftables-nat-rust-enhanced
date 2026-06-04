@@ -1472,9 +1472,10 @@ fn show_quota_status(config_path: &str) {
         return;
     }
     for usage in &usages {
-        let rule_idx: Option<usize> = usage.rule_id.strip_prefix('r').and_then(|s| s.parse().ok());
-        let rule_state = rule_idx
-            .and_then(|i| config.rules.get(i))
+        // 用 original_index 取真实规则状态；rule_id 是「启用规则序号」，不能直接当数组下标。
+        let rule_state = config
+            .rules
+            .get(usage.original_index)
             .map(|r| if r.enabled() { "enabled" } else { "disabled" })
             .unwrap_or("?");
         let remaining = usage.limit_bytes.saturating_sub(usage.used_bytes);

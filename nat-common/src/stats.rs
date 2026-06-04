@@ -231,13 +231,23 @@ fn parse_nat_rule_comment(payload: &str) -> HashMap<String, String> {
 }
 
 pub fn rule_labels_from_config(config: &TomlConfig) -> HashMap<String, String> {
-    config
-        .rules
-        .iter()
-        .enumerate()
-        .filter(|(_, rule)| rule.enabled())
-        .filter_map(|(index, rule)| rule_to_label(rule).map(|label| (format!("r{index}"), label)))
-        .collect()
+    // rule_id（`rN`）必须与 nft 脚本生成一致：先过滤 disabled 规则，再对剩余「启用规则」
+    // （含 Drop，因为 Drop::enabled() == true）顺序编号。Drop 规则会占用一个序号但不产生 label。
+    // 不能先 enumerate 再 filter，否则 N 变成 config.rules 数组下标，disabled 规则在前时与
+    // nft 计数器口径（per_rule_*_bytes 的 key）错位。
+    let mut labels = HashMap::new();
+    let mut enabled_seq = 0usize;
+    for rule in &config.rules {
+        if !rule.enabled() {
+            continue;
+        }
+        let rule_seq = enabled_seq;
+        enabled_seq += 1;
+        if let Some(label) = rule_to_label(rule) {
+            labels.insert(format!("r{rule_seq}"), label);
+        }
+    }
+    labels
 }
 
 fn rule_to_label(rule: &NftCell) -> Option<String> {
@@ -775,6 +785,71 @@ domain = "example.com"
         )
         .unwrap();
         assert!(rule_labels_from_config(&config).is_empty());
+    }
+
+    #[test]
+    fn labels_align_with_nft_rule_id_when_disabled_rule_precedes() {
+        // M-1 回归：config.rules = [disabled, enabled]。nft 只为启用规则编号 → 启用规则是 r0。
+        // 修复前这里会把它标成 r1，与 per_rule_*_bytes 的 key（r0）错位。
+        let config = TomlConfig::from_toml_str(
+            r#"
+[[rules]]
+type = "single"
+enabled = false
+sport = 30000
+dport = 80
+domain = "disabled.example.com"
+
+[[rules]]
+type = "single"
+sport = 34120
+dport = 44336
+domain = "example.com"
+protocol = "all"
+ip_version = "ipv4"
+comment = "https"
+"#,
+        )
+        .unwrap();
+        let labels = rule_labels_from_config(&config);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(
+            labels.get("r0").map(String::as_str),
+            Some("https: 34120 -> example.com:44336/all"),
+            "启用规则的 label 必须挂在 r0，而不是 r1"
+        );
+        assert!(!labels.contains_key("r1"));
+    }
+
+    #[test]
+    fn labels_drop_rule_consumes_rule_id_slot() {
+        // Drop 规则启用、占用 r0 序号（和 nft 一致）但自身无 label；后面的转发规则应是 r1。
+        let config = TomlConfig::from_toml_str(
+            r#"
+[[rules]]
+type = "drop"
+chain = "input"
+src_ip = "198.51.100.7"
+
+[[rules]]
+type = "single"
+sport = 34120
+dport = 44336
+domain = "example.com"
+protocol = "all"
+ip_version = "ipv4"
+comment = "https"
+"#,
+        )
+        .unwrap();
+        let labels = rule_labels_from_config(&config);
+        assert_eq!(labels.len(), 1);
+        assert!(!labels.contains_key("r0"), "Drop 规则不产生 label");
+        assert_eq!(
+            labels.get("r1").map(String::as_str),
+            Some("https: 34120 -> example.com:44336/all"),
+            "Drop 占用 r0 后，转发规则必须是 r1"
+        );
     }
 
     #[test]

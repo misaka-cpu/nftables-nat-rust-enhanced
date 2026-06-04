@@ -10,14 +10,14 @@
 - 支持单端口 / 端口段 / IPv4 / IPv6 / TCP / UDP / all
 - 支持全局转发开关、Stats、quota、audit log、Telegram、last-good、dynamic_whitelist
 
-当前稳定版本：**v0.8.6**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
+当前稳定版本：**v0.8.7**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
 
 ## 快速安装
 
 推荐安装并进入 CLI 菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.6 --enter-menu
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.7 --enter-menu
 ```
 
 安装完成后会安装 `/usr/local/bin/nat` 与 `nat.service`，保留或创建 `/etc/nat.toml`，并启动服务。
@@ -37,13 +37,13 @@ systemctl status nat --no-pager -l
 安装但不自动进入菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.6
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.7
 ```
 
 更新到指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.6
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.7
 ```
 
 推荐系统：Debian 11 / 12、Ubuntu 20.04 / 22.04 / 24.04。轻量安装依赖：
@@ -64,10 +64,10 @@ tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nfta
 
 ### 1. 使用自建 mirror
 
-mirror 需要按 `MIRROR_BASE/VERSION/ASSET` 存放 release asset，例如 `https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.6/nftables-nat-rust-enhanced-linux-amd64.tar.gz`。
+mirror 需要按 `MIRROR_BASE/VERSION/ASSET` 存放 release asset，例如 `https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.7/nftables-nat-rust-enhanced-linux-amd64.tar.gz`。
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.6 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced
+bash install.sh --core-only --use-release --version v0.8.7 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced
 ```
 
 `--mirror-base` 只在下载 release asset 时生效；mirror asset 下载失败时会明确报错并 fallback 到 GitHub Release。不要使用不可信第三方镜像，mirror 属于供应链敏感路径。
@@ -265,7 +265,7 @@ CLI 兼容旧版 `/etc/nat.conf` 读取逻辑。
 
 ```text
 ====================================
-nft-nat-rust v0.8.6
+nft-nat-rust v0.8.7
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
@@ -782,7 +782,7 @@ bash install.sh --core-only --build-from-source
 指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.6
+bash install.sh --core-only --use-release --version v0.8.7
 bash install.sh --core-only --build-from-source
 ```
 
@@ -836,7 +836,11 @@ apt update && apt install -y git curl wget ca-certificates build-essential pkg-c
 
 ## 版本说明
 
-### v0.8.6（当前稳定版）
+### v0.8.7（当前稳定版）
+
+- 修复 disabled 规则位于启用规则之前时 Stats / quota 的 `rule_id` 对齐问题（与 nft 计数器口径统一为「启用规则序号」）
+
+### v0.8.6
 
 - 新增 `[global] enabled` 全局转发开关，可临时停用 / 恢复本项目所有转发规则生成，不删除规则配置
 - `global.enabled=false` 时仍保留 managed table 基础结构，不生成 DNAT/SNAT 转发规则，不影响 SSH 和系统其他 nft table

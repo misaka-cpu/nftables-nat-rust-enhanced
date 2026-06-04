@@ -89,7 +89,11 @@ impl QuotaState {
 /// 当前 period 的 used / limit / key
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaUsage {
+    /// nft 计数器口径的规则 id（`rN`），N 为「启用规则序号」，与 nft 脚本生成一致。
     pub rule_id: String,
+    /// 该规则在 `config.rules` 中的真实数组下标，供 [`apply_disable_actions`] 精确写回。
+    /// 不能用 `rule_id` 的数字部分当数组下标——两者只有在没有 disabled 规则时才相等。
+    pub original_index: usize,
     pub label: Option<String>,
     pub period: QuotaPeriod,
     pub period_key: String,
@@ -115,8 +119,20 @@ pub fn compute_usages(
     now: DateTime<Utc>,
 ) -> Vec<QuotaUsage> {
     let mut out = Vec::new();
-    for (idx, rule) in rules.iter().enumerate() {
+    // rule_id（`rN`）必须与 nft 脚本生成完全一致：`read_toml_config` 先 `filter(NftCell::enabled)`
+    // 过滤掉 disabled 规则，再对剩余「启用规则」（含 Drop，因为 Drop::enabled() == true）顺序编号
+    // r0,r1,…。因此这里用「启用规则序号」而不是 config.rules 数组下标，否则 disabled 规则排在
+    // 启用规则之前时，per_rule_*_bytes 的 key 会和这里查的 key 错位。
+    let mut enabled_seq = 0usize;
+    for (original_index, rule) in rules.iter().enumerate() {
+        if !rule.enabled() {
+            // 被禁用的规则不会生成 nft 规则、没有计数器，也不占用 rN 序号。
+            continue;
+        }
+        let rule_seq = enabled_seq;
+        enabled_seq += 1;
         if matches!(rule, NftCell::Drop { .. }) {
+            // Drop 规则会占用一个 rN 序号（和 nft 生成保持对齐），但没有 quota / 流量计数。
             continue;
         }
         if !rule.quota_enabled() {
@@ -126,7 +142,7 @@ pub fn compute_usages(
         if limit == 0 {
             continue;
         }
-        let rule_id = format!("r{idx}");
+        let rule_id = format!("r{rule_seq}");
         let period = rule.quota_period();
         let (used, period_key) = match period {
             QuotaPeriod::Daily => (
@@ -155,8 +171,9 @@ pub fn compute_usages(
             ),
         };
         out.push(QuotaUsage {
+            label: stats_state.rule_labels.get(&rule_id).cloned(),
             rule_id,
-            label: stats_state.rule_labels.get(&format!("r{idx}")).cloned(),
+            original_index,
             period,
             period_key,
             used_bytes: used,
@@ -204,15 +221,8 @@ pub fn check_and_decide(
         let key = usage.notify_key();
         let already_notified = quota_state.is_notified(&key);
         let rule_enabled = rules
-            .iter()
-            .enumerate()
-            .find_map(|(i, r)| {
-                if format!("r{i}") == usage.rule_id {
-                    Some(r.enabled())
-                } else {
-                    None
-                }
-            })
+            .get(usage.original_index)
+            .map(|r| r.enabled())
             .unwrap_or(true);
         decisions.push(ExceededDecision {
             usage,
@@ -230,14 +240,9 @@ pub fn apply_disable_actions(
 ) -> Vec<usize> {
     let mut changed = Vec::new();
     for decision in decisions {
-        let Some(idx) = decision
-            .usage
-            .rule_id
-            .strip_prefix('r')
-            .and_then(|s| s.parse::<usize>().ok())
-        else {
-            continue;
-        };
+        // 必须用 original_index（config.rules 的真实数组下标）写回，而不是把 rule_id 的数字部分
+        // 当下标——rule_id 是「启用规则序号」，有 disabled 规则在前时与数组下标并不相等。
+        let idx = decision.usage.original_index;
         if let Some(rule) = config.rules.get_mut(idx)
             && rule.enabled()
         {
@@ -472,6 +477,7 @@ mod tests {
         config.rules.push(rule.clone());
         let usage = QuotaUsage {
             rule_id: "r0".to_string(),
+            original_index: 0,
             label: None,
             period: QuotaPeriod::Monthly,
             period_key: "2026-05".to_string(),
@@ -524,6 +530,7 @@ mod tests {
     fn telegram_message_contains_no_secrets() {
         let usage = QuotaUsage {
             rule_id: "r0".to_string(),
+            original_index: 0,
             label: Some("hk-out".to_string()),
             period: QuotaPeriod::Monthly,
             period_key: "2026-05".to_string(),
@@ -540,5 +547,198 @@ mod tests {
         assert!(msg.contains("disabled"));
         assert!(!msg.to_lowercase().contains("bot_token"));
         assert!(!msg.to_lowercase().contains("token"));
+    }
+
+    // ---- M-1 回归测试：disabled 规则排在 enabled 规则之前时的 rule_id 对齐 ----
+
+    fn disabled_rule(sport: u16) -> NftCell {
+        let mut rule = rule_with_quota(sport, 100, QuotaPeriod::Monthly);
+        rule.set_enabled(false);
+        rule
+    }
+
+    fn drop_rule() -> NftCell {
+        NftCell::Drop {
+            chain: crate::Chain::Input,
+            src_ip: Some("198.51.100.7".to_string()),
+            dst_ip: None,
+            src_port: None,
+            src_port_end: None,
+            dst_port: None,
+            dst_port_end: None,
+            protocol: Protocol::All,
+            comment: None,
+        }
+    }
+
+    #[test]
+    fn compute_usages_aligns_rule_id_with_nft_when_disabled_rule_precedes() {
+        // config.rules = [disabled, enabled_with_quota]
+        // nft 只为启用规则编号 → 启用规则是 r0（不是 r1）。
+        let rules = vec![
+            disabled_rule(30000),
+            rule_with_quota(30080, 100, QuotaPeriod::Monthly),
+        ];
+        let mut stats = StatsState::default();
+        stats.per_rule_monthly_bytes.insert("r0".to_string(), 200);
+        // 故意往 r1 放干扰流量，确保不会被误读。
+        stats
+            .per_rule_monthly_bytes
+            .insert("r1".to_string(), 999_999);
+
+        let usages = compute_usages(&rules, &stats, ts("2026-05-19T12:00:00Z"));
+        assert_eq!(usages.len(), 1);
+        let usage = &usages[0];
+        assert_eq!(usage.rule_id, "r0", "启用规则必须对应 nft 的 r0");
+        assert_eq!(
+            usage.original_index, 1,
+            "original_index 必须是 config.rules 真实下标"
+        );
+        assert_eq!(usage.used_bytes, 200, "必须读到 r0 的流量，而不是 r1");
+    }
+
+    #[test]
+    fn compute_usages_reads_per_rule_label_with_aligned_rule_id() {
+        let rules = vec![
+            disabled_rule(30000),
+            rule_with_quota(30080, 100, QuotaPeriod::Monthly),
+        ];
+        let mut stats = StatsState::default();
+        stats.per_rule_monthly_bytes.insert("r0".to_string(), 50);
+        stats.rule_labels.insert(
+            "r0".to_string(),
+            "hk-out: 30080 -> example.com:80/tcp".to_string(),
+        );
+        // r1 放一个错误 label，确保不会被误取。
+        stats
+            .rule_labels
+            .insert("r1".to_string(), "WRONG".to_string());
+
+        let usages = compute_usages(&rules, &stats, ts("2026-05-19T12:00:00Z"));
+        assert_eq!(usages.len(), 1);
+        assert_eq!(
+            usages[0].label.as_deref(),
+            Some("hk-out: 30080 -> example.com:80/tcp")
+        );
+    }
+
+    #[test]
+    fn apply_disable_disables_correct_rule_with_leading_disabled() {
+        // 超额的是 config.rules[1]，必须禁用它，不能误动 config.rules[0]。
+        let mut config = TomlConfig::from_toml_str("rules = []").unwrap();
+        config.rules.push(disabled_rule(30000));
+        config
+            .rules
+            .push(rule_with_quota(30080, 100, QuotaPeriod::Monthly));
+        let mut stats = StatsState::default();
+        stats.per_rule_monthly_bytes.insert("r0".to_string(), 200);
+
+        let decisions = check_and_decide(
+            &config.rules,
+            &stats,
+            &QuotaConfig::default(),
+            &QuotaState::default(),
+            ts("2026-05-19T12:00:00Z"),
+        );
+        assert_eq!(decisions.len(), 1);
+        let changed = apply_disable_actions(&mut config, &decisions);
+        assert_eq!(changed, vec![1], "必须改 config.rules[1]");
+        assert!(!config.rules[1].enabled(), "超额规则（下标 1）必须被禁用");
+        // 下标 0 本来就 disabled，不应被 apply 改成 changed。
+        assert!(!config.rules[0].enabled());
+    }
+
+    #[test]
+    fn compute_usages_aligns_multiple_rules_after_leading_disabled() {
+        // config.rules = [disabled, enabled_A, enabled_B] → A=r0, B=r1
+        let rules = vec![
+            disabled_rule(30000),
+            rule_with_quota(30080, 100, QuotaPeriod::Monthly),
+            rule_with_quota(30090, 100, QuotaPeriod::Monthly),
+        ];
+        let mut stats = StatsState::default();
+        stats.per_rule_monthly_bytes.insert("r0".to_string(), 111);
+        stats.per_rule_monthly_bytes.insert("r1".to_string(), 222);
+
+        let usages = compute_usages(&rules, &stats, ts("2026-05-19T12:00:00Z"));
+        assert_eq!(usages.len(), 2);
+        // A = config.rules[1] = r0 = 111
+        assert_eq!(usages[0].rule_id, "r0");
+        assert_eq!(usages[0].original_index, 1);
+        assert_eq!(usages[0].used_bytes, 111);
+        // B = config.rules[2] = r1 = 222
+        assert_eq!(usages[1].rule_id, "r1");
+        assert_eq!(usages[1].original_index, 2);
+        assert_eq!(usages[1].used_bytes, 222);
+    }
+
+    #[test]
+    fn compute_usages_renumbers_after_leading_rule_auto_disabled() {
+        // 先 [enabled_A, enabled_B] → A=r0, B=r1。A 被自动禁用后 config = [disabled_A, enabled_B]，
+        // 下一轮 B 应重新对应 r0，能读到 r0 的流量，而不是继续查旧的 r1。
+        let rules = vec![
+            disabled_rule(30080),
+            rule_with_quota(30090, 100, QuotaPeriod::Monthly),
+        ];
+        let mut stats = StatsState::default();
+        stats.per_rule_monthly_bytes.insert("r0".to_string(), 333);
+
+        let usages = compute_usages(&rules, &stats, ts("2026-05-19T12:00:00Z"));
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].rule_id, "r0");
+        assert_eq!(usages[0].original_index, 1);
+        assert_eq!(usages[0].used_bytes, 333);
+    }
+
+    #[test]
+    fn compute_usages_drop_rule_consumes_rule_id_slot() {
+        // Drop 规则是启用的，会占用 r0 序号（和 nft 生成一致），所以带 quota 的规则是 r1。
+        let rules = vec![
+            drop_rule(),
+            rule_with_quota(30080, 100, QuotaPeriod::Monthly),
+        ];
+        let mut stats = StatsState::default();
+        stats.per_rule_monthly_bytes.insert("r1".to_string(), 700);
+        // r0 是 Drop 的位置，不该被 quota 规则读到。
+        stats
+            .per_rule_monthly_bytes
+            .insert("r0".to_string(), 999_999);
+
+        let usages = compute_usages(&rules, &stats, ts("2026-05-19T12:00:00Z"));
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].rule_id, "r1", "Drop 占用 r0，quota 规则应为 r1");
+        assert_eq!(usages[0].original_index, 1);
+        assert_eq!(usages[0].used_bytes, 700);
+    }
+
+    #[test]
+    fn compute_usages_all_enabled_unchanged_behaviour() {
+        // 没有 disabled 规则时，启用序号 == 数组下标，行为与修复前一致。
+        let rules = vec![
+            rule_with_quota(30080, 100, QuotaPeriod::Monthly),
+            rule_with_quota(30090, 100, QuotaPeriod::Monthly),
+        ];
+        let mut stats = StatsState::default();
+        stats.per_rule_monthly_bytes.insert("r0".to_string(), 10);
+        stats.per_rule_monthly_bytes.insert("r1".to_string(), 20);
+
+        let usages = compute_usages(&rules, &stats, ts("2026-05-19T12:00:00Z"));
+        assert_eq!(usages.len(), 2);
+        assert_eq!(
+            (
+                usages[0].rule_id.as_str(),
+                usages[0].original_index,
+                usages[0].used_bytes
+            ),
+            ("r0", 0, 10)
+        );
+        assert_eq!(
+            (
+                usages[1].rule_id.as_str(),
+                usages[1].original_index,
+                usages[1].used_bytes
+            ),
+            ("r1", 1, 20)
+        );
     }
 }
