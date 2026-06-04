@@ -913,6 +913,7 @@ pub(crate) fn last_good_identities_from_runtime_cells(
 // TOML配置示例函数
 pub fn toml_example(conf: &str) -> Result<(), io::Error> {
     let example_config = TomlConfig {
+        global: Default::default(),
         rules: vec![
             NftCell::Single {
                 enabled: true,

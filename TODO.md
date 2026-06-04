@@ -2,7 +2,7 @@
 
 本文件记录在历次「稳定版架构体检」中被识别、但本轮不修复的低优先级改进项。
 
-> 当前稳定版本 v0.8.5 是 CLI 观测与安全提示增强发布；v0.8.0 是 dynamic_whitelist 功能版本；v0.8.1 在其之上做 CLI 白名单 / 黑名单管理与动态 DDNS 来源白名单子菜单的展示层级优化，不改 nft / safe apply / 组合策略。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
+> 当前稳定版本 v0.8.6 是全局转发开关、SSH 来源检测提示和来源策略摘要增强发布；v0.8.5 是 CLI 观测与安全提示增强发布；v0.8.0 是 dynamic_whitelist 功能版本。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
 > 真正会动结构的改造请挪到独立 minor 版本规划，并先在本文件提案。
 
 不属于本文件的内容：
@@ -102,6 +102,14 @@
 - **whitelist 防锁死提示**：启用 whitelist 时若没有静态 entries 且没有可用动态来源，默认取消；用户强制继续写 `access_control.whitelist.empty_override` audit warning。
 - **README 排查说明**：新增「来源白名单排查」，明确 dynamic_whitelist 是来源白名单、`egress_control` 是目标限制。
 - **未改动**：nft 规则生成 / safe apply / access_control、GeoIP、dynamic_whitelist 组合策略；未新增省市白名单、WebUI、Bot 面板或数据库。
+
+### v0.8.6
+
+- **全局转发开关**：新增 `[global] enabled`，可临时关闭 / 恢复本项目所有转发规则生成，不删除 rules 或 access_control / dynamic_whitelist / egress_control / quota / stats 配置。
+- **规则生成边界**：`global.enabled=false` 时保留 managed table 基础结构，不生成 DNAT/SNAT 转发规则；不 `flush ruleset`，不触碰非 self-* 表，不影响 SSH。
+- **SSH 来源检测提示**：白名单 / 黑名单管理新增「检测当前 SSH 来源 IP」，从 `SSH_CONNECTION` / `SSH_CLIENT` 读取来源，只在用户确认后加入静态 entries；blacklist 模式拒绝添加避免误封。
+- **来源摘要继续优化**：摘要新增 `global forwarding`、global disabled 明显提示、whitelist 空来源 warning、dynamic_whitelist 非 whitelist 模式提示；详情仍保留在「来源策略详情」。
+- **连通性测试**：global disabled 时直接提示规则不会生效，不继续做误导性的 nft 应用判断。
 
 ---
 

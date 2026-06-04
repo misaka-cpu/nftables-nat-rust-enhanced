@@ -151,6 +151,7 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
             dynamic_whitelist_refresh_interval(&runtime_config.dynamic_whitelist)?;
         warn_short_ddns_interval_once(refresh_interval, &mut last_short_ddns_warn);
         let dns_config = runtime_config.dns;
+        let global_config = runtime_config.global;
         let access_config = runtime_config.access_control;
         let dynamic_whitelist_config = runtime_config.dynamic_whitelist;
         let geoip_config = runtime_config.geoip;
@@ -265,7 +266,8 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
             let effective_access_config =
                 access_config_with_dynamic_whitelist(&access_config, &dynamic_whitelist_ips);
             let resolution_log = ResolutionLog::new();
-            let script = match build_new_script(
+            let script = match build_new_script_with_global(
+                global_config.enabled,
                 &nat_cells,
                 &dns_config,
                 &effective_access_config,
@@ -424,7 +426,8 @@ pub(crate) fn refresh_once(args: &Args) -> Result<(), io::Error> {
         &dynamic_whitelist_ips,
     );
     let resolution_log = ResolutionLog::new();
-    let script = build_new_script(
+    let script = build_new_script_with_global(
+        runtime_config.global.enabled,
         &nat_cells,
         &runtime_config.dns,
         &effective_access_config,
@@ -520,6 +523,7 @@ fn prune_last_good_state_for_runtime_cells(
 }
 
 struct RuntimeConfig {
+    global: nat_common::GlobalConfig,
     dns: DnsConfig,
     ddns: DdnsConfig,
     access_control: nat_common::AccessControlConfig,
@@ -538,6 +542,7 @@ struct RuntimeConfig {
 
 fn default_runtime_config() -> RuntimeConfig {
     RuntimeConfig {
+        global: nat_common::GlobalConfig::default(),
         dns: DnsConfig::default(),
         ddns: DdnsConfig::default(),
         access_control: Default::default(),
@@ -570,6 +575,7 @@ fn load_runtime_config(args: &Args) -> RuntimeConfig {
         Ok(config) => {
             let rule_labels = traffic_stats::rule_labels_from_config(&config);
             RuntimeConfig {
+                global: config.global,
                 dns: config.dns,
                 ddns: config.ddns,
                 access_control: config.access_control,
@@ -877,8 +883,38 @@ use runtime::{
     warn_short_ddns_interval_once,
 };
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_new_script(
+    nat_cells: &[config::RuntimeCell],
+    dns_config: &DnsConfig,
+    access_config: &nat_common::AccessControlConfig,
+    geoip_config: &GeoIpConfig,
+    egress_config: &EgressControlConfig,
+    snat_config: &SnatConfig,
+    mss_clamp_config: &MssClampConfig,
+    last_good_config: &LastGoodConfig,
+    last_good_state: &LastGoodState,
+    resolution_log: &ResolutionLog,
+) -> Result<String, io::Error> {
+    build_new_script_with_global(
+        true,
+        nat_cells,
+        dns_config,
+        access_config,
+        geoip_config,
+        egress_config,
+        snat_config,
+        mss_clamp_config,
+        last_good_config,
+        last_good_state,
+        resolution_log,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_new_script_with_global(
+    global_enabled: bool,
     nat_cells: &[config::RuntimeCell],
     dns_config: &DnsConfig,
     access_config: &nat_common::AccessControlConfig,
@@ -924,14 +960,21 @@ fn build_new_script(
         ",
     );
 
+    if !global_enabled {
+        warn!(
+            "global.enabled=false：跳过本项目所有转发规则生成，仅保留 managed table 基础结构和非转发 SSH 规则"
+        );
+    }
+
     // egress_control 启用但 allowed_target_cidrs 为空：所有转发规则都会被跳过
-    if egress_config.enabled && egress_config.allowed_target_cidrs.is_empty() {
+    if global_enabled && egress_config.enabled && egress_config.allowed_target_cidrs.is_empty() {
         warn!("egress_control 已启用但 allowed_target_cidrs 为空，所有转发目标都会被跳过");
     }
 
     // GeoIP 准备：仅当启用且有任意一个子开关打开
-    let geoip_active =
-        geoip_config.enabled && (geoip_config.forward.enabled || geoip_config.ssh.enabled);
+    let geoip_forward_active = global_enabled && geoip_config.forward.enabled;
+    let geoip_ssh_active = geoip_config.ssh.enabled;
+    let geoip_active = geoip_config.enabled && (geoip_forward_active || geoip_ssh_active);
     let cn4_set_definition = if geoip_active {
         match geoip::read_and_render_cn4_set(&geoip_config.cn4_file) {
             Some(rendered) => Some(rendered),
@@ -950,11 +993,16 @@ fn build_new_script(
     if let Some(set_def) = &cn4_set_definition {
         script.push_str("\n# GeoIP cn4 set\n");
         script.push_str(set_def);
-        script.push_str(&build_geoip_prerouting_chain());
-        // ssh / forward 规则
-        if geoip_config.ssh.enabled {
+        if geoip_forward_active {
+            script.push_str(&build_geoip_prerouting_chain());
+        }
+        if geoip_ssh_active {
             script.push_str(&build_geoip_ssh_rules(geoip_config));
         }
+    }
+
+    if !global_enabled {
+        return Ok(script);
     }
 
     let mut rule_index = 0usize;
@@ -2746,6 +2794,134 @@ refresh_interval_seconds = 123
         assert!(script.contains("add table ip self-filter"));
         assert!(script.contains("add table ip6 self-filter"));
         assert!(!script.contains("flush ruleset"));
+    }
+
+    #[test]
+    fn global_enabled_true_matches_existing_generation() {
+        let cells = single_forward_cell();
+        let legacy = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap();
+        let explicit = build_new_script_with_global(
+            true,
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap();
+        assert_eq!(legacy, explicit);
+        assert!(explicit.contains("dnat to 93.184.216.34:80"));
+    }
+
+    #[test]
+    fn global_disabled_generates_no_forwarding_rules_but_keeps_managed_tables() {
+        let cells = single_forward_cell();
+        let script = build_new_script_with_global(
+            false,
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap();
+        assert!(script.contains("add table ip self-nat"));
+        assert!(script.contains("add table ip6 self-nat"));
+        assert!(script.contains("add table ip self-filter"));
+        assert!(script.contains("add table ip6 self-filter"));
+        assert!(!script.contains("dnat to"));
+        assert!(!script.contains("masquerade"));
+        assert!(!script.contains("snat to"));
+        assert!(!script.contains("nat-traffic"));
+        assert!(!script.contains("mss-clamp"));
+        assert!(!script.contains("GEOIP_PREROUTING"));
+        assert!(!script.contains("flush ruleset"));
+    }
+
+    #[test]
+    fn global_disabled_does_not_mutate_rule_enabled() {
+        let mut cells = single_forward_cell();
+        let script = build_new_script_with_global(
+            false,
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap();
+        assert!(!script.contains("dnat to"));
+        let config::RuntimeCell::Rule(rule) = cells.remove(0) else {
+            panic!("expected rule");
+        };
+        assert!(rule.enabled());
+    }
+
+    #[test]
+    fn global_disabled_keeps_geoip_ssh_rules_but_skips_forward_geoip() {
+        let cn4 = write_temp_cn4_file("global-off-ssh", sample_cn4_content());
+        let cells = single_forward_cell();
+        let geoip = GeoIpConfig {
+            enabled: true,
+            forward: nat_common::GeoIpForwardConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ssh: nat_common::GeoIpSshConfig {
+                enabled: true,
+                port: 2222,
+                ..Default::default()
+            },
+            cn4_file: cn4.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let script = build_new_script_with_global(
+            false,
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &geoip,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap();
+        assert!(script.contains("add set ip self-filter cn4"));
+        assert!(script.contains("geoip-ssh:mode=allow-cn"));
+        assert!(script.contains("tcp dport 2222"));
+        assert!(!script.contains("GEOIP_PREROUTING"));
+        assert!(!script.contains("dnat to"));
+        let _ = fs::remove_dir_all(cn4.parent().unwrap());
     }
 
     fn single_forward_cell() -> Vec<config::RuntimeCell> {

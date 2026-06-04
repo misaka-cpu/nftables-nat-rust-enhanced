@@ -360,6 +360,8 @@ impl<'de> Deserialize<'de> for Protocol {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TomlConfig {
     #[serde(default)]
+    pub global: GlobalConfig,
+    #[serde(default)]
     pub rules: Vec<NftCell>,
     #[serde(default)]
     pub dns: DnsConfig,
@@ -389,6 +391,18 @@ pub struct TomlConfig {
     pub quota: QuotaConfig,
     #[serde(default)]
     pub ui: UiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for GlobalConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2502,6 +2516,23 @@ entries = ["example.com"]
         )
         .unwrap_err();
         assert!(err.contains("access_control entry 只支持 IP/CIDR"));
+    }
+
+    #[test]
+    fn global_defaults_enabled_when_section_missing() {
+        let cfg = TomlConfig::from_toml_str("rules = []").unwrap();
+        assert!(cfg.global.enabled);
+    }
+
+    #[test]
+    fn global_enabled_can_be_disabled() {
+        let cfg = TomlConfig::from_toml_str("rules = []\n\n[global]\nenabled = false\n").unwrap();
+        assert!(!cfg.global.enabled);
+        let roundtrip = cfg.to_toml_string().unwrap();
+        assert!(roundtrip.contains("[global]"));
+        assert!(roundtrip.contains("enabled = false"));
+        let reparsed = TomlConfig::from_toml_str(&roundtrip).unwrap();
+        assert!(!reparsed.global.enabled);
     }
 
     #[test]

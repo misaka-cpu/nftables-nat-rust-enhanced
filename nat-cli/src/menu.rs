@@ -16,6 +16,7 @@ use nat_common::{
     uninstall::{self, DataMode, UninstallTarget},
 };
 use serde_json::json;
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::IpAddr;
@@ -326,6 +327,14 @@ pub(crate) fn render_rules_default_lines(
     last_good_state: &LastGoodState,
 ) -> Vec<String> {
     let mut lines = Vec::new();
+    lines.push(format!(
+        "全局转发：{}",
+        enabled_label(config.global.enabled)
+    ));
+    if !config.global.enabled {
+        lines.push("当前不会生成转发规则。规则配置仍保留。".to_string());
+    }
+    lines.push(String::new());
     if config.rules.is_empty() {
         lines.push("当前没有转发规则".to_string());
     } else {
@@ -479,8 +488,9 @@ fn egress_brief(rule: &NftCell, resolved: Option<&str>, config: &TomlConfig) -> 
     }
 }
 
-/// 单行组合策略摘要：access_control / GeoIP / egress / SNAT / MSS 各自一个键值，便于扫读。
+/// 单行组合策略摘要：global / access_control / GeoIP / egress / SNAT / MSS 各自一个键值，便于扫读。
 pub(crate) fn combined_policy_summary(config: &TomlConfig) -> String {
+    let global = enabled_label(config.global.enabled);
     let ac = match &config.access_control.mode {
         AccessControlMode::Off => "off".to_string(),
         AccessControlMode::Whitelist => {
@@ -527,7 +537,9 @@ pub(crate) fn combined_policy_summary(config: &TomlConfig) -> String {
     } else {
         "off".to_string()
     };
-    format!("组合策略：access_control={ac}, GeoIP={geoip}, egress={egress}, SNAT={snat}, MSS={mss}")
+    format!(
+        "组合策略：global={global}, access_control={ac}, GeoIP={geoip}, egress={egress}, SNAT={snat}, MSS={mss}"
+    )
 }
 
 /// 单行 last-good 摘要：enabled / 缓存条数 / 最近成功时间。完整每条规则缓存通过 l 入口查看。
@@ -1006,7 +1018,9 @@ pub(crate) fn reason_affects_nft(reason: &str) -> bool {
             | "rule.add.range"
             | "rule.delete"
             | "rule.toggle"
+            | "global.enabled.update"
             | "access_control.update"
+            | "access_control.ssh_source.add"
             | "dynamic_whitelist.domain.add"
             | "dynamic_whitelist.domain.delete"
             | "dynamic_whitelist.domain.toggle"
@@ -1616,8 +1630,9 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
 7) 清空 entries
 8) 动态 DDNS 来源白名单
 9) 查询来源 IP 命中情况
-10) 查看来源策略详情
-11) 保存并应用
+10) 检测当前 SSH 来源 IP
+11) 查看来源策略详情
+12) 保存并应用
 0) 返回主菜单
 ===================================="#
         );
@@ -1692,12 +1707,17 @@ fn access_control_menu(path: &str) -> Result<(), io::Error> {
                 wait_enter_to_return()?;
             }
             "10" => {
+                detect_ssh_source_interactive(path)?;
+                config = load_toml_config(path)?;
+                wait_enter_to_return()?;
+            }
+            "11" => {
                 for line in format_source_policy_detail_lines(&config) {
                     println!("{line}");
                 }
                 wait_enter_to_return()?;
             }
-            "11" => {
+            "12" => {
                 config
                     .access_control
                     .validate()
@@ -1756,7 +1776,8 @@ pub(crate) fn format_access_control_brief_lines_with_state(
     } else {
         "disabled"
     };
-    vec![
+    let global_label = enabled_label(config.global.enabled);
+    let mut lines = vec![
         "来源访问控制：".to_string(),
         format!("  mode: {}", config.access_control.mode),
         format!("  静态 entries: {}", config.access_control.entries.len()),
@@ -1775,6 +1796,7 @@ pub(crate) fn format_access_control_brief_lines_with_state(
         ),
         format!("  GeoIP forward: {geoip_label}"),
         format!("  SSH GeoIP: {ssh_geoip_label}"),
+        format!("  global forwarding: {global_label}"),
         String::new(),
         "最终来源判断：".to_string(),
         "  黑名单优先拒绝".to_string(),
@@ -1784,7 +1806,26 @@ pub(crate) fn format_access_control_brief_lines_with_state(
         "提示：".to_string(),
         "  dynamic_whitelist 只有在 access_control.mode = whitelist 时才参与放行。".to_string(),
         "  egress_control 是目标 IP 限制，不在此处管理。".to_string(),
-    ]
+        "  global.enabled=false 时，所有转发规则都会临时停用。".to_string(),
+    ];
+    if !config.global.enabled {
+        lines.push("  警告：global forwarding 当前为 disabled，所有转发规则临时停用。".to_string());
+    }
+    if config.access_control.mode == AccessControlMode::Whitelist
+        && config.access_control.entries.is_empty()
+        && current_ips.is_empty()
+    {
+        lines.push(
+            "  warning: whitelist 模式下静态 entries=0 且 dynamic current_ips=0，可能拒绝所有来源。"
+                .to_string(),
+        );
+    }
+    if config.dynamic_whitelist.enabled
+        && config.access_control.mode != AccessControlMode::Whitelist
+    {
+        lines.push("  提示：动态白名单只解析和显示状态，不参与放行。".to_string());
+    }
+    lines
 }
 
 fn query_source_ip_match_interactive(config: &TomlConfig) -> Result<(), io::Error> {
@@ -2280,6 +2321,190 @@ pub(crate) fn add_access_entry(config: &mut TomlConfig, entry: String) {
     if !config.access_control.entries.contains(&entry) {
         config.access_control.entries.push(entry);
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshSourceDetection {
+    pub ip: IpAddr,
+    pub detected_from: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SshSourceAddOutcome {
+    Added { cidr: String },
+    AlreadyExists { cidr: String },
+    RefusedBlacklist,
+}
+
+fn detect_ssh_source_interactive(config_path: &str) -> Result<(), io::Error> {
+    let Some(detection) = detect_current_ssh_source() else {
+        println!("未检测到 SSH 来源 IP。");
+        println!("可能是本地控制台、非 SSH 会话、sudo 未保留环境变量，或通过跳板进入。");
+        println!("你仍可以手动添加 IP/CIDR。");
+        return Ok(());
+    };
+    println!("当前 SSH 来源 IP：{}", detection.ip);
+    let mut config = load_toml_config(config_path)?;
+    match config.access_control.mode {
+        AccessControlMode::Blacklist => {
+            println!(
+                "当前 access_control.mode=blacklist，此入口不会添加 SSH 来源 IP，避免误封自己。"
+            );
+            println!("如需切换为 whitelist，请先调整模式。");
+            return Ok(());
+        }
+        AccessControlMode::Off => {
+            println!(
+                "当前 access_control.mode=off，添加后暂不生效；切换到 whitelist 后才会作为来源白名单使用。"
+            );
+        }
+        AccessControlMode::Whitelist => {
+            println!("当前 access_control.mode=whitelist，添加后会作为静态白名单生效。");
+        }
+    }
+
+    let Some(cidr) = choose_ssh_source_cidr_interactive(detection.ip)? else {
+        println!("已取消，不修改配置。");
+        return Ok(());
+    };
+    if !confirm(&format!("确认将 {cidr} 加入静态白名单 entries？[y/N]: "))? {
+        println!("已取消，不修改配置。");
+        return Ok(());
+    }
+    match add_ssh_source_entry_to_config(&mut config, &cidr)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+    {
+        SshSourceAddOutcome::Added { cidr } => {
+            save_toml_config(config_path, &config, "access_control.ssh_source.add")?;
+            audit_ssh_source_add(&audit_config_from(config_path), &detection, &cidr);
+            println!("已加入静态 entries：{cidr}");
+            println!("不会自动启用 whitelist，请按需手动切换 access_control.mode。");
+            print_config_saved_hint(config_path, "access_control.ssh_source.add");
+        }
+        SshSourceAddOutcome::AlreadyExists { cidr } => {
+            println!("该 IP/CIDR 已存在，不重复添加：{cidr}");
+        }
+        SshSourceAddOutcome::RefusedBlacklist => {
+            println!("当前 access_control.mode=blacklist，此入口不会添加 SSH 来源 IP。");
+        }
+    }
+    Ok(())
+}
+
+fn choose_ssh_source_cidr_interactive(ip: IpAddr) -> Result<Option<String>, io::Error> {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            let exact = ssh_source_exact_cidr(ip);
+            let broad = ssh_source_ipv4_24_cidr(ipv4);
+            println!("建议添加范围：");
+            println!("  1) /32 精确 IP ({exact})");
+            println!("  2) /24 网段 ({broad})");
+            println!("  0) 取消");
+            let choice = prompt("请选择 [1/2/0，默认 1]: ")?;
+            match choice.trim() {
+                "" | "1" => Ok(Some(exact)),
+                "2" => {
+                    println!("/24 会扩大来源范围，仅在移动网络或运营商出口频繁变化时使用。");
+                    Ok(Some(broad))
+                }
+                "0" => Ok(None),
+                other => {
+                    println!("未知选项: {other}");
+                    Ok(None)
+                }
+            }
+        }
+        IpAddr::V6(_) => {
+            let exact = ssh_source_exact_cidr(ip);
+            println!("建议添加范围：");
+            println!("  1) /128 精确地址 ({exact})");
+            println!("  0) 取消");
+            println!("IPv6 不提供 /64 自动扩展；如需更大范围请手动添加并自行评估风险。");
+            let choice = prompt("请选择 [1/0，默认 1]: ")?;
+            match choice.trim() {
+                "" | "1" => Ok(Some(exact)),
+                "0" => Ok(None),
+                other => {
+                    println!("未知选项: {other}");
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn detect_current_ssh_source() -> Option<SshSourceDetection> {
+    detect_ssh_source_from_env_vars(|name| env::var(name).ok())
+}
+
+pub(crate) fn detect_ssh_source_from_env_vars<F>(mut get_env: F) -> Option<SshSourceDetection>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    for name in ["SSH_CONNECTION", "SSH_CLIENT"] {
+        if let Some(value) = get_env(name)
+            && let Some(ip) = parse_ssh_source_ip(&value)
+        {
+            return Some(SshSourceDetection {
+                ip,
+                detected_from: name,
+            });
+        }
+    }
+    None
+}
+
+fn parse_ssh_source_ip(value: &str) -> Option<IpAddr> {
+    value.split_whitespace().next()?.parse().ok()
+}
+
+fn ssh_source_ipv4_24_cidr(ip: std::net::Ipv4Addr) -> String {
+    let octets = ip.octets();
+    format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2])
+}
+
+fn ssh_source_exact_cidr(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ipv4) => format!("{ipv4}/32"),
+        IpAddr::V6(ipv6) => format!("{ipv6}/128"),
+    }
+}
+
+pub(crate) fn add_ssh_source_entry_to_config(
+    config: &mut TomlConfig,
+    cidr: &str,
+) -> Result<SshSourceAddOutcome, String> {
+    if config.access_control.mode == AccessControlMode::Blacklist {
+        return Ok(SshSourceAddOutcome::RefusedBlacklist);
+    }
+    validate_access_entry(cidr).map_err(|e| e.to_string())?;
+    if config
+        .access_control
+        .entries
+        .iter()
+        .any(|entry| entry == cidr)
+    {
+        return Ok(SshSourceAddOutcome::AlreadyExists {
+            cidr: cidr.to_string(),
+        });
+    }
+    config.access_control.entries.push(cidr.to_string());
+    Ok(SshSourceAddOutcome::Added {
+        cidr: cidr.to_string(),
+    })
+}
+
+fn audit_ssh_source_add(audit_cfg: &AuditConfig, detection: &SshSourceDetection, cidr: &str) {
+    audit::log_event(
+        audit_cfg,
+        "access_control.ssh_source.add",
+        AuditResult::Ok,
+        json!({
+            "ip": detection.ip.to_string(),
+            "cidr": cidr,
+            "detected_from": detection.detected_from,
+        }),
+    );
 }
 
 pub(crate) fn delete_access_entry(config: &mut TomlConfig, index: usize) -> Result<String, String> {
@@ -3130,6 +3355,13 @@ pub(crate) fn format_combined_policy_status(config: &TomlConfig) -> Vec<String> 
     lines.push("------------------------------------".to_string());
     lines.push("组合策略 (access_control + GeoIP + egress + SNAT + MSS)".to_string());
     lines.push("------------------------------------".to_string());
+    lines.push(format!(
+        "global forwarding（全局转发开关）：{}",
+        enabled_label(config.global.enabled)
+    ));
+    if !config.global.enabled {
+        lines.push("当前不会生成转发规则。规则配置仍保留。".to_string());
+    }
     lines.push(format!(
         "access_control（自定义来源 IP 限制）：模式={ac_mode} entries={ac_count}"
     ));
@@ -4279,6 +4511,7 @@ fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
 5) 设置 MSS clamp size
 6) 时间 / NTP 状态检查
 7) 查看全局诊断状态
+8) 全局转发开关
 0) 返回主菜单
 ===================================="#
         );
@@ -4314,6 +4547,9 @@ fn advanced_network_menu(config_path: &str) -> Result<(), io::Error> {
                     println!("{line}");
                 }
                 wait_enter_to_return()?;
+            }
+            "8" => {
+                global_forwarding_menu(config_path)?;
             }
             "0" => break,
             value if is_menu_refresh_command(value) => break,
@@ -4571,10 +4807,99 @@ fn print_advanced_network_status(config: &TomlConfig) {
     println!("fixed_source_ip：{ip}");
     println!("MSS clamp：{}", enabled_label(mss.enabled));
     println!("MSS size：{}", mss.size);
+    println!("全局转发：{}", enabled_label(config.global.enabled));
+    if !config.global.enabled {
+        println!("当前不会生成转发规则。规则配置仍保留。");
+    }
     println!();
     for line in format_combined_policy_status(config) {
         println!("{line}");
     }
+}
+
+fn global_forwarding_menu(config_path: &str) -> Result<(), io::Error> {
+    loop {
+        let config = load_toml_config(config_path)?;
+        println!("====================================");
+        println!("全局转发开关");
+        println!("====================================");
+        println!("当前状态：{}", enabled_label(config.global.enabled));
+        println!("规则数量：{}", config.rules.len());
+        println!("提示：关闭后不会删除配置，只是不生成/应用转发规则。");
+        println!("提示：只影响本项目管理的转发规则，不影响 SSH 和系统其他 nft 规则。");
+        println!(
+            r#"1) 开启全局转发
+2) 关闭全局转发
+0) 返回
+===================================="#
+        );
+        let choice = prompt("请选择操作: ")?;
+        match choice.trim() {
+            "1" => {
+                update_global_forwarding_interactive(config_path, true)?;
+                wait_enter_to_return()?;
+            }
+            "2" => {
+                update_global_forwarding_interactive(config_path, false)?;
+                wait_enter_to_return()?;
+            }
+            "0" => break,
+            value if is_menu_refresh_command(value) => break,
+            "" => continue,
+            _ => {
+                println!("未知选项: {}", choice.trim());
+                wait_enter_to_return()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_global_forwarding_interactive(
+    config_path: &str,
+    new_enabled: bool,
+) -> Result<(), io::Error> {
+    let mut config = load_toml_config(config_path)?;
+    let old_enabled = config.global.enabled;
+    if old_enabled == new_enabled {
+        println!(
+            "全局转发当前已是 {}。",
+            enabled_label(config.global.enabled)
+        );
+        return Ok(());
+    }
+    if new_enabled {
+        println!("将恢复根据当前配置生成并应用转发规则。");
+        if !confirm("是否继续？[y/N]: ")? {
+            println!("已取消。");
+            return Ok(());
+        }
+    } else {
+        println!("你即将关闭本项目管理的所有转发规则。");
+        println!("规则配置会保留，但入口端口将不再转发。");
+        if !confirm("是否继续？[y/N]: ")? {
+            println!("已取消。");
+            return Ok(());
+        }
+    }
+    config.global.enabled = new_enabled;
+    save_toml_config(config_path, &config, "global.enabled.update")?;
+    audit_global_enabled_update(&audit_config_from(config_path), old_enabled, new_enabled);
+    println!("全局转发已更新为 {}。", enabled_label(new_enabled));
+    print_config_saved_hint(config_path, "global.enabled.update");
+    Ok(())
+}
+
+fn audit_global_enabled_update(audit_cfg: &AuditConfig, old_enabled: bool, new_enabled: bool) {
+    audit::log_event(
+        audit_cfg,
+        "global.enabled.update",
+        AuditResult::Ok,
+        json!({
+            "old_enabled": old_enabled,
+            "new_enabled": new_enabled,
+        }),
+    );
 }
 
 fn set_snat_mode_interactive(config_path: &str) -> Result<(), io::Error> {
@@ -4799,7 +5124,7 @@ impl NatServiceStatus {
             NatServiceStatus::Inactive => "inactive",
             NatServiceStatus::Failed => "failed",
             NatServiceStatus::Unknown => "unknown",
-            NatServiceStatus::NotChecked => "未检查（规则未启用）",
+            NatServiceStatus::NotChecked => "未检查",
         }
     }
 
@@ -4822,7 +5147,7 @@ impl LastApplyState {
             LastApplyState::Success => "success",
             LastApplyState::Fail => "fail",
             LastApplyState::Unknown => "unknown",
-            LastApplyState::NotChecked => "未检查（规则未启用）",
+            LastApplyState::NotChecked => "未检查",
         }
     }
 }
@@ -4871,6 +5196,7 @@ pub(crate) enum NftConnectivityStatus {
     Unconfirmed {
         reason: String,
     },
+    SkippedGlobalDisabled,
     SkippedDisabled,
 }
 
@@ -4885,6 +5211,7 @@ pub(crate) struct RuleResolutionDisplay {
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectivityReport<'a> {
     pub rule: &'a forward_test::TestableRule,
+    pub global_enabled: bool,
     pub rule_enabled: bool,
     pub resolution: RuleResolutionDisplay,
     pub nat_service: NatServiceStatus,
@@ -4934,7 +5261,15 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
         .unwrap_or(false);
     let last_good_state = LastGoodState::load(&config.last_good.file);
     let resolution = build_rule_resolution_display(&config, rule, &last_good_state);
-    let (nat_service, last_apply, nft, target_tcp) = if rule_enabled {
+    let global_enabled = config.global.enabled;
+    let (nat_service, last_apply, nft, target_tcp) = if !global_enabled {
+        (
+            NatServiceStatus::NotChecked,
+            LastApplyDisplay::not_checked(),
+            NftConnectivityStatus::SkippedGlobalDisabled,
+            None,
+        )
+    } else if rule_enabled {
         let nat_service = read_nat_service_status();
         let last_apply = read_last_apply_display(&config);
         let nft = read_nft_connectivity_status(
@@ -4954,6 +5289,7 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
     };
     let report = ConnectivityReport {
         rule,
+        global_enabled,
         rule_enabled,
         resolution,
         nat_service,
@@ -5167,6 +5503,10 @@ pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) 
 
     lines.push("1. 配置状态".to_string());
     lines.push(format!(
+        "- 全局转发：{}",
+        enabled_label(report.global_enabled)
+    ));
+    lines.push(format!(
         "- 规则：{}",
         if report.rule_enabled {
             "enabled"
@@ -5196,6 +5536,9 @@ pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) 
     }
     if !report.rule_enabled {
         lines.push("- 提示：规则未启用，不会生成 nft。".to_string());
+    }
+    if !report.global_enabled {
+        lines.push("- 提示：全局转发已关闭，该规则当前不会生效。".to_string());
     }
     if let Some(note) = &report.access_control_note {
         lines.push(format!("- access_control：{note}"));
@@ -5254,6 +5597,11 @@ pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) 
             lines.push("- 检测结论：未确认".to_string());
             lines.push(format!("- 说明：{reason}"));
         }
+        NftConnectivityStatus::SkippedGlobalDisabled => {
+            lines.push("- self-nat：未检查".to_string());
+            lines.push("- self-filter：未检查".to_string());
+            lines.push("- 检测结论：全局转发已关闭，该规则当前不会生效".to_string());
+        }
         NftConnectivityStatus::SkippedDisabled => {
             lines.push("- self-nat：未找到".to_string());
             lines.push("- self-filter：未找到".to_string());
@@ -5271,7 +5619,7 @@ pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) 
     lines.push(String::new());
 
     lines.push("5. 外部访问测试".to_string());
-    if report.rule_enabled {
+    if report.global_enabled && report.rule_enabled {
         lines.push(format!(
             "- 请在另一台机器访问 SERVER_IP:{}",
             report.rule.sport
@@ -5281,6 +5629,8 @@ pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) 
             report.rule.sport
         ));
         lines.push("- 输入 h 查看详细 curl / nc 示例，按 Enter 返回。".to_string());
+    } else if !report.global_enabled {
+        lines.push("- 全局转发已关闭，外部访问不会命中本项目转发规则。".to_string());
     } else {
         lines.push("- 规则未启用，外部访问不会命中本项目 nft 规则。".to_string());
     }
@@ -5289,6 +5639,7 @@ pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) 
     lines.push("6. 结论".to_string());
     lines.extend(connectivity_conclusion_lines(
         report.rule,
+        report.global_enabled,
         report.rule_enabled,
         report.nat_service,
         report.last_apply.state,
@@ -5318,6 +5669,7 @@ fn target_udp_label(rule: &forward_test::TestableRule) -> &'static str {
 
 pub(crate) fn connectivity_conclusion_lines(
     rule: &forward_test::TestableRule,
+    global_enabled: bool,
     rule_enabled: bool,
     nat_service: NatServiceStatus,
     last_apply: LastApplyState,
@@ -5325,6 +5677,10 @@ pub(crate) fn connectivity_conclusion_lines(
     target_tcp: Option<bool>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
+    if !global_enabled {
+        lines.push("- ⚠️ 全局转发已关闭，该规则当前不会生效。".to_string());
+        return lines;
+    }
     if !rule_enabled {
         lines.push("- ⚠️ 规则未启用，不会生成 nft。".to_string());
         return lines;
@@ -5386,6 +5742,9 @@ pub(crate) fn connectivity_conclusion_lines(
         },
         NftConnectivityStatus::Unconfirmed { .. } => {
             lines.push("- ⚠️ 规则已保存，但 nft 检测器尚未确认应用。".to_string());
+        }
+        NftConnectivityStatus::SkippedGlobalDisabled => {
+            lines.push("- ⚠️ 全局转发已关闭，该规则当前不会生效。".to_string());
         }
         NftConnectivityStatus::SkippedDisabled => {
             lines.push("- ⚠️ 规则未启用，不会生成 nft。".to_string());
@@ -6015,6 +6374,7 @@ mod tests {
     #[test]
     fn adds_single_rule_to_toml_config() {
         let mut config = TomlConfig {
+            global: Default::default(),
             rules: Vec::new(),
             dns: Default::default(),
             ddns: Default::default(),
@@ -6048,6 +6408,7 @@ mod tests {
     #[test]
     fn adds_range_rule_to_toml_config() {
         let mut config = TomlConfig {
+            global: Default::default(),
             rules: Vec::new(),
             dns: Default::default(),
             ddns: Default::default(),
@@ -7688,6 +8049,7 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
     ) -> ConnectivityReport<'a> {
         ConnectivityReport {
             rule,
+            global_enabled: true,
             rule_enabled,
             resolution: sample_resolution_display(),
             nat_service,
@@ -7728,6 +8090,26 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             !conclusion.contains("⚠️"),
             "正常结论不应把外部机器测试建议展示为 warning: {conclusion}"
         );
+    }
+
+    #[test]
+    fn connectivity_report_global_disabled_warns_and_skips_nft_judgement() {
+        let rule = sample_testable_rule("93.184.216.34", "tcp");
+        let mut report = sample_connectivity_report(
+            &rule,
+            true,
+            NatServiceStatus::NotChecked,
+            NftConnectivityStatus::SkippedGlobalDisabled,
+            None,
+        );
+        report.global_enabled = false;
+        report.last_apply = LastApplyDisplay::not_checked();
+        let lines = render_connectivity_report_lines(&report).join("\n");
+        assert!(lines.contains("- 全局转发：disabled"));
+        assert!(lines.contains("全局转发已关闭，该规则当前不会生效"));
+        assert!(!lines.contains("检测结论：已应用"));
+        let conclusion = conclusion_text(&lines);
+        assert!(conclusion.contains("⚠️ 全局转发已关闭"));
     }
 
     #[test]
@@ -8156,7 +8538,11 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
         let resolutions = vec![Some("93.184.216.34".to_string())];
         let lines = render_rules_default_lines(&cfg, &resolutions, &stats, &last_good).join("\n");
         assert!(
-            lines.contains("组合策略：access_control=off"),
+            lines.contains("全局转发：enabled"),
+            "默认页面应显示全局转发状态:\n{lines}"
+        );
+        assert!(
+            lines.contains("组合策略：global=enabled, access_control=off"),
             "默认页面应显示组合策略摘要:\n{lines}"
         );
         assert!(
@@ -8167,6 +8553,18 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             lines.contains("last-good：") && lines.contains("缓存 0 条"),
             "默认页面应显示 last-good 摘要:\n{lines}"
         );
+    }
+
+    #[test]
+    fn show_rules_default_warns_when_global_disabled() {
+        let mut cfg = sample_single_rule_config("93.184.216.34");
+        cfg.global.enabled = false;
+        let stats = StatsState::default();
+        let last_good = LastGoodState::default();
+        let resolutions = vec![Some("93.184.216.34".to_string())];
+        let lines = render_rules_default_lines(&cfg, &resolutions, &stats, &last_good).join("\n");
+        assert!(lines.contains("全局转发：disabled"));
+        assert!(lines.contains("当前不会生成转发规则。规则配置仍保留。"));
     }
 
     #[test]
@@ -8423,6 +8821,10 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             src.contains("7) 查看全局诊断状态"),
             "高级网络菜单应有「查看全局诊断状态」单一入口"
         );
+        assert!(
+            src.contains("8) 全局转发开关"),
+            "高级网络菜单应暴露「全局转发开关」入口"
+        );
         // 旧的并列项：编号 7 不应再绑到「组合策略详情」、编号 8 不应再绑到「last-good 状态缓存」
         assert!(
             !src.contains("7) 查看组合策略详情"),
@@ -8486,7 +8888,7 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
         let resolutions = vec![Some("93.184.216.34".to_string())];
         let lines = render_rules_default_lines(&cfg, &resolutions, &stats, &last_good).join("\n");
         assert!(lines.contains("0) [启用] type=single"));
-        assert!(lines.contains("组合策略：access_control="));
+        assert!(lines.contains("组合策略：global=enabled, access_control="));
         assert!(lines.contains("last-good：") && lines.contains("缓存 0 条"));
     }
 
@@ -8893,6 +9295,178 @@ HTTP/2 200
     }
 
     #[test]
+    fn ssh_connection_parses_ipv4_source() {
+        let detected = detect_ssh_source_from_env_vars(|name| match name {
+            "SSH_CONNECTION" => Some("198.51.100.7 54321 203.0.113.10 22".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(detected.ip.to_string(), "198.51.100.7");
+        assert_eq!(detected.detected_from, "SSH_CONNECTION");
+    }
+
+    #[test]
+    fn ssh_client_parses_ipv4_source() {
+        let detected = detect_ssh_source_from_env_vars(|name| match name {
+            "SSH_CLIENT" => Some("198.51.100.8 54321 22".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(detected.ip.to_string(), "198.51.100.8");
+        assert_eq!(detected.detected_from, "SSH_CLIENT");
+    }
+
+    #[test]
+    fn ssh_connection_takes_priority_over_ssh_client() {
+        let detected = detect_ssh_source_from_env_vars(|name| match name {
+            "SSH_CONNECTION" => Some("198.51.100.9 54321 203.0.113.10 22".to_string()),
+            "SSH_CLIENT" => Some("198.51.100.10 54321 22".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(detected.ip.to_string(), "198.51.100.9");
+        assert_eq!(detected.detected_from, "SSH_CONNECTION");
+    }
+
+    #[test]
+    fn ssh_source_detection_returns_none_without_env() {
+        assert!(detect_ssh_source_from_env_vars(|_| None).is_none());
+    }
+
+    #[test]
+    fn ssh_source_cidr_candidates_cover_ipv4_32_ipv4_24_and_ipv6_128() {
+        let ipv4: IpAddr = "198.51.100.7".parse().unwrap();
+        let ipv6: IpAddr = "2001:db8::7".parse().unwrap();
+        assert_eq!(ssh_source_exact_cidr(ipv4), "198.51.100.7/32");
+        assert_eq!(
+            ssh_source_ipv4_24_cidr("198.51.100.7".parse().unwrap()),
+            "198.51.100.0/24"
+        );
+        assert_eq!(ssh_source_exact_cidr(ipv6), "2001:db8::7/128");
+    }
+
+    #[test]
+    fn ssh_source_add_refuses_blacklist_mode() {
+        let mut cfg =
+            brief_layout_config(AccessControlMode::Blacklist, &[], false, false, false, &[]);
+        let result = add_ssh_source_entry_to_config(&mut cfg, "198.51.100.7/32").unwrap();
+        assert_eq!(result, SshSourceAddOutcome::RefusedBlacklist);
+        assert!(cfg.access_control.entries.is_empty());
+    }
+
+    #[test]
+    fn ssh_source_add_allows_off_mode_without_enabling_whitelist() {
+        let mut cfg = brief_layout_config(AccessControlMode::Off, &[], false, false, false, &[]);
+        let result = add_ssh_source_entry_to_config(&mut cfg, "198.51.100.7/32").unwrap();
+        assert_eq!(
+            result,
+            SshSourceAddOutcome::Added {
+                cidr: "198.51.100.7/32".to_string()
+            }
+        );
+        assert_eq!(cfg.access_control.mode, AccessControlMode::Off);
+        assert_eq!(cfg.access_control.entries, vec!["198.51.100.7/32"]);
+    }
+
+    #[test]
+    fn ssh_source_add_allows_whitelist_mode() {
+        let mut cfg =
+            brief_layout_config(AccessControlMode::Whitelist, &[], false, false, false, &[]);
+        let result = add_ssh_source_entry_to_config(&mut cfg, "198.51.100.7/32").unwrap();
+        assert!(matches!(result, SshSourceAddOutcome::Added { .. }));
+        assert_eq!(cfg.access_control.mode, AccessControlMode::Whitelist);
+        assert_eq!(cfg.access_control.entries, vec!["198.51.100.7/32"]);
+    }
+
+    #[test]
+    fn ssh_source_add_deduplicates_existing_entry() {
+        let mut cfg = brief_layout_config(
+            AccessControlMode::Whitelist,
+            &["198.51.100.7/32"],
+            false,
+            false,
+            false,
+            &[],
+        );
+        let result = add_ssh_source_entry_to_config(&mut cfg, "198.51.100.7/32").unwrap();
+        assert_eq!(
+            result,
+            SshSourceAddOutcome::AlreadyExists {
+                cidr: "198.51.100.7/32".to_string()
+            }
+        );
+        assert_eq!(cfg.access_control.entries, vec!["198.51.100.7/32"]);
+    }
+
+    #[test]
+    fn ssh_source_add_accepts_ipv4_24_and_ipv6_128() {
+        let mut cfg = brief_layout_config(AccessControlMode::Off, &[], false, false, false, &[]);
+        assert!(matches!(
+            add_ssh_source_entry_to_config(&mut cfg, "198.51.100.0/24").unwrap(),
+            SshSourceAddOutcome::Added { .. }
+        ));
+        assert!(matches!(
+            add_ssh_source_entry_to_config(&mut cfg, "2001:db8::7/128").unwrap(),
+            SshSourceAddOutcome::Added { .. }
+        ));
+        assert_eq!(
+            cfg.access_control.entries,
+            vec!["198.51.100.0/24", "2001:db8::7/128"]
+        );
+    }
+
+    #[test]
+    fn ssh_source_add_reason_is_nft_affecting_and_audit_has_expected_detail() {
+        assert!(reason_affects_nft("access_control.ssh_source.add"));
+        let dir = std::env::temp_dir().join(format!(
+            "nat-ssh-source-audit-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_file = dir.join("audit.log");
+        let audit_cfg = AuditConfig {
+            enabled: true,
+            file: audit_file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let detection = SshSourceDetection {
+            ip: "198.51.100.7".parse().unwrap(),
+            detected_from: "SSH_CONNECTION",
+        };
+        audit_ssh_source_add(&audit_cfg, &detection, "198.51.100.7/32");
+        let raw = std::fs::read_to_string(&audit_file).unwrap();
+        assert!(raw.contains("\"action\":\"access_control.ssh_source.add\""));
+        assert!(raw.contains("\"result\":\"ok\""));
+        assert!(raw.contains("\"ip\":\"198.51.100.7\""));
+        assert!(raw.contains("\"cidr\":\"198.51.100.7/32\""));
+        assert!(raw.contains("\"detected_from\":\"SSH_CONNECTION\""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn global_enabled_update_reason_is_nft_affecting_and_audit_has_expected_detail() {
+        assert!(reason_affects_nft("global.enabled.update"));
+        let dir = std::env::temp_dir().join(format!(
+            "nat-global-audit-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_file = dir.join("audit.log");
+        let audit_cfg = AuditConfig {
+            enabled: true,
+            file: audit_file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        audit_global_enabled_update(&audit_cfg, true, false);
+        let raw = std::fs::read_to_string(&audit_file).unwrap();
+        assert!(raw.contains("\"action\":\"global.enabled.update\""));
+        assert!(raw.contains("\"result\":\"ok\""));
+        assert!(raw.contains("\"old_enabled\":true"));
+        assert!(raw.contains("\"new_enabled\":false"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn access_control_brief_lines_show_summary_not_long_combined_policy() {
         let cfg = brief_layout_config(AccessControlMode::Off, &[], false, false, false, &[]);
         let state = DynamicWhitelistState::default();
@@ -8904,6 +9478,7 @@ HTTP/2 200
         assert!(lines.contains("cidr_expand_ipv4: false"));
         assert!(lines.contains("GeoIP forward: disabled"));
         assert!(lines.contains("SSH GeoIP: disabled"));
+        assert!(lines.contains("global forwarding: enabled"));
         assert!(lines.contains("最终来源判断："));
         assert!(lines.contains("whitelist 模式：静态 entries OR dynamic_whitelist"));
         // 简洁页面不应包含 SNAT / MSS / egress / 完整组合策略标题块
@@ -8967,10 +9542,45 @@ HTTP/2 200
         assert!(lines.contains("dynamic_whitelist: enabled, domains=1, current_ips=1, stale=1"));
         assert!(lines.contains("GeoIP forward: enabled"));
         assert!(lines.contains("SSH GeoIP: enabled"));
+        assert!(lines.contains("global forwarding: enabled"));
     }
 
     #[test]
-    fn access_control_menu_lists_detail_entry_and_save_apply_renumbered() {
+    fn access_control_brief_lines_warn_when_global_disabled() {
+        let mut cfg = brief_layout_config(AccessControlMode::Off, &[], false, false, false, &[]);
+        cfg.global.enabled = false;
+        let state = DynamicWhitelistState::default();
+        let lines = format_access_control_brief_lines_with_state(&cfg, &state).join("\n");
+        assert!(lines.contains("global forwarding: disabled"));
+        assert!(lines.contains("global forwarding 当前为 disabled"));
+        assert!(lines.contains("所有转发规则都会临时停用"));
+    }
+
+    #[test]
+    fn access_control_brief_lines_warn_when_whitelist_has_no_sources() {
+        let cfg = brief_layout_config(AccessControlMode::Whitelist, &[], false, false, false, &[]);
+        let state = DynamicWhitelistState::default();
+        let lines = format_access_control_brief_lines_with_state(&cfg, &state).join("\n");
+        assert!(lines.contains("warning: whitelist 模式下静态 entries=0"));
+    }
+
+    #[test]
+    fn access_control_brief_lines_note_dynamic_whitelist_inactive_outside_whitelist_mode() {
+        let cfg = brief_layout_config(
+            AccessControlMode::Off,
+            &[],
+            false,
+            false,
+            true,
+            &[("home", "home.example.com", true)],
+        );
+        let state = DynamicWhitelistState::default();
+        let lines = format_access_control_brief_lines_with_state(&cfg, &state).join("\n");
+        assert!(lines.contains("动态白名单只解析和显示状态，不参与放行"));
+    }
+
+    #[test]
+    fn access_control_menu_lists_ssh_detection_detail_entry_and_save_apply_renumbered() {
         let src = menu_src_non_test();
         assert!(
             src.contains("8) 动态 DDNS 来源白名单"),
@@ -8981,10 +9591,14 @@ HTTP/2 200
             "白名单 / 黑名单管理应新增「查询来源 IP 命中情况」入口"
         );
         assert!(
-            src.contains("10) 查看来源策略详情"),
-            "查看来源策略详情应顺延为 10)"
+            src.contains("10) 检测当前 SSH 来源 IP"),
+            "白名单 / 黑名单管理应新增「检测当前 SSH 来源 IP」入口"
         );
-        assert!(src.contains("11) 保存并应用"), "保存并应用顺延为 11)");
+        assert!(
+            src.contains("11) 查看来源策略详情"),
+            "查看来源策略详情应顺延为 11)"
+        );
+        assert!(src.contains("12) 保存并应用"), "保存并应用顺延为 12)");
         // 旧的 9) 保存并应用编号不应再出现在白名单/黑名单菜单文本块
         assert!(
             !src.contains("9) 保存并应用"),

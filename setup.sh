@@ -313,6 +313,9 @@ else
 # https://github.com/misaka-cpu/nftables-nat-rust-enhanced#toml-配置示例
 rules = []
 
+[global]
+enabled = true
+
 [stats]
 enabled = true
 collect_interval_seconds = 60
@@ -327,6 +330,9 @@ EOF
     # 生成示例配置文件
     cat > "$EXAMPLE_FILE" <<EOF
 # 单端口转发示例
+[global]
+enabled = true
+
 [[rules]]
 type = "single"
 sport = 10000          # 本机端口

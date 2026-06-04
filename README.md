@@ -8,16 +8,16 @@
 - 只管理本项目的 `self-nat` / `self-filter` 表，不 `flush ruleset`
 - 应用前执行 `nft -c`，失败自动回滚
 - 支持单端口 / 端口段 / IPv4 / IPv6 / TCP / UDP / all
-- 支持 Stats、quota、audit log、Telegram、last-good、dynamic_whitelist
+- 支持全局转发开关、Stats、quota、audit log、Telegram、last-good、dynamic_whitelist
 
-当前稳定版本：**v0.8.5**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
+当前稳定版本：**v0.8.6**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
 
 ## 快速安装
 
 推荐安装并进入 CLI 菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.5 --enter-menu
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.6 --enter-menu
 ```
 
 安装完成后会安装 `/usr/local/bin/nat` 与 `nat.service`，保留或创建 `/etc/nat.toml`，并启动服务。
@@ -37,13 +37,13 @@ systemctl status nat --no-pager -l
 安装但不自动进入菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.5
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.6
 ```
 
 更新到指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.5
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.6
 ```
 
 推荐系统：Debian 11 / 12、Ubuntu 20.04 / 22.04 / 24.04。轻量安装依赖：
@@ -64,10 +64,10 @@ tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nfta
 
 ### 1. 使用自建 mirror
 
-mirror 需要按 `MIRROR_BASE/VERSION/ASSET` 存放 release asset，例如 `https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.5/nftables-nat-rust-enhanced-linux-amd64.tar.gz`。
+mirror 需要按 `MIRROR_BASE/VERSION/ASSET` 存放 release asset，例如 `https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.6/nftables-nat-rust-enhanced-linux-amd64.tar.gz`。
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.5 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced
+bash install.sh --core-only --use-release --version v0.8.6 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced
 ```
 
 `--mirror-base` 只在下载 release asset 时生效；mirror asset 下载失败时会明确报错并 fallback 到 GitHub Release。不要使用不可信第三方镜像，mirror 属于供应链敏感路径。
@@ -119,6 +119,7 @@ mirror、local binary、local asset 都是供应链敏感路径。安装脚本�
 
 | 功能 | 说明 |
 |---|---|
+| global.enabled | 临时停用 / 恢复本项目所有转发规则生成，不删除配置 |
 | NAT 转发 | 单端口、端口段、TCP/UDP/all、IPv4/IPv6，支持本机 redirect |
 | DDNS 目标 | 目标域名自动解析，解析失败时可用 last-good 兜底 |
 | access_control | 限制谁能访问入口（来源 IP/CIDR 白名单或黑名单） |
@@ -135,6 +136,7 @@ mirror、local binary、local asset 都是供应链敏感路径。安装脚本�
 - `access_control`：限制谁能访问入口
 - `dynamic_whitelist`：把 DDNS 解析结果加入来源白名单
 - `egress_control`：限制本机能转发到哪里
+- `global.enabled`：临时停用或恢复本项目管理的转发规则生成
 - `last-good`：DNS 临时失败时复用上一次成功解析到的 IP
 
 各功能的详细行为见下面的 [功能详解](#功能详解)。
@@ -144,6 +146,9 @@ mirror、local binary、local asset 都是供应链敏感路径。安装脚本�
 默认配置文件：`/etc/nat.toml`。一份较完整的示例：
 
 ```toml
+[global]
+enabled = true
+
 [[rules]]
 type = "single"
 sport = 30080
@@ -260,7 +265,7 @@ CLI 兼容旧版 `/etc/nat.conf` 读取逻辑。
 
 ```text
 ====================================
-nft-nat-rust v0.8.5
+nft-nat-rust v0.8.6
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
@@ -289,9 +294,9 @@ nft-nat-rust v0.8.5
 
 - **查看当前转发规则**：默认展示每条规则的核心字段（index / 状态 / type / sport / target / resolved / dport / protocol / ip_version / access_control / quota / egress），以及一行组合策略摘要和一行 last-good 摘要。页面尾部输入 `d` 展开完整组合策略 + 完整 last-good 状态缓存。
 - **添加单端口 / 端口段转发**：会尽力用 `ss -lntup` 检测入口端口是否已被本机服务占用，发现占用时默认取消，输入 `y` 才继续并写 `port_conflict.override` audit。没有 `ss` 时只 warning，不阻塞，也不会自动安装依赖或 kill 进程。
-- **白名单 / 黑名单管理**：默认页只显示来源访问控制摘要；可用「查询来源 IP 命中情况」检查某个来源 IP 是否命中当前 `access_control` / `dynamic_whitelist` / GeoIP 来源限制。
-- **测试转发规则连通性**：扫描 `ip/ip6 self-nat / self-filter`，结论分 `已应用` / `部分匹配` / `未确认` / `未应用`；不依赖 counter 非零，不会因检测未确认就自动重启 nat。CLI 默认只展示简短测试提示（`SERVER_IP:入口端口` + 协议提示），详细 `curl` / `nc` / SNI 示例可在测试页面输入 h 查看（按 `protocol` / `target` 分支生成）。
-- **高级网络设置**：查看 / 设置 SNAT 模式、fixed SNAT 源 IP、MSS clamp、时间 / NTP 状态检查、查看全局诊断状态（完整组合策略 + 完整 last-good 状态缓存，仅查看不修改）。
+- **白名单 / 黑名单管理**：默认页只显示来源访问控制摘要；可用「查询来源 IP 命中情况」检查某个来源 IP 是否命中当前 `access_control` / `dynamic_whitelist` / GeoIP 来源限制；也可检测当前 SSH 来源 IP，确认后手动加入静态白名单。
+- **测试转发规则连通性**：扫描 `ip/ip6 self-nat / self-filter`，结论分 `已应用` / `部分匹配` / `未确认` / `未应用`；不依赖 counter 非零，不会因检测未确认就自动重启 nat。CLI 默认只展示简短测试提示（`SERVER_IP:入口端口` + 协议提示），详细 `curl` / `nc` / SNI 示例可在测试页面输入 h 查看（按 `protocol` / `target` 分支生成）。`global.enabled=false` 时会直接提示全局转发已关闭，不继续给出误导性的 nft 应用结论。
+- **高级网络设置**：查看 / 设置 SNAT 模式、fixed SNAT 源 IP、MSS clamp、全局转发开关、时间 / NTP 状态检查、查看全局诊断状态（完整组合策略 + 完整 last-good 状态缓存，仅查看不修改）。
 - **查看审计日志**：默认按展示时区显示最近 50 行格式化日志，子菜单可切换原始 JSON。文件路径默认 `audit.file = /var/log/nftables-nat-rust-audit.log`，可用 `tail -F` / `grep` 直接查看。
 - **最近来源 IP 观察（手动排查）**：只打印 `conntrack -L` / `nft list table ...` / `journalctl` 等命令供手动观察，不自动采集来源 IP，也不会放行或封禁来源。
 
@@ -315,6 +320,7 @@ CLI 修改任意配置时**只写 `/etc/nat.toml`**，不绕过安全 apply 直�
 - safe apply 流程：生成规则后先 `nft -c` 检查 → 备份当前 ruleset → `nft -f` 应用 → 失败回滚本项目 managed tables（`ip/ip6 self-nat`、`ip/ip6 self-filter`）
 - nft comment 使用短 ID，规避 nftables comment 128 字符限制
 - 配置写入统一走 `safe_write_config`：备份 → 临时文件 + fsync → rename 原子替换 → 写 audit；任何一步失败都保留旧文件
+- `global.enabled=false` 只临时停用本项目转发规则生成，不删除规则配置，不影响 SSH，不影响系统其他 nft table
 - audit log 记录配置修改与 nat.service 自动行为；Telegram `bot_token` / `chat_id` 在写入前脱敏
 - `dynamic_whitelist` 是来源白名单增强，不会放开所有来源；`egress_control` 限制目标 IP；GeoIP 与 `access_control` 是 AND 叠加，不是互相绕过
 - 卸载只清理本项目 `self-*` 表，默认保留 `/etc/nat.toml`、Stats、backups
@@ -335,7 +341,7 @@ CLI 修改任意配置时**只写 `/etc/nat.toml`**，不绕过安全 apply 直�
 
 保存提示按 reason 分流，避免对不影响 nft 的配置误提示等待 nft 应用：
 
-- **影响 nft 规则的配置**（规则增删改、access_control、dynamic_whitelist 域名增删启停、GeoIP、egress_control、SNAT、MSS、quota、`stats.mode.update`、`backup.restore`）→ 显示完整提示并列出 `systemctl restart nat` / `nft list table ip self-nat` / `journalctl -u nat -n 120 --no-pager`。
+- **影响 nft 规则的配置**（规则增删改、`global.enabled.update`、access_control、dynamic_whitelist 域名增删启停、GeoIP、egress_control、SNAT、MSS、quota、`stats.mode.update`、`backup.restore`）→ 显示完整提示并列出 `systemctl restart nat` / `nft list table ip self-nat` / `journalctl -u nat -n 120 --no-pager`。
 - **不影响 nft 规则的配置**（Telegram、dynamic_whitelist 刷新间隔、UI timezone、audit 显示 / 轮转）→ 只显示「配置已安全保存…该配置不会改变 nft 转发规则，无需等待 nft 应用。」这类不影响 nft 规则的 reason 不会引导用户执行 `systemctl restart nat`。
 
 ## 功能详解
@@ -346,6 +352,18 @@ CLI 修改任意配置时**只写 `/etc/nat.toml`**，不绕过安全 apply 直�
 - IPv4 / IPv6，TCP / UDP / all
 - 目标支持 IP、域名、DDNS
 - TOML 配置，兼容旧版 `/etc/nat.conf`
+
+### 全局转发开关（global.enabled）
+
+`[global] enabled = false` 用于临时停用本项目管理的所有转发规则：
+
+- 不删除 `/etc/nat.toml` 中的 `rules`
+- 不清空 `access_control`、`dynamic_whitelist`、`egress_control`、quota / stats 等配置
+- 不影响 SSH
+- 不影响系统其他 nft table
+- 只影响本项目 `self-nat` / `self-filter` 内的转发规则生成
+
+关闭后 `nat.service` 仍可运行并继续做配置检测、状态展示和 dynamic_whitelist 解析；解析结果只显示状态，不参与实际放行。重新开启后会按当前配置恢复生成和应用转发规则。
 
 ### DDNS
 
@@ -393,7 +411,7 @@ allow = (来源不在黑名单)
 
 不要理解为 OR：白名单不会绕过 GeoIP，GeoIP 也不会绕过白名单。GeoIP 与 access_control 两者可以同时启用，叠加生效，不是互相覆盖。组合不会 `flush ruleset`，只在本项目 `self-nat` / `self-filter` 表内叠加规则。
 
-CLI 的「白名单 / 黑名单管理」默认页只显示来源访问控制的简洁摘要（mode / 静态 entries 数量 / 动态 DDNS 状态 / GeoIP / SSH GeoIP），完整组合策略通过子菜单「查看来源策略详情」按需展开；「查询来源 IP 命中情况」只读检查单个来源 IP，不修改配置、不应用 nft。
+CLI 的「白名单 / 黑名单管理」默认页只显示来源访问控制的简洁摘要（mode / 静态 entries 数量 / 动态 DDNS 状态 / GeoIP / SSH GeoIP / global forwarding），完整组合策略通过子菜单「查看来源策略详情」按需展开；「查询来源 IP 命中情况」只读检查单个来源 IP，不修改配置、不应用 nft。
 
 ### dynamic_whitelist / DDNS 来源白名单
 
@@ -473,6 +491,13 @@ CLI / audit / Telegram：状态页与详细结果显示当前 `cidr_expand_ipv4`
 ## 来源白名单排查
 
 在「白名单 / 黑名单管理」里使用「查询来源 IP 命中情况」，可以检查某个来源 IP 是否会被当前 `access_control` / `dynamic_whitelist` / GeoIP 来源限制放行。这个入口只读诊断，不会添加白名单、不会切换模式、不会执行 `nft -f`。
+
+也可以使用「检测当前 SSH 来源 IP」辅助添加静态白名单。该入口只读取当前进程环境里的 `SSH_CONNECTION` / `SSH_CLIENT`，检测结果只作为提示；必须用户确认后才会写入 `access_control.entries`。它不会自动启用 whitelist，不会自动关闭 GeoIP，不会修改 SSH 配置，也不会访问外网查询 IP。
+
+- IPv4 默认建议 `/32` 精确 IP，可明确选择 `/24` 网段；`/24` 会扩大来源范围，仅在移动网络或运营商出口频繁变化时使用。
+- IPv6 只建议 `/128` 精确地址，不做 `/64` 自动扩展。
+- `access_control.mode = "blacklist"` 时不会通过该入口添加 SSH 来源 IP，避免把当前 SSH 来源加入黑名单误封自己。
+- `access_control.mode = "off"` 时允许添加到 entries，但暂不生效；切换到 whitelist 后才作为来源白名单使用。
 
 - `dynamic_whitelist` 是来源 IP 动态白名单，不是目标 IP 限制。
 - 启用 `access_control.mode = "whitelist"` 时，建议保留至少一个静态白名单 IP/CIDR 作为兜底。
@@ -757,7 +782,7 @@ bash install.sh --core-only --build-from-source
 指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.5
+bash install.sh --core-only --use-release --version v0.8.6
 bash install.sh --core-only --build-from-source
 ```
 
@@ -811,7 +836,15 @@ apt update && apt install -y git curl wget ca-certificates build-essential pkg-c
 
 ## 版本说明
 
-### v0.8.5（当前稳定版）
+### v0.8.6（当前稳定版）
+
+- 新增 `[global] enabled` 全局转发开关，可临时停用 / 恢复本项目所有转发规则生成，不删除规则配置
+- `global.enabled=false` 时仍保留 managed table 基础结构，不生成 DNAT/SNAT 转发规则，不影响 SSH 和系统其他 nft table
+- 白名单 / 黑名单管理新增「检测当前 SSH 来源 IP」，只提示并在用户确认后手动加入静态 entries；blacklist 模式下拒绝添加以避免误封
+- 来源策略摘要新增 `global forwarding` 状态、global disabled 提示、whitelist 空白名单 warning、dynamic whitelist 非 whitelist 模式提示
+- 测试转发规则连通性在 global disabled 时直接给 warning，不继续给出误导性的 nft 应用判断
+
+### v0.8.5
 
 - 白名单 / 黑名单管理新增「查询来源 IP 命中情况」只读诊断入口
 - 来源策略摘要显示静态 entries、dynamic_whitelist current/stale、`cidr_expand_ipv4`、GeoIP forward / SSH GeoIP
@@ -859,7 +892,7 @@ apt update && apt install -y git curl wget ca-certificates build-essential pkg-c
 
 ## 维护路线
 
-后续保持 CLI-first / core-only。承诺**不**做：WebUI、tc/ifb 限速、多租户 / server-agent 架构、数据库存储、DNS 供应商接口，以及任何破坏既有 CLI 文案 / 菜单编号 / TOML 字段语义的改动。
+后续保持 CLI-first / core-only。承诺**不**做：WebUI、tc/ifb 限速、多租户 / server-agent 架构、数据库存储、DNS 供应商接口，以及无必要的破坏性 CLI / TOML 语义改动。
 
 可选维护项（按需推进，不许诺时间）：继续拆分 `menu.rs` 剩余子菜单、统一测试结构、audit 轮转按时间维度增强、install / update 文档打磨。
 
