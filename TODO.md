@@ -2,7 +2,7 @@
 
 本文件记录在历次「稳定版架构体检」中被识别、但本轮不修复的低优先级改进项。
 
-> 当前稳定版本 v0.8.9 是 per-rule `snat_ip` 双出口维护功能发布；v0.8.8 是编辑现有转发规则的 CLI 功能发布；v0.8.7 是 disabled 规则在前时 Stats/quota rule_id 对齐的 bugfix 发布；v0.8.6 是全局转发开关、SSH 来源检测提示和来源策略摘要增强发布；v0.8.5 是 CLI 观测与安全提示增强发布；v0.8.0 是 dynamic_whitelist 功能版本。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
+> 当前稳定版本 v0.8.10 是「测试转发规则连通性」的 SNAT 出口 + 本机出站诊断增强发布；v0.8.9 是 per-rule `snat_ip` 双出口维护功能发布；v0.8.8 是编辑现有转发规则的 CLI 功能发布；v0.8.7 是 disabled 规则在前时 Stats/quota rule_id 对齐的 bugfix 发布；v0.8.6 是全局转发开关、SSH 来源检测提示和来源策略摘要增强发布；v0.8.5 是 CLI 观测与安全提示增强发布；v0.8.0 是 dynamic_whitelist 功能版本。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
 > 真正会动结构的改造请挪到独立 minor 版本规划，并先在本文件提案。
 
 不属于本文件的内容：
@@ -128,6 +128,12 @@
 - **规则级 SNAT 出口 IP**：`single` / `range` 转发规则新增可选 `snat_ip`，为空时保持旧 SNAT 行为；填写 IPv4 literal 时仅该条规则 POSTROUTING 使用 `snat to <snat_ip>`。
 - **CLI 与校验**：添加 / 编辑 / 查看规则支持 `snat_ip`，配置校验拒绝域名、CIDR、IPv6、带端口或带空格值；不强制检查 IP 是否存在于本机网卡。
 - **边界**：不改 DNAT、监听端口、rule_id、disabled 过滤、enabled 顺序、系统默认路由或 `ip route` / `ip rule`；未新增 WebUI、数据库、Bot 面板或白名单功能。
+
+### v0.8.10
+
+- **连通性测试增强**：「测试转发规则连通性」新增「SNAT 出口诊断」段，复用现有 `forward_test` 入口与判定逻辑，回答「为什么可能不通」：SNAT 模式、per-rule `snat_ip`、POSTROUTING 动作、nft 中 `snat to <ip>` 存在性、系统默认出口 IP、`ip route get from <snat_ip>`、可选 `curl --interface <snat_ip>` 出口 IP 测试。
+- **纯逻辑可测**：新增 `snat_plan` / `nft_json_contains_snat_to` / `parse_route_get_src` / `parse_curl_egress_ip` / `EgressProbe` 等纯函数（`nat-common/forward_test`），系统命令仅做薄封装；未配置 `snat_ip` 显示 `default` 并跳过 snat_ip 专属检查，`ip route` / `curl` 缺失或失败按 WARN 处理。
+- **边界**：只读诊断，不修改 `ip route` / `ip rule` / nft 规则 / DNS / 配置；不新增配置项、daemon、WebUI、数据库、远程探针或外部 VPS 探测；不改 DNAT/SNAT 生成、disabled 过滤、enabled 顺序、Stats/quota rule_id 对齐。明确本机侧诊断不替代公网外部入口测试。
 
 ---
 

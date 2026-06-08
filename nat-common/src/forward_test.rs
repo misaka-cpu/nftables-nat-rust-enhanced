@@ -683,6 +683,204 @@ pub fn tcp_connect_target(rule: &TestableRule, timeout: Duration) -> Option<bool
     Some(std::net::TcpStream::connect_timeout(&addr, timeout).is_ok())
 }
 
+// ===== v0.8.10：per-rule SNAT 出口诊断（纯逻辑，不触发任何系统命令）=====
+
+/// SNAT 出口计划：根据规则与全局配置推导出该规则 POSTROUTING 的实际行为，仅用于展示。
+///
+/// 这是 `nat-cli` 里 `resolve_snat_action` 的纯逻辑镜像（不读环境变量、不执行命令），
+/// 便于单元测试；真实生成仍以 `resolve_snat_action` 为准。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnatPlan {
+    /// 出口模式标签：`per-rule` / `masquerade` / `fixed` / `off`。
+    pub mode_label: String,
+    /// 规则的 per-rule snat_ip（调用方已用 `NftCell::snat_ip()` 过滤空串）；None 表示走全局默认。
+    pub per_rule_snat_ip: Option<String>,
+    /// POSTROUTING 实际动作的可读描述。
+    pub postrouting_action: String,
+    /// 附加说明（如 legacy env 覆盖、IPv4/IPv6 family 行为差异）。
+    pub notes: Vec<String>,
+}
+
+/// 计算单个 IP family 的 SNAT 动作字符串，与 `resolve_snat_action` 对齐。
+/// 返回 None 表示该 family 不生成 POSTROUTING SNAT（mode=off）。
+fn family_snat_action(
+    is_v4: bool,
+    global_mode: &str,
+    fixed_source_ip: &str,
+    legacy_env_ip: Option<&str>,
+) -> Option<String> {
+    match global_mode {
+        "off" => None,
+        "fixed" => {
+            let ip = fixed_source_ip.trim();
+            if is_v4 && !ip.is_empty() {
+                Some(format!("snat to {ip}"))
+            } else {
+                // IPv6 或 fixed_source_ip 为空：回退 masquerade，与生成逻辑一致。
+                Some("masquerade".to_string())
+            }
+        }
+        // 默认 masquerade：legacy nat_local_ip 环境变量存在时覆盖为 snat to <env>。
+        _ => match legacy_env_ip.filter(|ip| !ip.is_empty()) {
+            Some(ip) => Some(format!("snat to {ip}")),
+            None => Some("masquerade".to_string()),
+        },
+    }
+}
+
+fn action_label(action: &Option<String>) -> String {
+    match action {
+        Some(a) => a.clone(),
+        None => "off（不生成 POSTROUTING SNAT）".to_string(),
+    }
+}
+
+/// 推导某条规则的 SNAT 出口计划。
+///
+/// - `rule_snat_ip`：规则 per-rule snat_ip（已过滤空串）。per-rule snat_ip 仅在 IPv4 规则上合法，
+///   命中时直接 `snat to <ip>`，覆盖全局模式。
+/// - `ip_version`：`"ipv4"` / `"ipv6"` / `"all"`。
+/// - `global_mode`：`"masquerade"` / `"fixed"` / `"off"`。
+/// - `fixed_source_ip`：全局 `snat.fixed_source_ip`。
+/// - `legacy_env_ip`：legacy `nat_local_ip` 环境变量值（masquerade 兼容路径），无则 None。
+pub fn snat_plan(
+    rule_snat_ip: Option<&str>,
+    ip_version: &str,
+    global_mode: &str,
+    fixed_source_ip: &str,
+    legacy_env_ip: Option<&str>,
+) -> SnatPlan {
+    if let Some(ip) = rule_snat_ip.filter(|v| !v.is_empty()) {
+        return SnatPlan {
+            mode_label: "per-rule".to_string(),
+            per_rule_snat_ip: Some(ip.to_string()),
+            postrouting_action: format!("snat to {ip}"),
+            notes: Vec::new(),
+        };
+    }
+    let need_v4 = matches!(ip_version, "ipv4" | "all");
+    let need_v6 = matches!(ip_version, "ipv6" | "all");
+    let v4 = family_snat_action(true, global_mode, fixed_source_ip, legacy_env_ip);
+    let v6 = family_snat_action(false, global_mode, fixed_source_ip, None);
+    let postrouting_action = match (need_v4, need_v6) {
+        (true, true) => {
+            let a4 = action_label(&v4);
+            let a6 = action_label(&v6);
+            if a4 == a6 {
+                a4
+            } else {
+                format!("ipv4: {a4} / ipv6: {a6}")
+            }
+        }
+        (true, false) => action_label(&v4),
+        (false, true) => action_label(&v6),
+        (false, false) => "off（不生成 POSTROUTING SNAT）".to_string(),
+    };
+    let mut notes = Vec::new();
+    if global_mode == "masquerade"
+        && let Some(ip) = legacy_env_ip.filter(|v| !v.is_empty())
+    {
+        notes.push(format!(
+            "legacy nat_local_ip 覆盖：IPv4 family 使用 snat to {ip}"
+        ));
+    }
+    SnatPlan {
+        mode_label: global_mode.to_string(),
+        per_rule_snat_ip: None,
+        postrouting_action,
+        notes,
+    }
+}
+
+/// 轻量检查：`nft -j list ruleset` JSON 中是否存在 `snat to <ip>`（snat 语句的 addr == ip）。
+/// 不解析 counter，只做存在性判断；JSON 解析失败时返回 false（调用方据此显示 unable to parse）。
+pub fn nft_json_contains_snat_to(json: &str, ip: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(json) else {
+        return false;
+    };
+    let mut found = false;
+    scan_snat_addr(&value, ip, &mut found);
+    found
+}
+
+fn scan_snat_addr(value: &Value, ip: &str, found: &mut bool) {
+    if *found {
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                scan_snat_addr(item, ip, found);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(snat) = map.get("snat")
+                && addr_value_matches(snat.get("addr"), ip)
+            {
+                *found = true;
+                return;
+            }
+            for v in map.values() {
+                scan_snat_addr(v, ip, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn addr_value_matches(addr: Option<&Value>, ip: &str) -> bool {
+    fn contains(value: &Value, ip: &str) -> bool {
+        match value {
+            Value::String(s) => s == ip,
+            Value::Array(items) => items.iter().any(|i| contains(i, ip)),
+            Value::Object(map) => map.values().any(|v| contains(v, ip)),
+            _ => false,
+        }
+    }
+    addr.map(|a| contains(a, ip)).unwrap_or(false)
+}
+
+/// 解析 `ip route get ...` 输出里的 `src <ip>` 字段。
+pub fn parse_route_get_src(output: &str) -> Option<String> {
+    let mut tokens = output.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        if tok == "src"
+            && let Some(candidate) = tokens.next()
+            && candidate.parse::<IpAddr>().is_ok()
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// 解析出口 IP 探测（如 api.ipify.org）返回的纯 IP body；非 IP 内容返回 None。
+pub fn parse_curl_egress_ip(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    trimmed.parse::<IpAddr>().ok().map(|_| trimmed.to_string())
+}
+
+/// 出口探测结果。`Warn` 表示探测失败但不视为硬错误（命令缺失 / 网络不可达 / 未配置 snat_ip 等）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressProbe {
+    /// 不适用而跳过（如规则未配置 snat_ip、规则未生效）。
+    Skipped(String),
+    /// 探测成功，附带可读细节。
+    Ok(String),
+    /// 探测失败但属软告警，不影响其它诊断结论。
+    Warn(String),
+}
+
+impl EgressProbe {
+    pub fn label(&self) -> String {
+        match self {
+            EgressProbe::Skipped(why) => format!("skipped（{why}）"),
+            EgressProbe::Ok(detail) => format!("ok，{detail}"),
+            EgressProbe::Warn(why) => format!("warn（{why}）"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1100,5 +1298,120 @@ domain = "93.184.216.34"
         let verdict =
             classify_nft_presence_with_shape(&p, "ipv4", "all", NftRuleShape::Redirect, true, true);
         assert_eq!(verdict, NftDetectionVerdict::Partial);
+    }
+
+    // ============ v0.8.10：per-rule SNAT 出口诊断 ============
+
+    #[test]
+    fn snat_plan_per_rule_overrides_global_mode() {
+        // 配置了 per-rule snat_ip 的 IPv4 规则：mode=per-rule，动作固定 snat to <ip>，
+        // 即使全局是 masquerade。
+        let plan = snat_plan(Some("198.51.100.20"), "ipv4", "masquerade", "", None);
+        assert_eq!(plan.mode_label, "per-rule");
+        assert_eq!(plan.per_rule_snat_ip.as_deref(), Some("198.51.100.20"));
+        assert_eq!(plan.postrouting_action, "snat to 198.51.100.20");
+        assert!(plan.notes.is_empty());
+    }
+
+    #[test]
+    fn snat_plan_default_rule_shows_global_masquerade() {
+        // 没有 snat_ip 的规则：mode=default，按全局 masquerade，snat_ip 显示 default。
+        let plan = snat_plan(None, "ipv4", "masquerade", "", None);
+        assert_eq!(plan.mode_label, "masquerade");
+        assert_eq!(plan.per_rule_snat_ip, None);
+        assert_eq!(plan.postrouting_action, "masquerade");
+    }
+
+    #[test]
+    fn snat_plan_empty_snat_ip_is_treated_as_default() {
+        let plan = snat_plan(Some(""), "ipv4", "off", "", None);
+        assert_eq!(plan.mode_label, "off");
+        assert_eq!(plan.per_rule_snat_ip, None);
+        assert_eq!(plan.postrouting_action, "off（不生成 POSTROUTING SNAT）");
+    }
+
+    #[test]
+    fn snat_plan_global_fixed_uses_fixed_ip_for_v4() {
+        let plan = snat_plan(None, "ipv4", "fixed", "203.0.113.7", None);
+        assert_eq!(plan.mode_label, "fixed");
+        assert_eq!(plan.postrouting_action, "snat to 203.0.113.7");
+    }
+
+    #[test]
+    fn snat_plan_legacy_env_overrides_masquerade() {
+        let plan = snat_plan(None, "ipv4", "masquerade", "", Some("203.0.113.9"));
+        assert_eq!(plan.postrouting_action, "snat to 203.0.113.9");
+        assert!(plan.notes.iter().any(|n| n.contains("legacy")));
+    }
+
+    #[test]
+    fn snat_plan_all_family_fixed_shows_v4_and_v6_split() {
+        // ip_version=all + fixed：v4 固定 IP，v6 回退 masquerade。
+        let plan = snat_plan(None, "all", "fixed", "203.0.113.7", None);
+        assert_eq!(
+            plan.postrouting_action,
+            "ipv4: snat to 203.0.113.7 / ipv6: masquerade"
+        );
+    }
+
+    #[test]
+    fn nft_json_contains_snat_to_matches_addr() {
+        let json = r#"{"nftables":[
+            {"rule":{"family":"ip","table":"self-nat","chain":"POSTROUTING","handle":9,
+                "expr":[{"counter":{"packets":0,"bytes":0}},{"snat":{"addr":"198.51.100.20","family":"ip"}}]
+            }}
+        ]}"#;
+        assert!(nft_json_contains_snat_to(json, "198.51.100.20"));
+        assert!(!nft_json_contains_snat_to(json, "203.0.113.7"));
+    }
+
+    #[test]
+    fn nft_json_contains_snat_to_false_on_masquerade_only() {
+        let json = r#"{"nftables":[
+            {"rule":{"family":"ip","table":"self-nat","chain":"POSTROUTING","handle":9,
+                "expr":[{"counter":{"packets":0,"bytes":0}},{"masquerade":null}]
+            }}
+        ]}"#;
+        assert!(!nft_json_contains_snat_to(json, "198.51.100.20"));
+    }
+
+    #[test]
+    fn nft_json_contains_snat_to_false_on_garbage_json() {
+        assert!(!nft_json_contains_snat_to("not json", "1.2.3.4"));
+    }
+
+    #[test]
+    fn parse_route_get_src_extracts_src_ip() {
+        let out = "1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 0 \n    cache";
+        assert_eq!(parse_route_get_src(out).as_deref(), Some("10.0.0.5"));
+        assert_eq!(parse_route_get_src("RTNETLINK answers: ..."), None);
+    }
+
+    #[test]
+    fn parse_curl_egress_ip_validates_ip_body() {
+        assert_eq!(
+            parse_curl_egress_ip(" 203.0.113.9\n").as_deref(),
+            Some("203.0.113.9")
+        );
+        assert_eq!(parse_curl_egress_ip("<html>error</html>"), None);
+    }
+
+    #[test]
+    fn egress_probe_labels_are_distinct() {
+        assert!(
+            EgressProbe::Skipped("无 snat_ip".into())
+                .label()
+                .starts_with("skipped")
+        );
+        assert!(
+            EgressProbe::Ok("src 1.2.3.4".into())
+                .label()
+                .starts_with("ok")
+        );
+        assert!(
+            EgressProbe::Warn("curl 不可用".into())
+                .label()
+                .starts_with("warn")
+        );
     }
 }

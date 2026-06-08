@@ -6390,6 +6390,32 @@ pub(crate) struct RuleResolutionDisplay {
     pub notes: Vec<String>,
 }
 
+/// v0.8.10：per-rule snat_ip 在 nft POSTROUTING 中的存在性检查结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SnatNftCheck {
+    /// 规则未配置 snat_ip，走全局默认 SNAT，无需检查 `snat to <ip>`。
+    NoSnatIp,
+    /// nft 中找到 `snat to <ip>`。
+    Found(String),
+    /// 配置了 snat_ip 但 nft 中没有对应 `snat to <ip>`（可能未重新 apply）。
+    Missing(String),
+    /// 配置了 snat_ip，但 nft ruleset 不可读 / 解析失败，无法判定。
+    Unknown(String),
+}
+
+/// v0.8.10：SNAT 出口 + 本机出站诊断。
+#[derive(Debug, Clone)]
+pub(crate) struct SnatEgressReport {
+    pub plan: forward_test::SnatPlan,
+    pub nft_snat_to: SnatNftCheck,
+    /// 系统默认出口 IP（`ip route get 1.1.1.1` 的 src）；None 表示无法确定。
+    pub system_egress_ip: Option<String>,
+    /// `ip route get 1.1.1.1 from <snat_ip>` 结果。
+    pub route_from_snat: forward_test::EgressProbe,
+    /// `curl -4 --interface <snat_ip> https://api.ipify.org` 结果。
+    pub curl_egress: forward_test::EgressProbe,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectivityReport<'a> {
     pub rule: &'a forward_test::TestableRule,
@@ -6401,6 +6427,7 @@ pub(crate) struct ConnectivityReport<'a> {
     pub nft: NftConnectivityStatus,
     pub target_tcp: Option<bool>,
     pub access_control_note: Option<String>,
+    pub snat: SnatEgressReport,
 }
 
 fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
@@ -6444,12 +6471,18 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
     let last_good_state = LastGoodState::load(&config.last_good.file);
     let resolution = build_rule_resolution_display(&config, rule, &last_good_state);
     let global_enabled = config.global.enabled;
-    let (nat_service, last_apply, nft, target_tcp) = if !global_enabled {
+    let rule_snat_ip = config
+        .rules
+        .get(rule.index)
+        .and_then(NftCell::snat_ip)
+        .map(str::to_string);
+    let (nat_service, last_apply, nft, target_tcp, snat) = if !global_enabled {
         (
             NatServiceStatus::NotChecked,
             LastApplyDisplay::not_checked(),
             NftConnectivityStatus::SkippedGlobalDisabled,
             None,
+            build_snat_egress_report(&config, rule, rule_snat_ip.as_deref(), None, false),
         )
     } else if rule_enabled {
         let nat_service = read_nat_service_status();
@@ -6460,13 +6493,22 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
             last_apply.state == LastApplyState::Success,
         );
         let target_tcp = forward_test::tcp_connect_target(rule, std::time::Duration::from_secs(3));
-        (nat_service, last_apply, nft, target_tcp)
+        let nft_json = read_nft_json_ruleset().ok();
+        let snat = build_snat_egress_report(
+            &config,
+            rule,
+            rule_snat_ip.as_deref(),
+            nft_json.as_deref(),
+            true,
+        );
+        (nat_service, last_apply, nft, target_tcp, snat)
     } else {
         (
             NatServiceStatus::NotChecked,
             LastApplyDisplay::not_checked(),
             NftConnectivityStatus::SkippedDisabled,
             None,
+            build_snat_egress_report(&config, rule, rule_snat_ip.as_deref(), None, false),
         )
     };
     let report = ConnectivityReport {
@@ -6479,6 +6521,7 @@ fn test_forward_interactive(path: &str) -> Result<(), io::Error> {
         nft,
         target_tcp,
         access_control_note: forward_test::access_control_note(&config.access_control),
+        snat,
     };
     for line in render_connectivity_report_lines(&report) {
         println!("{line}");
@@ -6650,6 +6693,147 @@ fn read_nft_connectivity_status(
     }
 }
 
+/// v0.8.10：构建 SNAT 出口 + 本机出站诊断。
+///
+/// `do_probes` 为 false（规则未启用 / 全局转发关闭）时只计算纯配置层 SnatPlan，
+/// 不执行任何 `ip route get` / `curl` 系统命令；snat_ip 的 nft 存在性也标记为跳过。
+fn build_snat_egress_report(
+    config: &TomlConfig,
+    rule: &forward_test::TestableRule,
+    rule_snat_ip: Option<&str>,
+    nft_json: Option<&str>,
+    do_probes: bool,
+) -> SnatEgressReport {
+    let legacy_env_ip = std::env::var("nat_local_ip").ok();
+    let plan = forward_test::snat_plan(
+        rule_snat_ip,
+        rule.ip_version.as_str(),
+        &config.snat.mode.to_string(),
+        &config.snat.fixed_source_ip,
+        legacy_env_ip.as_deref(),
+    );
+    let nft_snat_to = match (rule_snat_ip, nft_json) {
+        (None, _) => SnatNftCheck::NoSnatIp,
+        (Some(ip), Some(json)) => {
+            if forward_test::nft_json_contains_snat_to(json, ip) {
+                SnatNftCheck::Found(ip.to_string())
+            } else {
+                SnatNftCheck::Missing(ip.to_string())
+            }
+        }
+        // 配了 snat_ip 但拿不到 nft ruleset（规则未生效 / 读取失败）：不下定论。
+        (Some(ip), None) => SnatNftCheck::Unknown(ip.to_string()),
+    };
+    if !do_probes {
+        return SnatEgressReport {
+            plan,
+            nft_snat_to,
+            system_egress_ip: None,
+            route_from_snat: forward_test::EgressProbe::Skipped(
+                "规则未生效，跳过出口探测".to_string(),
+            ),
+            curl_egress: forward_test::EgressProbe::Skipped("规则未生效，跳过出口探测".to_string()),
+        };
+    }
+    let system_egress_ip = run_ip_route_get_src("1.1.1.1", None);
+    let (route_from_snat, curl_egress) = match rule_snat_ip {
+        Some(ip) => (probe_route_from_snat(ip), probe_curl_egress(ip)),
+        None => (
+            forward_test::EgressProbe::Skipped("规则未配置 snat_ip，使用全局默认出口".to_string()),
+            forward_test::EgressProbe::Skipped(
+                "规则未配置 snat_ip，不做 --interface 出站测试".to_string(),
+            ),
+        ),
+    };
+    SnatEgressReport {
+        plan,
+        nft_snat_to,
+        system_egress_ip,
+        route_from_snat,
+        curl_egress,
+    }
+}
+
+/// 执行 `ip route get <dest> [from <src>]` 并解析 `src`；命令缺失/失败返回 None。
+/// 只读，不修改任何路由 / 规则。
+fn run_ip_route_get_src(dest: &str, from: Option<&str>) -> Option<String> {
+    let mut cmd = Command::new("ip");
+    cmd.arg("route").arg("get").arg(dest);
+    if let Some(src) = from {
+        cmd.arg("from").arg(src);
+    }
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    forward_test::parse_route_get_src(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// 探测 `ip -4 route get 1.1.1.1 from <snat_ip>`：成功为 ok，失败为软告警（不 panic、不改路由）。
+fn probe_route_from_snat(snat_ip: &str) -> forward_test::EgressProbe {
+    match Command::new("ip")
+        .arg("-4")
+        .arg("route")
+        .arg("get")
+        .arg("1.1.1.1")
+        .arg("from")
+        .arg(snat_ip)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            match forward_test::parse_route_get_src(&text) {
+                Some(src) => {
+                    forward_test::EgressProbe::Ok(format!("from {snat_ip} 可路由（src {src}）"))
+                }
+                None => forward_test::EgressProbe::Ok(format!("from {snat_ip} 可路由")),
+            }
+        }
+        Ok(output) => {
+            let err = String::from_utf8_lossy(&output.stderr);
+            forward_test::EgressProbe::Warn(format!(
+                "ip route get from {snat_ip} 失败：{}",
+                err.trim()
+            ))
+        }
+        Err(e) => forward_test::EgressProbe::Warn(format!("ip 命令不可用：{e}")),
+    }
+}
+
+/// 用 snat_ip 作为出站源做出口 IP 测试。失败一律 Warn，不视为硬错误，也不改任何配置/路由。
+fn probe_curl_egress(snat_ip: &str) -> forward_test::EgressProbe {
+    match Command::new("curl")
+        .arg("-4")
+        .arg("--interface")
+        .arg(snat_ip)
+        .arg("--max-time")
+        .arg("5")
+        .arg("-s")
+        .arg("https://api.ipify.org")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let body = String::from_utf8_lossy(&output.stdout);
+            match forward_test::parse_curl_egress_ip(&body) {
+                Some(ip) if ip == snat_ip => {
+                    forward_test::EgressProbe::Ok(format!("observed ip = {ip}（与 snat_ip 一致）"))
+                }
+                Some(ip) => forward_test::EgressProbe::Warn(format!(
+                    "observed ip = {ip}，与 snat_ip {snat_ip} 不一致"
+                )),
+                None => forward_test::EgressProbe::Warn("curl 返回内容无法解析为 IP".to_string()),
+            }
+        }
+        Ok(output) => forward_test::EgressProbe::Warn(format!(
+            "curl --interface {snat_ip} 失败（exit {:?}）",
+            output.status.code()
+        )),
+        Err(_) => {
+            forward_test::EgressProbe::Warn("curl 不可用或无法执行，跳过出口 IP 测试".to_string())
+        }
+    }
+}
+
 fn summarize_nft_probe_states(
     rule: &forward_test::TestableRule,
     presence: &forward_test::NftRulePresence,
@@ -6792,7 +6976,9 @@ pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) 
     }
     lines.push(String::new());
 
-    lines.push("4. 目标连通性".to_string());
+    lines.extend(render_snat_egress_section(&report.snat));
+
+    lines.push("5. 目标连通性".to_string());
     lines.push(format!(
         "- 目标 TCP：{}",
         target_tcp_label(report.rule, report.target_tcp)
@@ -6800,7 +6986,7 @@ pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) 
     lines.push(format!("- 目标 UDP：{}", target_udp_label(report.rule)));
     lines.push(String::new());
 
-    lines.push("5. 外部访问测试".to_string());
+    lines.push("6. 外部访问测试".to_string());
     if report.global_enabled && report.rule_enabled {
         lines.push(format!(
             "- 请在另一台机器访问 SERVER_IP:{}",
@@ -6818,8 +7004,8 @@ pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) 
     }
     lines.push(String::new());
 
-    lines.push("6. 结论".to_string());
-    lines.extend(connectivity_conclusion_lines(
+    lines.push("7. 结论".to_string());
+    let mut conclusion = connectivity_conclusion_lines(
         report.rule,
         report.global_enabled,
         report.rule_enabled,
@@ -6827,7 +7013,68 @@ pub(crate) fn render_connectivity_report_lines(report: &ConnectivityReport<'_>) 
         report.last_apply.state,
         &report.nft,
         report.target_tcp,
+    );
+    if let SnatNftCheck::Missing(ip) = &report.snat.nft_snat_to {
+        conclusion.push(format!(
+            "- ⚠️ 已配置 per-rule snat_ip={ip}，但 nft 中未发现 snat to {ip}，请确认已重新 apply。"
+        ));
+    }
+    lines.extend(conclusion);
+    lines
+}
+
+/// 渲染「4. SNAT 出口诊断」段：展示 SNAT 模式 / snat_ip / POSTROUTING 动作 / nft 中
+/// `snat to <ip>` 存在性 / 本机默认出口 / route from snat_ip / curl --interface 出口测试。
+/// 所有探测失败均为软告警，且明确本机侧诊断不替代公网外部入口测试。
+fn render_snat_egress_section(snat: &SnatEgressReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("4. SNAT 出口诊断".to_string());
+    lines.push(format!("- snat 模式：{}", snat.plan.mode_label));
+    lines.push(format!(
+        "- snat_ip：{}",
+        snat.plan.per_rule_snat_ip.as_deref().unwrap_or("default")
     ));
+    lines.push(format!(
+        "- POSTROUTING 动作：{}",
+        snat.plan.postrouting_action
+    ));
+    for note in &snat.plan.notes {
+        lines.push(format!("- 说明：{note}"));
+    }
+    match &snat.nft_snat_to {
+        SnatNftCheck::NoSnatIp => {
+            lines.push(
+                "- nft snat to <ip>：不适用（规则未配置 snat_ip，走全局默认 SNAT）".to_string(),
+            );
+        }
+        SnatNftCheck::Found(ip) => {
+            lines.push(format!("- nft snat to {ip}：found"));
+        }
+        SnatNftCheck::Missing(ip) => {
+            lines.push(format!(
+                "- nft snat to {ip}：not found（可能尚未重新 apply）"
+            ));
+        }
+        SnatNftCheck::Unknown(ip) => {
+            lines.push(format!(
+                "- nft snat to {ip}：unable to parse（nft ruleset 不可读）"
+            ));
+        }
+    }
+    lines.push(format!(
+        "- 系统默认出口 IP：{}",
+        snat.system_egress_ip.as_deref().unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "- route from snat_ip：{}",
+        snat.route_from_snat.label()
+    ));
+    lines.push(format!(
+        "- curl --interface snat_ip：{}",
+        snat.curl_egress.label()
+    ));
+    lines.push("- 提示：以上为本机侧诊断，不能替代从公网外部发起的真实入口访问测试。".to_string());
+    lines.push(String::new());
     lines
 }
 
@@ -9699,6 +9946,58 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
     }
 
     #[test]
+    fn connectivity_report_snat_section_shows_default_for_rule_without_snat_ip() {
+        let rule = sample_testable_rule("93.184.216.34", "tcp");
+        let report = sample_connectivity_report(
+            &rule,
+            true,
+            NatServiceStatus::Active,
+            checked_nft_status(nat_common::forward_test::NftDetectionVerdict::Applied),
+            Some(true),
+        );
+        let lines = render_connectivity_report_lines(&report).join("\n");
+        assert!(lines.contains("4. SNAT 出口诊断"));
+        assert!(lines.contains("- snat_ip：default"));
+        assert!(lines.contains("不适用（规则未配置 snat_ip"));
+        assert!(lines.contains("不能替代从公网外部"));
+        // 默认无 snat_ip，不应产生 per-rule snat_ip 缺失告警。
+        assert!(!conclusion_text(&lines).contains("未发现 snat to"));
+    }
+
+    #[test]
+    fn connectivity_report_warns_when_per_rule_snat_ip_missing_in_nft() {
+        let rule = sample_testable_rule("93.184.216.34", "tcp");
+        let mut report = sample_connectivity_report(
+            &rule,
+            true,
+            NatServiceStatus::Active,
+            checked_nft_status(nat_common::forward_test::NftDetectionVerdict::Applied),
+            Some(true),
+        );
+        report.snat = SnatEgressReport {
+            plan: nat_common::forward_test::snat_plan(
+                Some("198.51.100.20"),
+                "ipv4",
+                "masquerade",
+                "",
+                None,
+            ),
+            nft_snat_to: SnatNftCheck::Missing("198.51.100.20".to_string()),
+            system_egress_ip: Some("203.0.113.1".to_string()),
+            route_from_snat: nat_common::forward_test::EgressProbe::Ok(
+                "from 198.51.100.20 可路由".to_string(),
+            ),
+            curl_egress: nat_common::forward_test::EgressProbe::Warn("curl 不可用".to_string()),
+        };
+        let lines = render_connectivity_report_lines(&report).join("\n");
+        assert!(lines.contains("- snat 模式：per-rule"));
+        assert!(lines.contains("- snat_ip：198.51.100.20"));
+        assert!(lines.contains("nft snat to 198.51.100.20：not found"));
+        assert!(lines.contains("curl --interface snat_ip：warn"));
+        assert!(conclusion_text(&lines).contains("未发现 snat to 198.51.100.20"));
+    }
+
+    #[test]
     fn print_nft_detection_block_smoke() {
         // 仅冒烟：构造 presence + rule + 调用，不 panic 即可（输出走 stdout）。
         let presence = nat_common::forward_test::NftRulePresence {
@@ -9790,11 +10089,23 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             nft,
             target_tcp,
             access_control_note: None,
+            snat: sample_snat_egress_report(),
+        }
+    }
+
+    /// 默认样本：规则无 per-rule snat_ip，全局 masquerade，未触发出口探测。
+    fn sample_snat_egress_report() -> SnatEgressReport {
+        SnatEgressReport {
+            plan: nat_common::forward_test::snat_plan(None, "ipv4", "masquerade", "", None),
+            nft_snat_to: SnatNftCheck::NoSnatIp,
+            system_egress_ip: None,
+            route_from_snat: nat_common::forward_test::EgressProbe::Skipped("test".to_string()),
+            curl_egress: nat_common::forward_test::EgressProbe::Skipped("test".to_string()),
         }
     }
 
     fn conclusion_text(lines: &str) -> &str {
-        lines.split("6. 结论").nth(1).unwrap_or(lines)
+        lines.split("7. 结论").nth(1).unwrap_or(lines)
     }
 
     #[test]
