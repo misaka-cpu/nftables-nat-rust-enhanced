@@ -377,7 +377,8 @@ fn format_rule_core_lines(
         } => {
             let resolved_str = resolved_display(domain, resolved);
             out.push(format!(
-                "{index}) [{status}] type=single sport={sport} target={domain} (resolved={resolved_str}) dport={dport} protocol={protocol} ip_version={ip_version}"
+                "{index}) [{status}] type=single sport={sport} target={domain} (resolved={resolved_str}) dport={dport} protocol={protocol} ip_version={ip_version} snat_ip={}",
+                snat_ip_display(rule)
             ));
         }
         NftCell::Range {
@@ -390,7 +391,8 @@ fn format_rule_core_lines(
         } => {
             let resolved_str = resolved_display(domain, resolved);
             out.push(format!(
-                "{index}) [{status}] type=range sport={port_start}-{port_end} target={domain} (resolved={resolved_str}) dport={port_start}-{port_end} protocol={protocol} ip_version={ip_version}"
+                "{index}) [{status}] type=range sport={port_start}-{port_end} target={domain} (resolved={resolved_str}) dport={port_start}-{port_end} protocol={protocol} ip_version={ip_version} snat_ip={}",
+                snat_ip_display(rule)
             ));
         }
         NftCell::Redirect {
@@ -568,6 +570,8 @@ fn add_single_interactive(path: &str) -> Result<(), io::Error> {
     let dport = parse_port(&prompt("目标端口 dport: ")?)?;
     let protocol = parse_protocol(&prompt("协议 tcp/udp/all [tcp]: ")?)?;
     let ip_version = parse_ip_version(&prompt("IP 版本 ipv4/ipv6/all [ipv4]: ")?)?;
+    print_snat_ip_hint();
+    let snat_ip = parse_optional_snat_ip(&prompt("SNAT 出口 IP snat_ip [留空默认]: ")?)?;
     let comment = parse_optional_comment(&prompt("comment，可为空: ")?);
 
     let conflict_override = match confirm_port_conflict_override_interactive(sport, sport)? {
@@ -594,7 +598,7 @@ fn add_single_interactive(path: &str) -> Result<(), io::Error> {
         domain,
         protocol,
         ip_version,
-        comment,
+        RuleExtras { snat_ip, comment },
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     save_toml_config(path, &config, "rule.add.single")?;
@@ -622,6 +626,8 @@ fn add_range_interactive(path: &str) -> Result<(), io::Error> {
     let domain = parse_domain(&prompt("目标地址 domain: ")?)?;
     let protocol = parse_protocol(&prompt("协议 tcp/udp/all [tcp]: ")?)?;
     let ip_version = parse_ip_version(&prompt("IP 版本 ipv4/ipv6/all [ipv4]: ")?)?;
+    print_snat_ip_hint();
+    let snat_ip = parse_optional_snat_ip(&prompt("SNAT 出口 IP snat_ip [留空默认]: ")?)?;
     let comment = parse_optional_comment(&prompt("comment，可为空: ")?);
 
     let conflict_override = match confirm_port_conflict_override_interactive(port_start, port_end)?
@@ -649,7 +655,7 @@ fn add_range_interactive(path: &str) -> Result<(), io::Error> {
         domain,
         protocol,
         ip_version,
-        comment,
+        RuleExtras { snat_ip, comment },
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     save_toml_config(path, &config, "rule.add.range")?;
@@ -968,6 +974,7 @@ pub(crate) struct RuleEditPatch {
     pub dport: Option<u16>,
     pub protocol: Option<Protocol>,
     pub enabled: Option<bool>,
+    pub snat_ip: Option<Option<String>>,
     pub comment: Option<Option<String>>,
 }
 
@@ -978,6 +985,7 @@ impl RuleEditPatch {
             && self.dport.is_none()
             && self.protocol.is_none()
             && self.enabled.is_none()
+            && self.snat_ip.is_none()
             && self.comment.is_none()
     }
 }
@@ -990,6 +998,7 @@ pub(crate) struct RuleEditSnapshot {
     pub dport: String,
     pub protocol: String,
     pub ip_version: String,
+    pub snat_ip: String,
     pub enabled: bool,
     pub comment: Option<String>,
 }
@@ -1249,6 +1258,30 @@ fn prompt_rule_edit_patch(rule: &NftCell) -> Result<Option<RuleEditPatch>, io::E
         None => return Ok(None),
     }
 
+    println!("当前 SNAT IP：{}", snapshot.snat_ip);
+    match rule {
+        NftCell::Single { .. } | NftCell::Range { .. } => {
+            print_snat_ip_hint();
+            match prompt_rule_edit_yes_no("是否修改？[y/N] ")? {
+                Some(true) => {
+                    let Some(raw) =
+                        prompt_rule_edit_line("新的 SNAT 出口 IP snat_ip（留空清空/默认）: ")?
+                    else {
+                        return Ok(None);
+                    };
+                    let snat_ip = parse_optional_snat_ip(&raw)?;
+                    patch.snat_ip = Some(snat_ip);
+                }
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
+        NftCell::Redirect { .. } => {
+            println!("redirect 本机重定向规则不生成转发 SNAT，snat_ip 不适用。");
+        }
+        NftCell::Drop { .. } => {}
+    }
+
     println!(
         "当前备注：{}",
         snapshot.comment.as_deref().unwrap_or("(无)")
@@ -1458,6 +1491,7 @@ pub(crate) fn build_edited_rule(
             dport,
             domain,
             protocol,
+            snat_ip,
             comment,
             ..
         } => {
@@ -1479,6 +1513,9 @@ pub(crate) fn build_edited_rule(
             if let Some(next) = patch.protocol {
                 *protocol = next;
             }
+            if let Some(next) = &patch.snat_ip {
+                *snat_ip = next.clone();
+            }
             if let Some(next) = &patch.comment {
                 *comment = next.clone();
             }
@@ -1489,6 +1526,7 @@ pub(crate) fn build_edited_rule(
             port_end,
             domain,
             protocol,
+            snat_ip,
             comment,
             ..
         } => {
@@ -1513,6 +1551,9 @@ pub(crate) fn build_edited_rule(
             }
             if let Some(next) = patch.protocol {
                 *protocol = next;
+            }
+            if let Some(next) = &patch.snat_ip {
+                *snat_ip = next.clone();
             }
             if let Some(next) = &patch.comment {
                 *comment = next.clone();
@@ -1608,6 +1649,9 @@ pub(crate) fn changed_fields(old: &NftCell, new: &NftCell) -> Vec<String> {
     if old.enabled != new.enabled {
         changed.push("enabled".to_string());
     }
+    if old.snat_ip != new.snat_ip {
+        changed.push("snat_ip".to_string());
+    }
     if old.comment != new.comment {
         changed.push("comment".to_string());
     }
@@ -1627,6 +1671,7 @@ pub(crate) fn render_rule_edit_summary(rule: &NftCell) -> Vec<String> {
         format!("dport: {}", s.dport),
         format!("protocol: {}", s.protocol),
         format!("ip_version: {}", s.ip_version),
+        format!("snat_ip: {}", s.snat_ip),
         format!("comment: {}", s.comment.as_deref().unwrap_or("(无)")),
     ]
 }
@@ -1660,7 +1705,7 @@ fn render_rule_edit_unsupported_lines(rule: &NftCell) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push("该字段当前不支持在编辑器中修改：ip_version，请通过重新添加规则处理。".to_string());
     lines.push(
-        "该字段当前不支持在编辑器中修改：quota / access_control / egress_control / SNAT / MSS 高级字段，请通过对应专用菜单处理。"
+        "该字段当前不支持在编辑器中修改：quota / access_control / egress_control / MSS 高级字段，请通过对应专用菜单处理。"
             .to_string(),
     );
     match rule {
@@ -1694,6 +1739,7 @@ pub(crate) fn rule_edit_snapshot(rule: &NftCell) -> RuleEditSnapshot {
             dport: dport.to_string(),
             protocol: protocol.to_string(),
             ip_version: ip_version.to_string(),
+            snat_ip: snat_ip_display(rule).to_string(),
             enabled: *enabled,
             comment: comment.clone(),
         },
@@ -1713,6 +1759,7 @@ pub(crate) fn rule_edit_snapshot(rule: &NftCell) -> RuleEditSnapshot {
             dport: format!("{port_start}-{port_end}"),
             protocol: protocol.to_string(),
             ip_version: ip_version.to_string(),
+            snat_ip: snat_ip_display(rule).to_string(),
             enabled: *enabled,
             comment: comment.clone(),
         },
@@ -1734,6 +1781,7 @@ pub(crate) fn rule_edit_snapshot(rule: &NftCell) -> RuleEditSnapshot {
             dport: dst_port.to_string(),
             protocol: protocol.to_string(),
             ip_version: ip_version.to_string(),
+            snat_ip: "-".to_string(),
             enabled: *enabled,
             comment: comment.clone(),
         },
@@ -1746,6 +1794,7 @@ pub(crate) fn rule_edit_snapshot(rule: &NftCell) -> RuleEditSnapshot {
             dport: "-".to_string(),
             protocol: protocol.to_string(),
             ip_version: "-".to_string(),
+            snat_ip: "-".to_string(),
             enabled: true,
             comment: comment.clone(),
         },
@@ -1782,6 +1831,10 @@ pub(crate) fn rule_edit_audit_detail(
     if old_s.enabled != new_s.enabled {
         detail["old_enabled"] = json!(old_s.enabled);
         detail["new_enabled"] = json!(new_s.enabled);
+    }
+    if old_s.snat_ip != new_s.snat_ip {
+        detail["old_snat_ip"] = json!(old_s.snat_ip);
+        detail["new_snat_ip"] = json!(new_s.snat_ip);
     }
     if old_s.comment != new_s.comment {
         detail["old_comment"] = json!(old_s.comment);
@@ -7118,7 +7171,7 @@ pub(crate) fn add_single_rule(
     domain: String,
     protocol: Protocol,
     ip_version: IpVersion,
-    comment: Option<String>,
+    extras: RuleExtras,
 ) -> Result<(), String> {
     let rule = NftCell::Single {
         enabled: true,
@@ -7127,7 +7180,8 @@ pub(crate) fn add_single_rule(
         domain,
         protocol,
         ip_version,
-        comment,
+        snat_ip: extras.snat_ip,
+        comment: extras.comment,
         quota_enabled: false,
         quota_bytes: 0,
         quota_period: nat_common::QuotaPeriod::default(),
@@ -7145,7 +7199,7 @@ pub(crate) fn add_range_rule(
     domain: String,
     protocol: Protocol,
     ip_version: IpVersion,
-    comment: Option<String>,
+    extras: RuleExtras,
 ) -> Result<(), String> {
     let rule = NftCell::Range {
         enabled: true,
@@ -7154,7 +7208,8 @@ pub(crate) fn add_range_rule(
         domain,
         protocol,
         ip_version,
-        comment,
+        snat_ip: extras.snat_ip,
+        comment: extras.comment,
         quota_enabled: false,
         quota_bytes: 0,
         quota_period: nat_common::QuotaPeriod::default(),
@@ -7163,6 +7218,12 @@ pub(crate) fn add_range_rule(
     rule.validate()?;
     config.rules.push(rule);
     Ok(())
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RuleExtras {
+    pub snat_ip: Option<String>,
+    pub comment: Option<String>,
 }
 
 pub(crate) fn delete_rule(config: &mut TomlConfig, index: usize) -> Result<NftCell, String> {
@@ -7342,6 +7403,31 @@ pub(crate) fn parse_ip_version(value: &str) -> Result<IpVersion, io::Error> {
     }
 }
 
+fn print_snat_ip_hint() {
+    println!("SNAT IP:");
+    println!("  留空 = 使用全局/默认 SNAT");
+    println!("  填写 = 该规则转发流量固定 SNAT 到指定 IPv4");
+}
+
+pub(crate) fn parse_optional_snat_ip(value: &str) -> Result<Option<String>, io::Error> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value != value.trim() || value.contains(char::is_whitespace) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("snat_ip 必须是合法 IPv4 地址，收到: {value}"),
+        ));
+    }
+    match value.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => Ok(Some(value.to_string())),
+        Ok(IpAddr::V6(_)) | Err(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("snat_ip 必须是合法 IPv4 地址，收到: {value}"),
+        )),
+    }
+}
+
 fn parse_optional_comment(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -7368,7 +7454,8 @@ pub(crate) fn format_rule(rule: &NftCell) -> String {
             comment,
             ..
         } => format!(
-            "{sport} -> {domain}:{dport}/{protocol}{}",
+            "{sport} -> {domain}:{dport}/{protocol} snat_ip={}{}",
+            snat_ip_display(rule),
             format_comment(comment)
         ),
         NftCell::Range {
@@ -7379,7 +7466,8 @@ pub(crate) fn format_rule(rule: &NftCell) -> String {
             comment,
             ..
         } => format!(
-            "{port_start}-{port_end} -> {domain}:{port_start}-{port_end}/{protocol}{}",
+            "{port_start}-{port_end} -> {domain}:{port_start}-{port_end}/{protocol} snat_ip={}{}",
+            snat_ip_display(rule),
             format_comment(comment)
         ),
         NftCell::Redirect {
@@ -7408,6 +7496,10 @@ fn rule_status(rule: &NftCell) -> &'static str {
     if rule.enabled() { "启用" } else { "禁用" }
 }
 
+fn snat_ip_display(rule: &NftCell) -> &str {
+    rule.snat_ip().unwrap_or("default")
+}
+
 fn format_rule_details(rule: &NftCell) -> String {
     match rule {
         NftCell::Single {
@@ -7419,8 +7511,9 @@ fn format_rule_details(rule: &NftCell) -> String {
             comment,
             ..
         } => format!(
-            "comment: {}\nsport: {sport}\ntarget: {domain}\ndport: {dport}\nprotocol: {protocol}\nip_version: {ip_version}",
-            comment.as_deref().unwrap_or("(无)")
+            "comment: {}\nsport: {sport}\ntarget: {domain}\ndport: {dport}\nprotocol: {protocol}\nip_version: {ip_version}\nsnat_ip: {}",
+            comment.as_deref().unwrap_or("(无)"),
+            snat_ip_display(rule)
         ),
         NftCell::Range {
             port_start,
@@ -7431,8 +7524,9 @@ fn format_rule_details(rule: &NftCell) -> String {
             comment,
             ..
         } => format!(
-            "comment: {}\nsport: {port_start}-{port_end}\ntarget: {domain}\ndport: {port_start}-{port_end}\nprotocol: {protocol}\nip_version: {ip_version}",
-            comment.as_deref().unwrap_or("(无)")
+            "comment: {}\nsport: {port_start}-{port_end}\ntarget: {domain}\ndport: {port_start}-{port_end}\nprotocol: {protocol}\nip_version: {ip_version}\nsnat_ip: {}",
+            comment.as_deref().unwrap_or("(无)"),
+            snat_ip_display(rule)
         ),
         NftCell::Redirect {
             src_port,
@@ -7527,11 +7621,40 @@ mod tests {
             "example.com".to_string(),
             Protocol::Tcp,
             IpVersion::V4,
-            Some("user-comment".to_string()),
+            RuleExtras {
+                snat_ip: None,
+                comment: Some("user-comment".to_string()),
+            },
         )
         .unwrap();
         assert_eq!(config.rules.len(), 1);
         assert!(matches!(config.rules[0], NftCell::Single { .. }));
+    }
+
+    #[test]
+    fn add_single_rule_persists_snat_ip() {
+        let mut config = TomlConfig::default();
+        add_single_rule(
+            &mut config,
+            30080,
+            80,
+            "example.com".to_string(),
+            Protocol::Tcp,
+            IpVersion::V4,
+            RuleExtras {
+                snat_ip: Some("198.51.100.20".to_string()),
+                comment: Some("user-comment".to_string()),
+            },
+        )
+        .unwrap();
+        match &config.rules[0] {
+            NftCell::Single { snat_ip, .. } => {
+                assert_eq!(snat_ip.as_deref(), Some("198.51.100.20"));
+            }
+            other => panic!("expected single rule, got {other:?}"),
+        }
+        let serialized = config.to_toml_string().unwrap();
+        assert!(serialized.contains("snat_ip = \"198.51.100.20\""));
     }
 
     #[test]
@@ -7561,7 +7684,10 @@ mod tests {
             "1.2.3.4".to_string(),
             Protocol::Tcp,
             IpVersion::V4,
-            Some("range-test".to_string()),
+            RuleExtras {
+                snat_ip: None,
+                comment: Some("range-test".to_string()),
+            },
         )
         .unwrap();
         assert_eq!(config.rules.len(), 1);
@@ -7586,6 +7712,7 @@ mod tests {
             domain: target.to_string(),
             protocol,
             ip_version: IpVersion::V4,
+            snat_ip: None,
             comment: Some("demo".to_string()),
             quota_enabled: false,
             quota_bytes: 0,
@@ -7602,6 +7729,7 @@ mod tests {
             domain: "range.example.com".to_string(),
             protocol,
             ip_version: IpVersion::V4,
+            snat_ip: None,
             comment: Some("range".to_string()),
             quota_enabled: false,
             quota_bytes: 0,
@@ -7676,7 +7804,7 @@ udp   UNCONN 0      0      0.0.0.0:30080      0.0.0.0:*     users:(("dnsmasq",pi
                     "example.com".to_string(),
                     Protocol::Tcp,
                     IpVersion::V4,
-                    None,
+                    RuleExtras::default(),
                 )
                 .unwrap();
                 assert_eq!(override_conflicts, conflicts);
@@ -7731,7 +7859,7 @@ file = "{}"
                 "example.com".to_string(),
                 Protocol::Tcp,
                 IpVersion::V4,
-                None,
+                RuleExtras::default(),
             )
             .unwrap();
         }
@@ -8349,6 +8477,27 @@ domain = "a.example.com"
         assert!(validate_access_entry("192.0.2.1").is_ok());
         assert!(validate_access_entry("2001:db8::/64").is_ok());
         assert!(validate_access_entry("example.com").is_err());
+    }
+
+    #[test]
+    fn validates_optional_snat_ip_input() {
+        assert_eq!(parse_optional_snat_ip("").unwrap(), None);
+        assert_eq!(
+            parse_optional_snat_ip("198.51.100.20").unwrap(),
+            Some("198.51.100.20".to_string())
+        );
+        for value in [
+            "example.com",
+            "1.2.3.4/32",
+            "2001:db8::1",
+            "1.2.3.4:443",
+            "1.2.3.4 ",
+        ] {
+            assert!(
+                parse_optional_snat_ip(value).is_err(),
+                "expected invalid snat_ip input: {value}"
+            );
+        }
     }
 
     #[test]
@@ -10067,6 +10216,7 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             domain: target.to_string(),
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
+            snat_ip: None,
             comment: Some("demo".to_string()),
             quota_enabled: false,
             quota_bytes: 0,

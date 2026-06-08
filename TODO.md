@@ -2,7 +2,7 @@
 
 本文件记录在历次「稳定版架构体检」中被识别、但本轮不修复的低优先级改进项。
 
-> 当前稳定版本 v0.8.8 是编辑现有转发规则的 CLI 功能发布；v0.8.7 是 disabled 规则在前时 Stats/quota rule_id 对齐的 bugfix 发布；v0.8.6 是全局转发开关、SSH 来源检测提示和来源策略摘要增强发布；v0.8.5 是 CLI 观测与安全提示增强发布；v0.8.0 是 dynamic_whitelist 功能版本。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
+> 当前稳定版本 v0.8.9 是 per-rule `snat_ip` 双出口维护功能发布；v0.8.8 是编辑现有转发规则的 CLI 功能发布；v0.8.7 是 disabled 规则在前时 Stats/quota rule_id 对齐的 bugfix 发布；v0.8.6 是全局转发开关、SSH 来源检测提示和来源策略摘要增强发布；v0.8.5 是 CLI 观测与安全提示增强发布；v0.8.0 是 dynamic_whitelist 功能版本。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
 > 真正会动结构的改造请挪到独立 minor 版本规划，并先在本文件提案。
 
 不属于本文件的内容：
@@ -122,6 +122,12 @@
 - **安全写入与审计**：保存走 `safe_write_config`，reason / action 使用 `rule.edit`；本机端口占用 override 写 `rule.edit.port_conflict.override`。
 - **冲突与缓存边界**：编辑入口端口或协议时检查本机监听端口和规则冲突，排除自身；target / sport / dport / protocol 变化后按现有 last-good prune 机制清理 stale cache。
 - **未改动**：nft 规则生成核心、safe apply、access_control / dynamic_whitelist / GeoIP / egress_control 组合策略、Stats / quota rule_id 对齐逻辑、install.sh / setup.sh。
+
+### v0.8.9
+
+- **规则级 SNAT 出口 IP**：`single` / `range` 转发规则新增可选 `snat_ip`，为空时保持旧 SNAT 行为；填写 IPv4 literal 时仅该条规则 POSTROUTING 使用 `snat to <snat_ip>`。
+- **CLI 与校验**：添加 / 编辑 / 查看规则支持 `snat_ip`，配置校验拒绝域名、CIDR、IPv6、带端口或带空格值；不强制检查 IP 是否存在于本机网卡。
+- **边界**：不改 DNAT、监听端口、rule_id、disabled 过滤、enabled 顺序、系统默认路由或 `ip route` / `ip rule`；未新增 WebUI、数据库、Bot 面板或白名单功能。
 
 ---
 

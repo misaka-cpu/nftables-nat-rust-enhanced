@@ -340,6 +340,7 @@ dport = 443            # 目标端口
 domain = "example.com" # 目标域名或 IP
 protocol = "all"       # all, tcp 或 udp
 ip_version = "ipv4"    # ipv4, ipv6 或 all
+snat_ip = ""           # 可选：留空使用默认 SNAT；IPv4 规则填写后仅该规则固定 SNAT 到该 IP
 comment = "HTTPS 转发"
 
 # 端口段转发示例
@@ -350,6 +351,7 @@ port_end = 20100        # 结束端口
 domain = "example.com"
 protocol = "tcp"
 ip_version = "all"    # 同时支持 IPv4 和 IPv6
+snat_ip = ""          # 可选：留空使用默认 SNAT；IPv4 规则填写后仅该规则固定 SNAT 到该 IP
 comment = "端口段转发"
 
 # 单端口重定向示例

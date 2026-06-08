@@ -10,14 +10,14 @@
 - 支持单端口 / 端口段 / IPv4 / IPv6 / TCP / UDP / all
 - 支持全局转发开关、Stats、quota、audit log、Telegram、last-good、dynamic_whitelist
 
-当前稳定版本：**v0.8.8**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
+当前稳定版本：**v0.8.9**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
 
 ## 快速安装
 
 推荐安装并进入 CLI 菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.8 --enter-menu
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.9 --enter-menu
 ```
 
 安装完成后会安装 `/usr/local/bin/nat` 与 `nat.service`，保留或创建 `/etc/nat.toml`，并启动服务。
@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 ```bash
 nat --menu
 nat --version
-# nat v0.8.8
+# nat v0.8.9
 systemctl status nat --no-pager -l
 ```
 
@@ -38,13 +38,13 @@ systemctl status nat --no-pager -l
 安装但不自动进入菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.8
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.9
 ```
 
 更新到指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.8
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.9
 ```
 
 推荐系统：Debian 11 / 12、Ubuntu 20.04 / 22.04 / 24.04。轻量安装依赖：
@@ -65,10 +65,10 @@ tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nfta
 
 ### 1. 使用自建 mirror
 
-mirror 需要按 `MIRROR_BASE/VERSION/ASSET` 存放 release asset，例如 `https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.8/nftables-nat-rust-enhanced-linux-amd64.tar.gz`。
+mirror 需要按 `MIRROR_BASE/VERSION/ASSET` 存放 release asset，例如 `https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.9/nftables-nat-rust-enhanced-linux-amd64.tar.gz`。
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.8 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced
+bash install.sh --core-only --use-release --version v0.8.9 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced
 ```
 
 `--mirror-base` 只在下载 release asset 时生效；mirror asset 下载失败时会明确报错并 fallback 到 GitHub Release。不要使用不可信第三方镜像，mirror 属于供应链敏感路径。
@@ -157,6 +157,7 @@ dport = 80
 domain = "example.com"
 protocol = "tcp"
 ip_version = "ipv4"
+snat_ip = ""
 comment = "example-http"
 enabled = true
 
@@ -266,7 +267,7 @@ CLI 兼容旧版 `/etc/nat.conf` 读取逻辑。
 
 ```text
 ====================================
-nft-nat-rust v0.8.8
+nft-nat-rust v0.8.9
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
@@ -536,6 +537,24 @@ fixed_source_ip = "10.100.0.10"
 
 历史版本的 `nat_local_ip` / `nat_local_ipv6` 环境变量仅在 `mode = "masquerade"` 时作为兼容兜底；推荐新配置直接用 `snat.mode = "fixed"`。
 
+### 双 IP 出口：本机默认 HKT，转发 SNAT RFC
+
+本工具不会修改系统默认路由，不会改 `ip route` / `ip rule`。系统默认出口由用户自行设置，例如本机 `curl`、ddns-go、bot 继续走 HKT IP；本工具只控制本项目转发流量的 nftables SNAT。
+
+需要让某条转发规则固定走 RFC 出口时，在 IPv4 转发规则里填写 `snat_ip = "RFC_IP"`；没填 `snat_ip` 的旧规则行为不变，继续使用全局 `snat.mode` / `fixed_source_ip` / legacy env 的旧逻辑。`snat_ip` 必须是本机可用且已分配的 IPv4 地址，不支持域名、CIDR、端口或 IPv6。错误配置可能导致转发断流或无法回包，建议先单条规则测试。
+
+```toml
+[[rules]]
+type = "single"
+sport = 30001
+dport = 443
+domain = "落地机IP"
+protocol = "all"
+ip_version = "ipv4"
+enabled = true
+snat_ip = "RFC_IP"
+```
+
 ### MSS clamp
 
 `mss_clamp` 在转发链路上对 TCP SYN 包写入 `tcp option maxseg size set <size>`，缓解多跳 / 隧道 / MTU 异常场景下的测速异常、网页卡顿、TLS 握手卡死。
@@ -785,7 +804,7 @@ bash install.sh --core-only --build-from-source
 指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.8
+bash install.sh --core-only --use-release --version v0.8.9
 bash install.sh --core-only --build-from-source
 ```
 
@@ -839,7 +858,13 @@ apt update && apt install -y git curl wget ca-certificates build-essential pkg-c
 
 ## 版本说明
 
-### v0.8.8（当前稳定版）
+### v0.8.9（当前稳定版）
+
+- add optional per-rule `snat_ip` for dual-egress forwarding scenarios
+- `snat_ip` 为空或未配置时保持旧规则行为不变；配置 IPv4 literal 时仅该条转发规则的 POSTROUTING 使用 `snat to <snat_ip>`
+- CLI 添加 / 编辑 / 查看规则支持 `snat_ip`；配置校验拒绝域名、CIDR、IPv6、带端口或带空格的值
+
+### v0.8.8
 
 - 新增 CLI「编辑现有转发规则」入口，可修改入口端口 / 端口段、目标地址、目标端口、协议、启用状态和备注。
 - 编辑保存统一走 `safe_write_config`、配置备份和 `rule.edit` audit；修改入口端口或协议时会做本机端口占用检测和规则冲突检测。

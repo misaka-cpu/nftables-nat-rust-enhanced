@@ -1610,6 +1610,7 @@ refresh_interval_seconds = 123
             domain: "198.19.184.4".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: Some("fake-ip-test".to_string()),
             quota_enabled: false,
             quota_bytes: 0,
@@ -1644,6 +1645,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -1680,6 +1682,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -1719,6 +1722,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -1773,6 +1777,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -1944,6 +1949,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -1980,6 +1986,7 @@ refresh_interval_seconds = 123
             domain: "2001:db8::1".to_string(),
             protocol: nat_common::Protocol::All,
             ip_version: nat_common::IpVersion::V6,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2033,6 +2040,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2071,6 +2079,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2117,6 +2126,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2168,6 +2178,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2283,6 +2294,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2344,6 +2356,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2400,6 +2413,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2440,6 +2454,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2488,6 +2503,7 @@ refresh_interval_seconds = 123
             domain: "8.8.8.8".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2520,6 +2536,7 @@ refresh_interval_seconds = 123
             domain: "8.8.8.8".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2560,6 +2577,7 @@ refresh_interval_seconds = 123
                 domain: "8.8.8.8".to_string(),
                 protocol: nat_common::Protocol::Tcp,
                 ip_version: nat_common::IpVersion::V4,
+                snat_ip: None,
                 comment: None,
                 quota_enabled: false,
                 quota_bytes: 0,
@@ -2573,6 +2591,7 @@ refresh_interval_seconds = 123
                 domain: "10.100.0.10".to_string(),
                 protocol: nat_common::Protocol::Tcp,
                 ip_version: nat_common::IpVersion::V4,
+                snat_ip: None,
                 comment: None,
                 quota_enabled: false,
                 quota_bytes: 0,
@@ -2616,6 +2635,7 @@ refresh_interval_seconds = 123
             domain: "172.31.8.5".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2654,6 +2674,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2701,6 +2722,7 @@ refresh_interval_seconds = 123
             domain: "10.100.0.10".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2925,6 +2947,10 @@ refresh_interval_seconds = 123
     }
 
     fn single_forward_cell() -> Vec<config::RuntimeCell> {
+        single_forward_cell_with_snat(None)
+    }
+
+    fn single_forward_cell_with_snat(snat_ip: Option<&str>) -> Vec<config::RuntimeCell> {
         vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
             enabled: true,
             sport: 30080,
@@ -2932,6 +2958,7 @@ refresh_interval_seconds = 123
             domain: "93.184.216.34".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: snat_ip.map(str::to_string),
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2986,6 +3013,90 @@ refresh_interval_seconds = 123
         .unwrap();
         assert!(script.contains("counter snat to 10.100.0.10 comment"));
         assert!(!script.contains("counter masquerade comment"));
+    }
+
+    #[test]
+    fn per_rule_snat_ip_overrides_global_fixed_ip() {
+        unsafe { std::env::remove_var("nat_local_ip") };
+        let snat = SnatConfig {
+            mode: nat_common::SnatMode::Fixed,
+            fixed_source_ip: "10.100.0.10".to_string(),
+        };
+        let script = build_new_script(
+            &single_forward_cell_with_snat(Some("198.51.100.20")),
+            &DnsConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &snat,
+            &MssClampConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap();
+        assert!(script.contains("counter snat to 198.51.100.20 comment"));
+        assert!(!script.contains("counter snat to 10.100.0.10 comment"));
+    }
+
+    #[test]
+    fn mixed_rules_keep_independent_snat_actions() {
+        unsafe { std::env::remove_var("nat_local_ip") };
+        let cells = vec![
+            config::RuntimeCell::Rule(nat_common::NftCell::Single {
+                enabled: true,
+                sport: 30080,
+                dport: 80,
+                domain: "93.184.216.34".to_string(),
+                protocol: nat_common::Protocol::Tcp,
+                ip_version: nat_common::IpVersion::V4,
+                snat_ip: None,
+                comment: None,
+                quota_enabled: false,
+                quota_bytes: 0,
+                quota_period: nat_common::QuotaPeriod::default(),
+                quota_action: nat_common::QuotaAction::default(),
+            }),
+            config::RuntimeCell::Rule(nat_common::NftCell::Single {
+                enabled: true,
+                sport: 30081,
+                dport: 81,
+                domain: "93.184.216.35".to_string(),
+                protocol: nat_common::Protocol::Tcp,
+                ip_version: nat_common::IpVersion::V4,
+                snat_ip: Some("198.51.100.20".to_string()),
+                comment: None,
+                quota_enabled: false,
+                quota_bytes: 0,
+                quota_period: nat_common::QuotaPeriod::default(),
+                quota_action: nat_common::QuotaAction::default(),
+            }),
+        ];
+        let snat = SnatConfig {
+            mode: nat_common::SnatMode::Fixed,
+            fixed_source_ip: "10.100.0.10".to_string(),
+        };
+        let script = build_new_script(
+            &cells,
+            &DnsConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &snat,
+            &MssClampConfig::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap();
+        assert!(
+            script.contains("ip daddr 93.184.216.34 tcp dport 80 counter snat to 10.100.0.10"),
+            "rule without snat_ip should use global fixed SNAT: {script}"
+        );
+        assert!(
+            script.contains("ip daddr 93.184.216.35 tcp dport 81 counter snat to 198.51.100.20"),
+            "rule with snat_ip should use per-rule SNAT: {script}"
+        );
     }
 
     #[test]
@@ -3077,6 +3188,7 @@ refresh_interval_seconds = 123
             domain: "8.8.8.8".to_string(),
             protocol: nat_common::Protocol::Udp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -3112,6 +3224,7 @@ refresh_interval_seconds = 123
             domain: "localhost".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -3191,6 +3304,7 @@ refresh_interval_seconds = 123
             domain: "2001:db8::1".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V6,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -3235,6 +3349,7 @@ refresh_interval_seconds = 123
                 domain: "10.100.0.10".to_string(),
                 protocol: nat_common::Protocol::Tcp,
                 ip_version: nat_common::IpVersion::V4,
+                snat_ip: None,
                 comment: None,
                 quota_enabled: false,
                 quota_bytes: 0,
@@ -3248,6 +3363,7 @@ refresh_interval_seconds = 123
                 domain: "10.100.0.10".to_string(),
                 protocol: nat_common::Protocol::All,
                 ip_version: nat_common::IpVersion::V4,
+                snat_ip: None,
                 comment: None,
                 quota_enabled: false,
                 quota_bytes: 0,
@@ -3288,6 +3404,7 @@ refresh_interval_seconds = 123
             domain: "8.8.8.8".to_string(),
             protocol: nat_common::Protocol::Udp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -3329,6 +3446,7 @@ refresh_interval_seconds = 123
             domain: "10.100.0.10".to_string(),
             protocol: nat_common::Protocol::All,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -3382,6 +3500,7 @@ refresh_interval_seconds = 123
                 domain: "10.100.0.10".to_string(),
                 protocol: nat_common::Protocol::Tcp,
                 ip_version: nat_common::IpVersion::V4,
+                snat_ip: None,
                 comment: None,
                 quota_enabled: false,
                 quota_bytes: 0,
@@ -3395,6 +3514,7 @@ refresh_interval_seconds = 123
                 domain: "10.100.0.10".to_string(),
                 protocol: nat_common::Protocol::Tcp,
                 ip_version: nat_common::IpVersion::V4,
+                snat_ip: None,
                 comment: None,
                 quota_enabled: false,
                 quota_bytes: 0,
@@ -3470,6 +3590,7 @@ refresh_interval_seconds = 123
             domain: "invalid domain".to_string(),
             protocol: nat_common::Protocol::Tcp,
             ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
             comment: Some("dns-fail-test".to_string()),
             quota_enabled: false,
             quota_bytes: 0,

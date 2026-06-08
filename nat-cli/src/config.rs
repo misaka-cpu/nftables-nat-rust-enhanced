@@ -443,7 +443,11 @@ pub(crate) fn resolve_snat_action(
     snat_config: &SnatConfig,
     ip_version: &IpVersion,
     legacy_env_var: &str,
+    rule_snat_ip: Option<&str>,
 ) -> Option<String> {
+    if let (IpVersion::V4, Some(ip)) = (ip_version, rule_snat_ip) {
+        return Some(format!("snat to {ip}"));
+    }
     match snat_config.mode {
         SnatMode::Off => None,
         SnatMode::Fixed => {
@@ -484,7 +488,7 @@ fn build_nat_rules(
         }
     };
 
-    let snat_action = resolve_snat_action(snat_config, ip_version, env_var);
+    let snat_action = resolve_snat_action(snat_config, ip_version, env_var, cell.snat_ip());
 
     match cell {
         NftCell::Range {
@@ -922,6 +926,7 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
                 domain: "baidu.com".to_string(),
                 protocol: Protocol::All,
                 ip_version: IpVersion::V4,
+                snat_ip: Some(String::new()),
                 comment: Some("百度HTTPS服务转发示例".to_string()),
                 quota_enabled: false,
                 quota_bytes: 0,
@@ -935,6 +940,7 @@ pub fn toml_example(conf: &str) -> Result<(), io::Error> {
                 domain: "baidu.com".to_string(),
                 protocol: Protocol::Tcp,
                 ip_version: IpVersion::V4,
+                snat_ip: Some(String::new()),
                 comment: Some("端口范围转发示例".to_string()),
                 quota_enabled: false,
                 quota_bytes: 0,
@@ -1131,6 +1137,7 @@ mod redirect_build_tests {
             domain: "93.184.216.34".to_string(),
             protocol: Protocol::All,
             ip_version: IpVersion::V4,
+            snat_ip: None,
             comment: Some(long_comment.clone()),
             quota_enabled: false,
             quota_bytes: 0,

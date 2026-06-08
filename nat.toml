@@ -8,6 +8,7 @@ dport = 443
 domain = "toutiao.com"
 protocol = "all"
 ip_version = "all"
+snat_ip = ""
 
 [[rules]]
 type = "single"

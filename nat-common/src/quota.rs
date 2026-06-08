@@ -335,6 +335,7 @@ mod tests {
             domain: "example.com".to_string(),
             protocol: Protocol::Tcp,
             ip_version: Default::default(),
+            snat_ip: None,
             comment: Some("hk-out".to_string()),
             quota_enabled: true,
             quota_bytes: limit,

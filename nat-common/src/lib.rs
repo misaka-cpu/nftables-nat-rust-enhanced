@@ -1290,6 +1290,8 @@ pub enum NftCell {
         #[serde(default)]
         ip_version: IpVersion,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        snat_ip: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         comment: Option<String>,
         #[serde(default)]
         quota_enabled: bool,
@@ -1314,6 +1316,8 @@ pub enum NftCell {
         protocol: Protocol,
         #[serde(default)]
         ip_version: IpVersion,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snat_ip: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         comment: Option<String>,
         #[serde(default)]
@@ -1505,6 +1509,15 @@ impl NftCell {
             | NftCell::Range { quota_action, .. }
             | NftCell::Redirect { quota_action, .. } => *quota_action,
             NftCell::Drop { .. } => QuotaAction::Disable,
+        }
+    }
+
+    pub fn snat_ip(&self) -> Option<&str> {
+        match self {
+            NftCell::Single { snat_ip, .. } | NftCell::Range { snat_ip, .. } => {
+                snat_ip.as_deref().filter(|value| !value.is_empty())
+            }
+            NftCell::Redirect { .. } | NftCell::Drop { .. } => None,
         }
     }
 
@@ -1842,6 +1855,7 @@ impl TryFrom<&str> for NftCell {
                     quota_bytes: 0,
                     quota_period: QuotaPeriod::default(),
                     quota_action: QuotaAction::default(),
+                    snat_ip: None,
                 })
             }
             "SINGLE" => {
@@ -1860,6 +1874,7 @@ impl TryFrom<&str> for NftCell {
                     quota_bytes: 0,
                     quota_period: QuotaPeriod::default(),
                     quota_action: QuotaAction::default(),
+                    snat_ip: None,
                 })
             }
             "REDIRECT" => {
@@ -1910,6 +1925,8 @@ impl NftCell {
                 sport,
                 dport,
                 domain,
+                ip_version,
+                snat_ip,
                 ..
             } => {
                 if domain.trim().is_empty() {
@@ -1917,11 +1934,14 @@ impl NftCell {
                 }
                 validate_port(*sport)?;
                 validate_port(*dport)?;
+                validate_optional_snat_ip(snat_ip.as_deref(), ip_version, self)?;
             }
             NftCell::Range {
                 port_start,
                 port_end,
                 domain,
+                ip_version,
+                snat_ip,
                 ..
             } => {
                 if domain.trim().is_empty() {
@@ -1935,6 +1955,7 @@ impl NftCell {
                 }
                 validate_port(*port_start)?;
                 validate_port(*port_end)?;
+                validate_optional_snat_ip(snat_ip.as_deref(), ip_version, self)?;
             }
             NftCell::Redirect {
                 src_port,
@@ -2014,6 +2035,60 @@ fn validate_port(port: u16) -> Result<(), String> {
         return Err("端口号不能为0".to_string());
     }
     Ok(())
+}
+
+fn validate_optional_snat_ip(
+    snat_ip: Option<&str>,
+    ip_version: &IpVersion,
+    rule: &NftCell,
+) -> Result<(), String> {
+    let Some(value) = snat_ip else {
+        return Ok(());
+    };
+    if value.is_empty() {
+        return Ok(());
+    }
+    let invalid = || {
+        format!(
+            "invalid snat_ip for rule \"{}\": must be an IPv4 address, got \"{}\"",
+            rule_label(rule),
+            value
+        )
+    };
+    if value != value.trim() || value.contains(char::is_whitespace) {
+        return Err(invalid());
+    }
+    match value.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) if matches!(ip_version, IpVersion::V4) => Ok(()),
+        Ok(IpAddr::V4(_)) => Err(format!(
+            "invalid snat_ip for rule \"{}\": only IPv4 forwarding rules support snat_ip, got ip_version={}",
+            rule_label(rule),
+            ip_version
+        )),
+        Ok(IpAddr::V6(_)) | Err(_) => Err(invalid()),
+    }
+}
+
+fn rule_label(rule: &NftCell) -> String {
+    match rule {
+        NftCell::Single {
+            comment: Some(comment),
+            ..
+        }
+        | NftCell::Range {
+            comment: Some(comment),
+            ..
+        }
+        | NftCell::Redirect {
+            comment: Some(comment),
+            ..
+        }
+        | NftCell::Drop {
+            comment: Some(comment),
+            ..
+        } => comment.clone(),
+        _ => rule.to_string(),
+    }
 }
 
 /// 验证IP地址格式
@@ -2211,6 +2286,7 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             domain: "example.com".to_string(),
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2229,6 +2305,7 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             domain: "".to_string(),
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2247,6 +2324,7 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             domain: "example.com".to_string(),
             protocol: Protocol::Tcp,
             ip_version: IpVersion::All,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2265,6 +2343,7 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
             domain: "example.com".to_string(),
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
@@ -2295,6 +2374,112 @@ ip_version = "all"
 "#;
         let result = TomlConfig::from_toml_str(toml_str);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rule_snat_ip_defaults_to_none_when_missing() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+[[rules]]
+type = "single"
+sport = 10000
+dport = 443
+domain = "example.com"
+protocol = "tcp"
+ip_version = "ipv4"
+"#,
+        )
+        .unwrap();
+        match &config.rules[0] {
+            NftCell::Single { snat_ip, .. } => assert!(snat_ip.is_none()),
+            other => panic!("expected single rule, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rule_snat_ip_accepts_ipv4_literal_and_persists() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+[[rules]]
+type = "single"
+sport = 10000
+dport = 443
+domain = "example.com"
+protocol = "tcp"
+ip_version = "ipv4"
+snat_ip = "198.51.100.20"
+"#,
+        )
+        .unwrap();
+        match &config.rules[0] {
+            NftCell::Single { snat_ip, .. } => {
+                assert_eq!(snat_ip.as_deref(), Some("198.51.100.20"));
+            }
+            other => panic!("expected single rule, got {other:?}"),
+        }
+        let serialized = config.to_toml_string().unwrap();
+        assert!(serialized.contains("snat_ip = \"198.51.100.20\""));
+        let reparsed = TomlConfig::from_toml_str(&serialized).unwrap();
+        match &reparsed.rules[0] {
+            NftCell::Single { snat_ip, .. } => {
+                assert_eq!(snat_ip.as_deref(), Some("198.51.100.20"));
+            }
+            other => panic!("expected single rule, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rule_snat_ip_rejects_non_ipv4_literals() {
+        for value in [
+            "example.com",
+            "1.2.3.4/32",
+            "2001:db8::1",
+            "1.2.3.4:443",
+            "1.2.3.4 ",
+        ] {
+            let body = format!(
+                r#"
+[[rules]]
+type = "single"
+sport = 10000
+dport = 443
+domain = "example.com"
+protocol = "tcp"
+ip_version = "ipv4"
+comment = "bad-snat"
+snat_ip = "{value}"
+"#
+            );
+            let err = TomlConfig::from_toml_str(&body).unwrap_err();
+            assert!(
+                err.contains("invalid snat_ip for rule \"bad-snat\"")
+                    && err.contains("must be an IPv4 address"),
+                "unexpected error for {value}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_snat_ip_requires_ipv4_rule_version() {
+        let err = TomlConfig::from_toml_str(
+            r#"
+[[rules]]
+type = "single"
+sport = 10000
+dport = 443
+domain = "example.com"
+protocol = "tcp"
+ip_version = "ipv6"
+comment = "ipv6-snat"
+snat_ip = "198.51.100.20"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("invalid snat_ip for rule \"ipv6-snat\"")
+                && err.contains("only IPv4 forwarding rules support snat_ip"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2769,6 +2954,7 @@ quota_action = "disable"
             domain: "example.com".to_string(),
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,

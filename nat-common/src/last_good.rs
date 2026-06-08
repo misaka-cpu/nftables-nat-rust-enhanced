@@ -631,6 +631,7 @@ mod tests {
             domain: domain.to_string(),
             protocol: Protocol::Tcp,
             ip_version: IpVersion::V4,
+            snat_ip: None,
             comment: None,
             quota_enabled: false,
             quota_bytes: 0,
