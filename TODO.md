@@ -2,7 +2,7 @@
 
 本文件记录在历次「稳定版架构体检」中被识别、但本轮不修复的低优先级改进项。
 
-> 当前稳定版本 v0.8.7 是 disabled 规则在前时 Stats/quota rule_id 对齐的 bugfix 发布；v0.8.6 是全局转发开关、SSH 来源检测提示和来源策略摘要增强发布；v0.8.5 是 CLI 观测与安全提示增强发布；v0.8.0 是 dynamic_whitelist 功能版本。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
+> 当前稳定版本 v0.8.8 是编辑现有转发规则的 CLI 功能发布；v0.8.7 是 disabled 规则在前时 Stats/quota rule_id 对齐的 bugfix 发布；v0.8.6 是全局转发开关、SSH 来源检测提示和来源策略摘要增强发布；v0.8.5 是 CLI 观测与安全提示增强发布；v0.8.0 是 dynamic_whitelist 功能版本。后续仍保持 CLI-first / core-only：不恢复 WebUI / nat-console，不引入多用户架构 / 分布式 agent / 数据库存储，不做 DNS 供应商接口。
 > 真正会动结构的改造请挪到独立 minor 版本规划，并先在本文件提案。
 
 不属于本文件的内容：
@@ -115,6 +115,13 @@
 
 - **bugfix**：修复 disabled 规则位于启用规则之前时 Stats / quota 的 `rule_id` 对齐问题。`compute_usages` / `rule_labels_from_config` 改为「启用规则序号」（先 `filter(enabled)` 再编号，与 nft 计数器口径一致）；`QuotaUsage` 新增 `original_index` 供 `apply_disable_actions` 精确写回正确规则。
 - **未改动**：nft 规则生成 / safe apply / access_control、GeoIP、dynamic_whitelist、egress_control、last-good、Telegram 超时；未新增功能。
+
+### v0.8.8
+
+- **编辑现有转发规则**：主菜单新增入口，支持修改入口端口 / 端口段、目标地址、目标端口、协议、启用状态和备注，保留 quota / access_control / last-good 等关联配置。
+- **安全写入与审计**：保存走 `safe_write_config`，reason / action 使用 `rule.edit`；本机端口占用 override 写 `rule.edit.port_conflict.override`。
+- **冲突与缓存边界**：编辑入口端口或协议时检查本机监听端口和规则冲突，排除自身；target / sport / dport / protocol 变化后按现有 last-good prune 机制清理 stale cache。
+- **未改动**：nft 规则生成核心、safe apply、access_control / dynamic_whitelist / GeoIP / egress_control 组合策略、Stats / quota rule_id 对齐逻辑、install.sh / setup.sh。
 
 ---
 

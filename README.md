@@ -10,14 +10,14 @@
 - 支持单端口 / 端口段 / IPv4 / IPv6 / TCP / UDP / all
 - 支持全局转发开关、Stats、quota、audit log、Telegram、last-good、dynamic_whitelist
 
-当前稳定版本：**v0.8.7**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
+当前稳定版本：**v0.8.8**。本项目在 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 基础上增强。
 
 ## 快速安装
 
 推荐安装并进入 CLI 菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.7 --enter-menu
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.8 --enter-menu
 ```
 
 安装完成后会安装 `/usr/local/bin/nat` 与 `nat.service`，保留或创建 `/etc/nat.toml`，并启动服务。
@@ -27,6 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanc
 ```bash
 nat --menu
 nat --version
+# nat v0.8.8
 systemctl status nat --no-pager -l
 ```
 
@@ -37,13 +38,13 @@ systemctl status nat --no-pager -l
 安装但不自动进入菜单：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.7
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --core-only --use-release --version v0.8.8
 ```
 
 更新到指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.7
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/nftables-nat-rust-enhanced/main/install.sh | bash -s -- --update --core-only --use-release --version v0.8.8
 ```
 
 推荐系统：Debian 11 / 12、Ubuntu 20.04 / 22.04 / 24.04。轻量安装依赖：
@@ -64,10 +65,10 @@ tmp="$(mktemp -d)" && cd "$tmp" && curl -fsSL https://github.com/misaka-cpu/nfta
 
 ### 1. 使用自建 mirror
 
-mirror 需要按 `MIRROR_BASE/VERSION/ASSET` 存放 release asset，例如 `https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.7/nftables-nat-rust-enhanced-linux-amd64.tar.gz`。
+mirror 需要按 `MIRROR_BASE/VERSION/ASSET` 存放 release asset，例如 `https://mirror.example.com/nftables-nat-rust-enhanced/v0.8.8/nftables-nat-rust-enhanced-linux-amd64.tar.gz`。
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.7 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced
+bash install.sh --core-only --use-release --version v0.8.8 --mirror-base https://mirror.example.com/nftables-nat-rust-enhanced
 ```
 
 `--mirror-base` 只在下载 release asset 时生效；mirror asset 下载失败时会明确报错并 fallback 到 GitHub Release。不要使用不可信第三方镜像，mirror 属于供应链敏感路径。
@@ -265,28 +266,29 @@ CLI 兼容旧版 `/etc/nat.conf` 读取逻辑。
 
 ```text
 ====================================
-nft-nat-rust v0.8.7
+nft-nat-rust v0.8.8
 ====================================
 1) 查看当前转发规则
 2) 添加单端口转发
 3) 添加端口段转发
-4) 删除转发规则
-5) 启用 / 禁用规则
-6) 查看当前 nft 规则
-7) 查看 Stats 流量统计
-8) 手动刷新 DDNS / 域名目标
-9) 备份当前配置
-10) 从备份恢复配置
-11) 白名单 / 黑名单管理
-12) GeoIP / CN IP 限制
-13) 出口目标限制
-14) 最近来源 IP 观察（手动排查）
-15) BBR / Telegram 状态
-16) 测试转发规则连通性
-17) 一键更新本项目
-18) 卸载 / 清理本项目
-19) 高级网络设置 (SNAT / MSS clamp)
-20) 查看审计日志
+4) 编辑现有转发规则
+5) 删除转发规则
+6) 启用 / 禁用规则
+7) 查看当前 nft 规则
+8) 查看 Stats 流量统计
+9) 手动刷新 DDNS / 域名目标
+10) 备份当前配置
+11) 从备份恢复配置
+12) 白名单 / 黑名单管理
+13) GeoIP / CN IP 限制
+14) 出口目标限制
+15) 最近来源 IP 观察（手动排查）
+16) BBR / Telegram 状态
+17) 测试转发规则连通性
+18) 一键更新本项目
+19) 卸载 / 清理本项目
+20) 高级网络设置 (SNAT / MSS clamp)
+21) 查看审计日志
 0) 退出
 ```
 
@@ -294,6 +296,7 @@ nft-nat-rust v0.8.7
 
 - **查看当前转发规则**：默认展示每条规则的核心字段（index / 状态 / type / sport / target / resolved / dport / protocol / ip_version / access_control / quota / egress），以及一行组合策略摘要和一行 last-good 摘要。页面尾部输入 `d` 展开完整组合策略 + 完整 last-good 状态缓存。
 - **添加单端口 / 端口段转发**：会尽力用 `ss -lntup` 检测入口端口是否已被本机服务占用，发现占用时默认取消，输入 `y` 才继续并写 `port_conflict.override` audit。没有 `ss` 时只 warning，不阻塞，也不会自动安装依赖或 kill 进程。
+- **编辑现有转发规则**：可修改入口端口 / 端口段、目标地址、目标端口、协议、启用状态和备注；保存走 `safe_write_config`、配置备份和 `rule.edit` audit。修改入口端口或协议时会检测本机端口占用，并检查与其它启用规则的入口端口 / 协议 / IP 版本冲突。
 - **白名单 / 黑名单管理**：默认页只显示来源访问控制摘要；可用「查询来源 IP 命中情况」检查某个来源 IP 是否命中当前 `access_control` / `dynamic_whitelist` / GeoIP 来源限制；也可检测当前 SSH 来源 IP，确认后手动加入静态白名单。
 - **测试转发规则连通性**：扫描 `ip/ip6 self-nat / self-filter`，结论分 `已应用` / `部分匹配` / `未确认` / `未应用`；不依赖 counter 非零，不会因检测未确认就自动重启 nat。CLI 默认只展示简短测试提示（`SERVER_IP:入口端口` + 协议提示），详细 `curl` / `nc` / SNI 示例可在测试页面输入 h 查看（按 `protocol` / `target` 分支生成）。`global.enabled=false` 时会直接提示全局转发已关闭，不继续给出误导性的 nft 应用结论。
 - **高级网络设置**：查看 / 设置 SNAT 模式、fixed SNAT 源 IP、MSS clamp、全局转发开关、时间 / NTP 状态检查、查看全局诊断状态（完整组合策略 + 完整 last-good 状态缓存，仅查看不修改）。
@@ -617,7 +620,7 @@ last-good 只是容错机制，不应长期掩盖 DNS 问题；请定期查看 a
 
 配额字节输入格式：纯字节数（如 `107374182400`）、十进制单位（如 `100GB`、`100MB`）；十进制 `KB`/`MB`/`GB`/`TB`（1000 进制）；短缀 `K`/`M`/`G`/`T` 与 `KiB`/`MiB`/`GiB`/`TiB`（1024 进制）。`quota_period = "total"` 的累计字节随当前 `traffic_mode` 累积，切换口径后历史 total 不会自动重算。
 
-CLI 入口：`7) 查看 Stats 流量统计` → `3) 设置规则流量配额` / `4) 查看规则配额状态`。
+CLI 入口：`8) 查看 Stats 流量统计` → `3) 设置规则流量配额` / `4) 查看规则配额状态`。
 
 ```toml
 [quota]
@@ -652,7 +655,7 @@ quota_period = "monthly"
 
 常见事件：`rule.add` / `rule.delete` / `rule.enable` / `rule.disable`、`access_control.update` / `dynamic_whitelist.config.update` / `geoip.update` / `egress_control.update` / `snat.update` / `mss_clamp.update`、`apply.success` / `apply.fail`（带 `script_hash`）、`dns.resolve.fail` / `last_good.used`、`dynamic_whitelist.resolve.success` / `.resolve.fail` / `.change` / `.prune`、`rule.skipped.egress_control`、`update.*` / `uninstall.start` 等。
 
-CLI `20) 查看审计日志` 默认显示最近 50 行格式化日志（按 `[ui].timezone`），子菜单可切换原始 JSON；任何展示路径都会再走 `redact` 兜底。
+CLI `21) 查看审计日志` 默认显示最近 50 行格式化日志（按 `[ui].timezone`），子菜单可切换原始 JSON；任何展示路径都会再走 `redact` 兜底。
 
 audit 内置轻量轮转（v0.6.0 起默认开启，best-effort）：默认 `rotate = true` / `max_size_mb = 10` / `max_backups = 3`；超阈值时滚动 `audit.log → .1 → .2 → .3`，`max_backups = 0` 时只截断当前文件，`rotate = false` 关闭内置轮转交给系统 logrotate。
 
@@ -701,7 +704,7 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
 - `timezone`：合法 IANA 时区名（DST 由 `chrono-tz` 兜底），非法值在校验阶段报错
 - `time_format`：chrono `strftime` 格式串
 
-nft 转发本身不严格依赖系统时间，但 Stats 滚动重置、quota 周期判断、audit 时间戳、last-good 时间、TLS 证书校验建议系统时间准确。CLI 在 `19) 高级网络设置 → 时间 / NTP 状态检查` 提供查看状态、设置 CLI 展示时区、显示修改系统时区命令（只打印不执行）、尝试启用 NTP（需 y/N 确认）等子项；不会 `apt-get install` 任何东西，不会强制改时区。
+nft 转发本身不严格依赖系统时间，但 Stats 滚动重置、quota 周期判断、audit 时间戳、last-good 时间、TLS 证书校验建议系统时间准确。CLI 在 `20) 高级网络设置 → 时间 / NTP 状态检查` 提供查看状态、设置 CLI 展示时区、显示修改系统时区命令（只打印不执行）、尝试启用 NTP（需 y/N 确认）等子项；不会 `apt-get install` 任何东西，不会强制改时区。
 
 ## 典型使用场景
 
@@ -782,7 +785,7 @@ bash install.sh --core-only --build-from-source
 指定版本或回退源码编译：
 
 ```bash
-bash install.sh --core-only --use-release --version v0.8.7
+bash install.sh --core-only --use-release --version v0.8.8
 bash install.sh --core-only --build-from-source
 ```
 
@@ -836,7 +839,14 @@ apt update && apt install -y git curl wget ca-certificates build-essential pkg-c
 
 ## 版本说明
 
-### v0.8.7（当前稳定版）
+### v0.8.8（当前稳定版）
+
+- 新增 CLI「编辑现有转发规则」入口，可修改入口端口 / 端口段、目标地址、目标端口、协议、启用状态和备注。
+- 编辑保存统一走 `safe_write_config`、配置备份和 `rule.edit` audit；修改入口端口或协议时会做本机端口占用检测和规则冲突检测。
+- 编辑 target / sport / dport / protocol 后会按现有 last-good rule_key / prune 机制避免旧缓存误复用；不改 Stats / quota 的 rule_id 对齐策略。
+- 未改动 nft 规则生成核心、safe apply、access_control / dynamic_whitelist / GeoIP / egress_control 组合策略；未新增 WebUI、Bot 面板、省市白名单或分流功能。
+
+### v0.8.7
 
 - 修复 disabled 规则位于启用规则之前时 Stats / quota 的 `rule_id` 对齐问题（与 nft 计数器口径统一为「启用规则序号」）
 

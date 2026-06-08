@@ -17,6 +17,7 @@ use nat_common::{
 };
 use serde_json::json;
 use std::env;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::IpAddr;
@@ -52,20 +53,21 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
             }
             "2" => add_single_interactive(config_path).map_err(Into::into),
             "3" => add_range_interactive(config_path).map_err(Into::into),
-            "4" => delete_rule_interactive(config_path).map_err(Into::into),
-            "5" => {
+            "4" => edit_rule_interactive(config_path).map_err(Into::into),
+            "5" => delete_rule_interactive(config_path).map_err(Into::into),
+            "6" => {
                 should_wait = false;
                 toggle_rule_interactive(config_path).map_err(Into::into)
             }
-            "6" => show_nft_rules().map_err(Into::into),
-            "7" => {
+            "7" => show_nft_rules().map_err(Into::into),
+            "8" => {
                 should_wait = false;
                 stats_menu(config_path).map_err(Into::into)
             }
-            "8" => {
+            "9" => {
                 refresh_ddns_interactive(config_path, &mut last_manual_refresh).map_err(Into::into)
             }
-            "9" => match backup_config(config_path) {
+            "10" => match backup_config(config_path) {
                 Ok(backup) => {
                     audit_cli(
                         config_path,
@@ -78,44 +80,44 @@ pub fn run_menu(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Err
                 }
                 Err(e) => Err(e.into()),
             },
-            "10" => restore_config_interactive(config_path).map_err(Into::into),
-            "11" => {
+            "11" => restore_config_interactive(config_path).map_err(Into::into),
+            "12" => {
                 should_wait = false;
                 access_control_menu(config_path).map_err(Into::into)
             }
-            "12" => {
+            "13" => {
                 should_wait = false;
                 geoip_menu(config_path).map_err(Into::into)
             }
-            "13" => {
+            "14" => {
                 should_wait = false;
                 egress_control_menu(config_path).map_err(Into::into)
             }
-            "14" => {
+            "15" => {
                 show_recent_source_design();
                 Ok(())
             }
-            "15" => {
+            "16" => {
                 should_wait = false;
                 bbr_telegram_menu(config_path).map_err(Into::into)
             }
-            "16" => {
+            "17" => {
                 should_wait = false;
                 test_forward_interactive(config_path).map_err(Into::into)
             }
-            "17" => {
+            "18" => {
                 should_wait = false;
                 update_menu(config_path).map_err(Into::into)
             }
-            "18" => {
+            "19" => {
                 should_wait = false;
                 uninstall_menu(config_path).map_err(Into::into)
             }
-            "19" => {
+            "20" => {
                 should_wait = false;
                 advanced_network_menu(config_path).map_err(Into::into)
             }
-            "20" => {
+            "21" => {
                 // view_audit_log_interactive 内部已经调用一次 wait_enter_to_return；
                 // 主循环再叠加一次会让用户感觉「按 Enter → 空白 → 再按 Enter」。
                 should_wait = false;
@@ -172,23 +174,24 @@ fn print_menu() {
 1) 查看当前转发规则
 2) 添加单端口转发
 3) 添加端口段转发
-4) 删除转发规则
-5) 启用 / 禁用规则
-6) 查看当前 nft 规则
-7) 查看 Stats 流量统计
-8) 手动刷新 DDNS / 域名目标
-9) 备份当前配置
-10) 从备份恢复配置
-11) 白名单 / 黑名单管理
-12) GeoIP / CN IP 限制
-13) 出口目标限制
-14) 最近来源 IP 观察（手动排查）
-15) BBR / Telegram 状态
-16) 测试转发规则连通性
-17) 一键更新本项目
-18) 卸载 / 清理本项目
-19) 高级网络设置 (SNAT / MSS clamp)
-20) 查看审计日志
+4) 编辑现有转发规则
+5) 删除转发规则
+6) 启用 / 禁用规则
+7) 查看当前 nft 规则
+8) 查看 Stats 流量统计
+9) 手动刷新 DDNS / 域名目标
+10) 备份当前配置
+11) 从备份恢复配置
+12) 白名单 / 黑名单管理
+13) GeoIP / CN IP 限制
+14) 出口目标限制
+15) 最近来源 IP 观察（手动排查）
+16) BBR / Telegram 状态
+17) 测试转发规则连通性
+18) 一键更新本项目
+19) 卸载 / 清理本项目
+20) 高级网络设置 (SNAT / MSS clamp)
+21) 查看审计日志
 0) 退出
 ===================================="#,
         title = main_menu_title(),
@@ -915,6 +918,1130 @@ fn audit_port_conflict_override(
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PortRangeSpec {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl PortRangeSpec {
+    pub(crate) fn new(start: u16, end: u16) -> Result<Self, String> {
+        if start == 0 || end == 0 {
+            return Err("端口必须是 1-65535".to_string());
+        }
+        if start > end {
+            return Err(format!("起始端口 {start} 不能大于结束端口 {end}"));
+        }
+        Ok(Self { start, end })
+    }
+
+    fn single(port: u16) -> Self {
+        Self {
+            start: port,
+            end: port,
+        }
+    }
+
+    fn is_single(self) -> bool {
+        self.start == self.end
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+}
+
+impl fmt::Display for PortRangeSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_single() {
+            write!(f, "{}", self.start)
+        } else {
+            write!(f, "{}-{}", self.start, self.end)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RuleEditPatch {
+    pub sport: Option<PortRangeSpec>,
+    pub target: Option<String>,
+    pub dport: Option<u16>,
+    pub protocol: Option<Protocol>,
+    pub enabled: Option<bool>,
+    pub comment: Option<Option<String>>,
+}
+
+impl RuleEditPatch {
+    fn is_empty(&self) -> bool {
+        self.sport.is_none()
+            && self.target.is_none()
+            && self.dport.is_none()
+            && self.protocol.is_none()
+            && self.enabled.is_none()
+            && self.comment.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuleEditSnapshot {
+    pub rule_type: String,
+    pub sport: String,
+    pub target: String,
+    pub dport: String,
+    pub protocol: String,
+    pub ip_version: String,
+    pub enabled: bool,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuleIngress {
+    ports: PortRangeSpec,
+    protocol: Protocol,
+    ip_version: IpVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuleEditConflict {
+    pub other_index: usize,
+    pub edited_ports: PortRangeSpec,
+    pub other_ports: PortRangeSpec,
+    pub edited_protocol: Protocol,
+    pub other_protocol: Protocol,
+    pub edited_ip_version: IpVersion,
+    pub other_ip_version: IpVersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuleEditConfirmation {
+    Save,
+    Cancel,
+}
+
+fn edit_rule_interactive(path: &str) -> Result<(), io::Error> {
+    let mut config = load_toml_config(path)?;
+    if config.rules.is_empty() {
+        println!("当前没有可编辑规则。");
+        return Ok(());
+    }
+
+    println!("当前规则：");
+    for (index, rule) in config.rules.iter().enumerate() {
+        println!(
+            "{}) [{}] {}",
+            index + 1,
+            rule_status(rule),
+            format_rule(rule)
+        );
+    }
+    println!("0) 返回");
+
+    let Some(raw_index) = prompt_rule_edit_line("请选择要编辑的规则编号: ")? else {
+        println!("输入结束，已取消编辑。");
+        return Ok(());
+    };
+    let index = parse_index(&raw_index)?;
+    if index == 0 {
+        println!("已取消编辑。");
+        return Ok(());
+    }
+    let rule_index = index - 1;
+    let Some(original) = config.rules.get(rule_index).cloned() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "规则编号超出范围",
+        ));
+    };
+    if matches!(original, NftCell::Drop { .. }) {
+        println!("Drop 规则当前不支持在编辑器中修改，请通过对应专用菜单或重新添加规则处理。");
+        return Ok(());
+    }
+
+    println!("当前规则完整摘要：");
+    for line in render_rule_edit_summary(&original) {
+        println!("{line}");
+    }
+    for line in render_rule_edit_unsupported_lines(&original) {
+        println!("{line}");
+    }
+
+    let Some(patch) = prompt_rule_edit_patch(&original)? else {
+        println!("已取消编辑，未保存配置。");
+        return Ok(());
+    };
+    if patch.is_empty() {
+        println!("未检测到修改，未保存配置。");
+        return Ok(());
+    }
+
+    let edited = build_edited_rule(&original, &patch)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let changed = changed_fields(&original, &edited);
+    if changed.is_empty() {
+        println!("未检测到修改，未保存配置。");
+        return Ok(());
+    }
+
+    validate_rule_edit_conflicts(&config, rule_index, &edited)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    let conflict_override = if rule_edit_requires_port_conflict_check(&original, &edited) {
+        if let Some(ingress) = rule_ingress(&edited) {
+            match confirm_port_conflict_override_interactive(
+                ingress.ports.start,
+                ingress.ports.end,
+            )? {
+                PortConflictAction::Proceed {
+                    override_conflicts,
+                    warning,
+                } => {
+                    if let Some(warning) = warning {
+                        println!("warning: {warning}");
+                    }
+                    override_conflicts
+                }
+                PortConflictAction::Cancel => {
+                    println!("已取消编辑，未保存配置。");
+                    return Ok(());
+                }
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    println!("修改前 / 修改后摘要：");
+    for line in render_rule_edit_diff_summary(&original, &edited) {
+        println!("{line}");
+    }
+    let Some(confirm) = prompt_rule_edit_line("确认保存本次修改？[y/N] ")? else {
+        println!("输入结束，已取消编辑。");
+        return Ok(());
+    };
+    if rule_edit_confirmation_from_answer(&confirm) != RuleEditConfirmation::Save {
+        println!("已取消编辑，未保存配置。");
+        return Ok(());
+    }
+
+    apply_rule_edit_to_config(&mut config, rule_index, edited.clone())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    if let Err(e) = save_toml_config(path, &config, "rule.edit") {
+        println!("保存失败，旧配置未覆盖: {e}");
+        return Err(e);
+    }
+    if let Some(ingress) = rule_ingress(&edited) {
+        audit_rule_edit_port_conflict_override(
+            path,
+            rule_index,
+            ingress.ports.start,
+            ingress.ports.end,
+            ingress.protocol,
+            &conflict_override,
+        );
+    }
+    audit_cli(
+        path,
+        "rule.edit",
+        AuditResult::Ok,
+        rule_edit_audit_detail(rule_index, &original, &edited),
+    );
+    prune_last_good_cache_after_rule_edit(path, &config);
+
+    println!("已编辑规则。");
+    print_config_saved_hint(path, "rule.edit");
+    for line in rule_edit_post_save_messages(&config, rule_index) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn prompt_rule_edit_patch(rule: &NftCell) -> Result<Option<RuleEditPatch>, io::Error> {
+    let mut patch = RuleEditPatch::default();
+
+    if let Some(current) = editable_sport(rule) {
+        let question = if current.is_single() {
+            format!("当前入口端口：{current}\n是否修改？[y/N] ")
+        } else {
+            format!("当前入口端口段：{current}\n是否修改？[y/N] ")
+        };
+        match prompt_rule_edit_yes_no(&question)? {
+            Some(true) => {
+                let Some(next) = prompt_new_sport(rule)? else {
+                    return Ok(None);
+                };
+                patch.sport = Some(next);
+            }
+            Some(false) => {}
+            None => return Ok(None),
+        }
+    }
+
+    let snapshot = rule_edit_snapshot(rule);
+    println!("当前目标地址：{}", snapshot.target);
+    match rule {
+        NftCell::Single { .. } | NftCell::Range { .. } => {
+            match prompt_rule_edit_yes_no("是否修改？[y/N] ")? {
+                Some(true) => {
+                    let Some(target) = prompt_new_target()? else {
+                        return Ok(None);
+                    };
+                    patch.target = Some(target);
+                }
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
+        NftCell::Redirect { .. } => {
+            println!(
+                "该字段当前不支持在编辑器中修改：redirect 规则目标固定为 localhost，请通过对应专用菜单或重新添加规则处理。"
+            );
+        }
+        NftCell::Drop { .. } => {}
+    }
+
+    println!("当前目标端口：{}", snapshot.dport);
+    match rule {
+        NftCell::Single { .. } | NftCell::Redirect { .. } => {
+            match prompt_rule_edit_yes_no("是否修改？[y/N] ")? {
+                Some(true) => {
+                    let Some(dport) = prompt_new_port("新的目标端口 dport: ")? else {
+                        return Ok(None);
+                    };
+                    patch.dport = Some(dport);
+                }
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
+        NftCell::Range { .. } => {
+            println!(
+                "该字段当前不支持在编辑器中单独修改：端口段规则的目标端口段随入口端口段保持一致，请通过入口端口段修改或重新添加规则处理。"
+            );
+        }
+        NftCell::Drop { .. } => {}
+    }
+
+    println!("当前协议：{}", snapshot.protocol);
+    match prompt_rule_edit_yes_no("是否修改？[y/N] ")? {
+        Some(true) => {
+            let Some(protocol) = prompt_new_protocol()? else {
+                return Ok(None);
+            };
+            patch.protocol = Some(protocol);
+        }
+        Some(false) => {}
+        None => return Ok(None),
+    }
+
+    println!(
+        "当前启用状态：{}",
+        if snapshot.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    match prompt_rule_edit_yes_no("是否切换？[y/N] ")? {
+        Some(true) => patch.enabled = Some(!snapshot.enabled),
+        Some(false) => {}
+        None => return Ok(None),
+    }
+
+    println!(
+        "当前备注：{}",
+        snapshot.comment.as_deref().unwrap_or("(无)")
+    );
+    match prompt_rule_edit_yes_no("是否修改？[y/N] ")? {
+        Some(true) => {
+            let Some(comment) = prompt_rule_edit_line("新的备注 comment（留空表示清空）: ")?
+            else {
+                return Ok(None);
+            };
+            patch.comment = Some(parse_optional_comment(&comment));
+        }
+        Some(false) => {}
+        None => return Ok(None),
+    }
+
+    Ok(Some(patch))
+}
+
+fn prompt_new_sport(rule: &NftCell) -> Result<Option<PortRangeSpec>, io::Error> {
+    loop {
+        let label = match rule {
+            NftCell::Single { .. } => "新的入口端口 sport: ",
+            NftCell::Range { .. } => "新的入口端口段 start-end: ",
+            NftCell::Redirect {
+                src_port_end: Some(_),
+                ..
+            } => "新的入口端口段 start-end: ",
+            NftCell::Redirect { .. } => "新的入口端口 sport: ",
+            NftCell::Drop { .. } => "新的入口端口: ",
+        };
+        let Some(raw) = prompt_rule_edit_line(label)? else {
+            return Ok(None);
+        };
+        let parsed = match parse_port_range_spec(&raw) {
+            Ok(range) => range,
+            Err(e) => {
+                println!("输入无效：{e}");
+                continue;
+            }
+        };
+        match rule {
+            NftCell::Single { .. }
+            | NftCell::Redirect {
+                src_port_end: None, ..
+            } => {
+                if !parsed.is_single() {
+                    println!("输入无效：该规则是单端口规则，请输入单个端口。");
+                    continue;
+                }
+            }
+            NftCell::Range { .. }
+            | NftCell::Redirect {
+                src_port_end: Some(_),
+                ..
+            } => {
+                if parsed.is_single() {
+                    println!("输入无效：该规则是端口段规则，请输入 start-end。");
+                    continue;
+                }
+            }
+            NftCell::Drop { .. } => {}
+        }
+        return Ok(Some(parsed));
+    }
+}
+
+fn prompt_new_target() -> Result<Option<String>, io::Error> {
+    loop {
+        let Some(raw) = prompt_rule_edit_line("新的目标地址 target IP/domain: ")? else {
+            return Ok(None);
+        };
+        match validate_target_address(&raw) {
+            Ok(target) => return Ok(Some(target)),
+            Err(e) => println!("输入无效：{e}"),
+        }
+    }
+}
+
+fn prompt_new_port(label: &str) -> Result<Option<u16>, io::Error> {
+    loop {
+        let Some(raw) = prompt_rule_edit_line(label)? else {
+            return Ok(None);
+        };
+        match parse_port(&raw) {
+            Ok(port) => return Ok(Some(port)),
+            Err(e) => println!("输入无效：{e}"),
+        }
+    }
+}
+
+fn prompt_new_protocol() -> Result<Option<Protocol>, io::Error> {
+    loop {
+        let Some(raw) = prompt_rule_edit_line("新的协议 tcp/udp/all: ")? else {
+            return Ok(None);
+        };
+        match parse_protocol(&raw) {
+            Ok(protocol) => return Ok(Some(protocol)),
+            Err(e) => println!("输入无效：{e}"),
+        }
+    }
+}
+
+fn prompt_rule_edit_yes_no(label: &str) -> Result<Option<bool>, io::Error> {
+    loop {
+        let Some(raw) = prompt_rule_edit_line(label)? else {
+            return Ok(None);
+        };
+        match raw.trim() {
+            "" | "n" | "N" => return Ok(Some(false)),
+            "y" | "Y" => return Ok(Some(true)),
+            "q" | "Q" | "0" => return Ok(None),
+            _ => println!("请输入 y 或 n；输入 q / 0 可取消编辑。"),
+        }
+    }
+}
+
+fn prompt_rule_edit_line(label: &str) -> Result<Option<String>, io::Error> {
+    prompt_result_to_rule_edit_input(prompt(label))
+}
+
+pub(crate) fn prompt_result_to_rule_edit_input(
+    result: Result<String, io::Error>,
+) -> Result<Option<String>, io::Error> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn parse_port_range_spec(value: &str) -> Result<PortRangeSpec, io::Error> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "端口不能为空"));
+    }
+    if let Some((start, end)) = trimmed.split_once('-') {
+        let start = parse_port(start)?;
+        let end = parse_port(end)?;
+        PortRangeSpec::new(start, end).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    } else {
+        Ok(PortRangeSpec::single(parse_port(trimmed)?))
+    }
+}
+
+pub(crate) fn validate_target_address(value: &str) -> Result<String, io::Error> {
+    let target = value.trim();
+    if target.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "目标地址不能为空",
+        ));
+    }
+    if target.parse::<IpAddr>().is_ok() || target.eq_ignore_ascii_case("localhost") {
+        return Ok(target.to_string());
+    }
+    if target.len() > 253
+        || target.contains(char::is_whitespace)
+        || target.contains('/')
+        || target.contains(':')
+        || target.contains('*')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("目标地址不是合法 IP 或域名: {target}"),
+        ));
+    }
+    let without_trailing_dot = target.trim_end_matches('.');
+    if without_trailing_dot.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "目标地址不是合法域名",
+        ));
+    }
+    for label in without_trailing_dot.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("目标域名 label 非法: {target}"),
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("目标域名 label 不能以短横线开头或结尾: {label}"),
+            ));
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("目标域名包含非法字符: {target}"),
+            ));
+        }
+    }
+    Ok(target.to_string())
+}
+
+pub(crate) fn build_edited_rule(
+    original: &NftCell,
+    patch: &RuleEditPatch,
+) -> Result<NftCell, String> {
+    let mut edited = original.clone();
+    match &mut edited {
+        NftCell::Single {
+            enabled,
+            sport,
+            dport,
+            domain,
+            protocol,
+            comment,
+            ..
+        } => {
+            if let Some(next) = patch.enabled {
+                *enabled = next;
+            }
+            if let Some(next) = patch.sport {
+                if !next.is_single() {
+                    return Err("单端口规则不能直接改为端口段；请重新添加端口段规则".to_string());
+                }
+                *sport = next.start;
+            }
+            if let Some(next) = &patch.target {
+                *domain = validate_target_address(next).map_err(|e| e.to_string())?;
+            }
+            if let Some(next) = patch.dport {
+                *dport = next;
+            }
+            if let Some(next) = patch.protocol {
+                *protocol = next;
+            }
+            if let Some(next) = &patch.comment {
+                *comment = next.clone();
+            }
+        }
+        NftCell::Range {
+            enabled,
+            port_start,
+            port_end,
+            domain,
+            protocol,
+            comment,
+            ..
+        } => {
+            if let Some(next) = patch.enabled {
+                *enabled = next;
+            }
+            if let Some(next) = patch.sport {
+                if next.is_single() {
+                    return Err("端口段规则不能直接改为单端口；请重新添加单端口规则".to_string());
+                }
+                *port_start = next.start;
+                *port_end = next.end;
+            }
+            if let Some(next) = &patch.target {
+                *domain = validate_target_address(next).map_err(|e| e.to_string())?;
+            }
+            if patch.dport.is_some() {
+                return Err(
+                    "端口段规则的目标端口段随入口端口段保持一致，当前不支持单独修改 dport"
+                        .to_string(),
+                );
+            }
+            if let Some(next) = patch.protocol {
+                *protocol = next;
+            }
+            if let Some(next) = &patch.comment {
+                *comment = next.clone();
+            }
+        }
+        NftCell::Redirect {
+            enabled,
+            src_port,
+            src_port_end,
+            dst_port,
+            protocol,
+            comment,
+            ..
+        } => {
+            if let Some(next) = patch.enabled {
+                *enabled = next;
+            }
+            if let Some(next) = patch.sport {
+                match src_port_end {
+                    Some(end) => {
+                        if next.is_single() {
+                            return Err(
+                                "redirect 端口段规则不能直接改为单端口；请重新添加规则".to_string()
+                            );
+                        }
+                        *src_port = next.start;
+                        *end = next.end;
+                    }
+                    None => {
+                        if !next.is_single() {
+                            return Err(
+                                "redirect 单端口规则不能直接改为端口段；请重新添加规则".to_string()
+                            );
+                        }
+                        *src_port = next.start;
+                    }
+                }
+            }
+            if patch.target.is_some() {
+                return Err("redirect 规则目标固定为 localhost，当前不支持修改目标地址".to_string());
+            }
+            if let Some(next) = patch.dport {
+                *dst_port = next;
+            }
+            if let Some(next) = patch.protocol {
+                *protocol = next;
+            }
+            if let Some(next) = &patch.comment {
+                *comment = next.clone();
+            }
+        }
+        NftCell::Drop { .. } => {
+            return Err("Drop 规则当前不支持在编辑器中修改".to_string());
+        }
+    }
+    edited.validate()?;
+    Ok(edited)
+}
+
+pub(crate) fn apply_rule_edit_to_config(
+    config: &mut TomlConfig,
+    index: usize,
+    edited: NftCell,
+) -> Result<Vec<String>, String> {
+    if index >= config.rules.len() {
+        return Err("规则编号超出范围".to_string());
+    }
+    edited.validate()?;
+    validate_rule_edit_conflicts(config, index, &edited)?;
+    let changed = changed_fields(&config.rules[index], &edited);
+    if !changed.is_empty() {
+        config.rules[index] = edited;
+    }
+    Ok(changed)
+}
+
+pub(crate) fn changed_fields(old: &NftCell, new: &NftCell) -> Vec<String> {
+    let old = rule_edit_snapshot(old);
+    let new = rule_edit_snapshot(new);
+    let mut changed = Vec::new();
+    if old.sport != new.sport {
+        changed.push("sport".to_string());
+    }
+    if old.target != new.target {
+        changed.push("target".to_string());
+    }
+    if old.dport != new.dport {
+        changed.push("dport".to_string());
+    }
+    if old.protocol != new.protocol {
+        changed.push("protocol".to_string());
+    }
+    if old.enabled != new.enabled {
+        changed.push("enabled".to_string());
+    }
+    if old.comment != new.comment {
+        changed.push("comment".to_string());
+    }
+    changed
+}
+
+pub(crate) fn render_rule_edit_summary(rule: &NftCell) -> Vec<String> {
+    let s = rule_edit_snapshot(rule);
+    vec![
+        format!("type: {}", s.rule_type),
+        format!(
+            "enabled: {}",
+            if s.enabled { "enabled" } else { "disabled" }
+        ),
+        format!("sport: {}", s.sport),
+        format!("target: {}", s.target),
+        format!("dport: {}", s.dport),
+        format!("protocol: {}", s.protocol),
+        format!("ip_version: {}", s.ip_version),
+        format!("comment: {}", s.comment.as_deref().unwrap_or("(无)")),
+    ]
+}
+
+pub(crate) fn render_rule_edit_diff_summary(old: &NftCell, new: &NftCell) -> Vec<String> {
+    let mut lines = vec!["修改前:".to_string()];
+    lines.extend(
+        render_rule_edit_summary(old)
+            .into_iter()
+            .map(|line| format!("  {line}")),
+    );
+    lines.push("修改后:".to_string());
+    lines.extend(
+        render_rule_edit_summary(new)
+            .into_iter()
+            .map(|line| format!("  {line}")),
+    );
+    let changed = changed_fields(old, new);
+    lines.push(format!(
+        "changed_fields: {}",
+        if changed.is_empty() {
+            "(无)".to_string()
+        } else {
+            changed.join(", ")
+        }
+    ));
+    lines
+}
+
+fn render_rule_edit_unsupported_lines(rule: &NftCell) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("该字段当前不支持在编辑器中修改：ip_version，请通过重新添加规则处理。".to_string());
+    lines.push(
+        "该字段当前不支持在编辑器中修改：quota / access_control / egress_control / SNAT / MSS 高级字段，请通过对应专用菜单处理。"
+            .to_string(),
+    );
+    match rule {
+        NftCell::Range { .. } => lines.push(
+            "该字段当前不支持在编辑器中单独修改：端口段规则 dport 独立映射。目标端口段会随入口端口段保持一致。"
+                .to_string(),
+        ),
+        NftCell::Redirect { .. } => lines.push(
+            "该字段当前不支持在编辑器中修改：redirect 规则目标地址固定为 localhost。".to_string(),
+        ),
+        NftCell::Single { .. } | NftCell::Drop { .. } => {}
+    }
+    lines
+}
+
+pub(crate) fn rule_edit_snapshot(rule: &NftCell) -> RuleEditSnapshot {
+    match rule {
+        NftCell::Single {
+            enabled,
+            sport,
+            dport,
+            domain,
+            protocol,
+            ip_version,
+            comment,
+            ..
+        } => RuleEditSnapshot {
+            rule_type: "single".to_string(),
+            sport: sport.to_string(),
+            target: domain.clone(),
+            dport: dport.to_string(),
+            protocol: protocol.to_string(),
+            ip_version: ip_version.to_string(),
+            enabled: *enabled,
+            comment: comment.clone(),
+        },
+        NftCell::Range {
+            enabled,
+            port_start,
+            port_end,
+            domain,
+            protocol,
+            ip_version,
+            comment,
+            ..
+        } => RuleEditSnapshot {
+            rule_type: "range".to_string(),
+            sport: format!("{port_start}-{port_end}"),
+            target: domain.clone(),
+            dport: format!("{port_start}-{port_end}"),
+            protocol: protocol.to_string(),
+            ip_version: ip_version.to_string(),
+            enabled: *enabled,
+            comment: comment.clone(),
+        },
+        NftCell::Redirect {
+            enabled,
+            src_port,
+            src_port_end,
+            dst_port,
+            protocol,
+            ip_version,
+            comment,
+            ..
+        } => RuleEditSnapshot {
+            rule_type: "redirect".to_string(),
+            sport: src_port_end
+                .map(|end| format!("{src_port}-{end}"))
+                .unwrap_or_else(|| src_port.to_string()),
+            target: "localhost".to_string(),
+            dport: dst_port.to_string(),
+            protocol: protocol.to_string(),
+            ip_version: ip_version.to_string(),
+            enabled: *enabled,
+            comment: comment.clone(),
+        },
+        NftCell::Drop {
+            protocol, comment, ..
+        } => RuleEditSnapshot {
+            rule_type: "drop".to_string(),
+            sport: "-".to_string(),
+            target: "-".to_string(),
+            dport: "-".to_string(),
+            protocol: protocol.to_string(),
+            ip_version: "-".to_string(),
+            enabled: true,
+            comment: comment.clone(),
+        },
+    }
+}
+
+pub(crate) fn rule_edit_audit_detail(
+    rule_index: usize,
+    old: &NftCell,
+    new: &NftCell,
+) -> serde_json::Value {
+    let old_s = rule_edit_snapshot(old);
+    let new_s = rule_edit_snapshot(new);
+    let mut detail = json!({
+        "rule_index": rule_index,
+        "changed_fields": changed_fields(old, new),
+    });
+    if old_s.sport != new_s.sport {
+        detail["old_sport"] = json!(old_s.sport);
+        detail["new_sport"] = json!(new_s.sport);
+    }
+    if old_s.target != new_s.target {
+        detail["old_target"] = json!(old_s.target);
+        detail["new_target"] = json!(new_s.target);
+    }
+    if old_s.dport != new_s.dport {
+        detail["old_dport"] = json!(old_s.dport);
+        detail["new_dport"] = json!(new_s.dport);
+    }
+    if old_s.protocol != new_s.protocol {
+        detail["old_protocol"] = json!(old_s.protocol);
+        detail["new_protocol"] = json!(new_s.protocol);
+    }
+    if old_s.enabled != new_s.enabled {
+        detail["old_enabled"] = json!(old_s.enabled);
+        detail["new_enabled"] = json!(new_s.enabled);
+    }
+    if old_s.comment != new_s.comment {
+        detail["old_comment"] = json!(old_s.comment);
+        detail["new_comment"] = json!(new_s.comment);
+    }
+    detail
+}
+
+pub(crate) fn validate_rule_edit_conflicts(
+    config: &TomlConfig,
+    edited_index: usize,
+    edited_rule: &NftCell,
+) -> Result<(), String> {
+    let conflicts = find_rule_edit_conflicts(config, edited_index, edited_rule);
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(format_rule_edit_conflict_lines(&conflicts).join("\n"))
+    }
+}
+
+pub(crate) fn find_rule_edit_conflicts(
+    config: &TomlConfig,
+    edited_index: usize,
+    edited_rule: &NftCell,
+) -> Vec<RuleEditConflict> {
+    let Some(edited) = rule_ingress(edited_rule) else {
+        return Vec::new();
+    };
+    if !edited_rule.enabled() {
+        return Vec::new();
+    }
+    config
+        .rules
+        .iter()
+        .enumerate()
+        .filter(|(idx, rule)| *idx != edited_index && rule.enabled())
+        .filter_map(|(other_index, rule)| {
+            let other = rule_ingress(rule)?;
+            if edited.ports.overlaps(other.ports)
+                && protocols_overlap(edited.protocol, other.protocol)
+                && ip_versions_overlap(edited.ip_version, other.ip_version)
+            {
+                Some(RuleEditConflict {
+                    other_index,
+                    edited_ports: edited.ports,
+                    other_ports: other.ports,
+                    edited_protocol: edited.protocol,
+                    other_protocol: other.protocol,
+                    edited_ip_version: edited.ip_version,
+                    other_ip_version: other.ip_version,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn format_rule_edit_conflict_lines(conflicts: &[RuleEditConflict]) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("编辑后的入口端口 / 协议 / IP 版本与已有规则冲突：".to_string());
+    for conflict in conflicts {
+        lines.push(format!(
+            "- 已有规则 {}: sport={} protocol={} ip_version={} 与新规则 sport={} protocol={} ip_version={} 重叠",
+            conflict.other_index + 1,
+            conflict.other_ports,
+            conflict.other_protocol,
+            conflict.other_ip_version,
+            conflict.edited_ports,
+            conflict.edited_protocol,
+            conflict.edited_ip_version
+        ));
+    }
+    lines.push("请改用其它入口端口 / 端口段或协议；本次编辑不会保存。".to_string());
+    lines
+}
+
+pub(crate) fn rule_edit_requires_port_conflict_check(old: &NftCell, new: &NftCell) -> bool {
+    let old_ingress = rule_ingress(old);
+    let new_ingress = rule_ingress(new);
+    match (old_ingress, new_ingress) {
+        (Some(old_ingress), Some(new_ingress)) => {
+            old_ingress.ports != new_ingress.ports
+                || old_ingress.protocol != new_ingress.protocol
+                || (!old.enabled() && new.enabled())
+        }
+        (None, Some(_)) => new.enabled(),
+        _ => false,
+    }
+}
+
+fn editable_sport(rule: &NftCell) -> Option<PortRangeSpec> {
+    match rule {
+        NftCell::Single { sport, .. } => Some(PortRangeSpec::single(*sport)),
+        NftCell::Range {
+            port_start,
+            port_end,
+            ..
+        } => Some(PortRangeSpec {
+            start: *port_start,
+            end: *port_end,
+        }),
+        NftCell::Redirect {
+            src_port,
+            src_port_end,
+            ..
+        } => Some(PortRangeSpec {
+            start: *src_port,
+            end: src_port_end.unwrap_or(*src_port),
+        }),
+        NftCell::Drop { .. } => None,
+    }
+}
+
+fn rule_ingress(rule: &NftCell) -> Option<RuleIngress> {
+    match rule {
+        NftCell::Single {
+            sport,
+            protocol,
+            ip_version,
+            ..
+        } => Some(RuleIngress {
+            ports: PortRangeSpec::single(*sport),
+            protocol: *protocol,
+            ip_version: *ip_version,
+        }),
+        NftCell::Range {
+            port_start,
+            port_end,
+            protocol,
+            ip_version,
+            ..
+        } => Some(RuleIngress {
+            ports: PortRangeSpec {
+                start: *port_start,
+                end: *port_end,
+            },
+            protocol: *protocol,
+            ip_version: *ip_version,
+        }),
+        NftCell::Redirect {
+            src_port,
+            src_port_end,
+            protocol,
+            ip_version,
+            ..
+        } => Some(RuleIngress {
+            ports: PortRangeSpec {
+                start: *src_port,
+                end: src_port_end.unwrap_or(*src_port),
+            },
+            protocol: *protocol,
+            ip_version: *ip_version,
+        }),
+        NftCell::Drop { .. } => None,
+    }
+}
+
+fn protocols_overlap(left: Protocol, right: Protocol) -> bool {
+    left == right || matches!(left, Protocol::All) || matches!(right, Protocol::All)
+}
+
+fn ip_versions_overlap(left: IpVersion, right: IpVersion) -> bool {
+    left == right || matches!(left, IpVersion::All) || matches!(right, IpVersion::All)
+}
+
+pub(crate) fn rule_edit_confirmation_from_answer(answer: &str) -> RuleEditConfirmation {
+    if matches!(answer.trim(), "y" | "Y") {
+        RuleEditConfirmation::Save
+    } else {
+        RuleEditConfirmation::Cancel
+    }
+}
+
+pub(crate) fn rule_edit_post_save_messages(config: &TomlConfig, rule_index: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !config.global.enabled {
+        lines.push("提示：全局转发当前关闭，规则配置已保存，但不会立即生成转发规则。".to_string());
+    }
+    if config
+        .rules
+        .get(rule_index)
+        .map(|rule| !rule.enabled())
+        .unwrap_or(false)
+    {
+        lines.push("提示：该规则当前 disabled，不会生成 nft 规则。".to_string());
+    }
+    lines
+}
+
+fn audit_rule_edit_port_conflict_override(
+    path: &str,
+    rule_index: usize,
+    port_start: u16,
+    port_end: u16,
+    protocol: Protocol,
+    conflicts: &[PortConflict],
+) {
+    if conflicts.is_empty() {
+        return;
+    }
+    let preview: Vec<serde_json::Value> = conflicts
+        .iter()
+        .take(10)
+        .map(|conflict| {
+            json!({
+                "protocol": conflict.protocol,
+                "state": conflict.state,
+                "local_addr": conflict.local_addr,
+                "port": conflict.port,
+                "process": conflict.process,
+            })
+        })
+        .collect();
+    audit_cli(
+        path,
+        "rule.edit.port_conflict.override",
+        AuditResult::Warn,
+        json!({
+            "rule_index": rule_index,
+            "port_start": port_start,
+            "port_end": port_end,
+            "protocol": protocol.to_string(),
+            "conflict_count": conflicts.len(),
+            "conflicts_preview": preview,
+        }),
+    );
+}
+
+fn prune_last_good_cache_after_rule_edit(path: &str, config: &TomlConfig) {
+    match prune_last_good_cache_for_config(config) {
+        Ok(Some(result)) => {
+            audit_cli(
+                path,
+                "last_good.prune",
+                AuditResult::Ok,
+                json!({
+                    "trigger": "rule.edit",
+                    "file": config.last_good.file,
+                    "before": result.before,
+                    "after": result.after,
+                    "removed": result.removed,
+                }),
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                "rule.edit 后清理 stale last-good 缓存失败 ({}): {e}",
+                config.last_good.file
+            );
+            eprintln!(
+                "WARN: 清理 stale last-good 缓存失败（{}）：{e}",
+                config.last_good.file
+            );
+        }
+    }
+}
+
 fn delete_rule_interactive(path: &str) -> Result<(), io::Error> {
     let mut config = load_toml_config(path)?;
     if config.rules.is_empty() {
@@ -1016,6 +2143,7 @@ pub(crate) fn reason_affects_nft(reason: &str) -> bool {
         reason,
         "rule.add.single"
             | "rule.add.range"
+            | "rule.edit"
             | "rule.delete"
             | "rule.toggle"
             | "global.enabled.update"
@@ -6450,6 +7578,44 @@ mod tests {
         }
     }
 
+    fn edit_test_single_rule(sport: u16, dport: u16, target: &str, protocol: Protocol) -> NftCell {
+        NftCell::Single {
+            enabled: true,
+            sport,
+            dport,
+            domain: target.to_string(),
+            protocol,
+            ip_version: IpVersion::V4,
+            comment: Some("demo".to_string()),
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
+        }
+    }
+
+    fn edit_test_range_rule(start: u16, end: u16, protocol: Protocol) -> NftCell {
+        NftCell::Range {
+            enabled: true,
+            port_start: start,
+            port_end: end,
+            domain: "range.example.com".to_string(),
+            protocol,
+            ip_version: IpVersion::V4,
+            comment: Some("range".to_string()),
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
+        }
+    }
+
+    fn config_with_rules(rules: Vec<NftCell>) -> TomlConfig {
+        let mut config = TomlConfig::from_toml_str("rules = []").unwrap();
+        config.rules = rules;
+        config
+    }
+
     #[test]
     fn port_conflict_single_unoccupied_passes_with_mock_ss() {
         let output = r#"
@@ -6607,6 +7773,419 @@ tcp   LISTEN 0      128    127.0.0.1:40000    0.0.0.0:*     users:(("other",pid=
         assert_eq!(conflicts[0].port, 30001);
         assert_eq!(conflicts[1].port, 30002);
         assert_eq!(conflicts[1].protocol, "udp");
+    }
+
+    #[test]
+    fn edit_rule_updates_single_sport_success() {
+        let old = edit_test_single_rule(30080, 80, "example.com", Protocol::Tcp);
+        let edited = build_edited_rule(
+            &old,
+            &RuleEditPatch {
+                sport: Some(PortRangeSpec::single(30081)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rule_edit_snapshot(&edited).sport, "30081");
+        assert_eq!(changed_fields(&old, &edited), vec!["sport"]);
+    }
+
+    #[test]
+    fn edit_rule_updates_target_success() {
+        let old = edit_test_single_rule(30080, 80, "example.com", Protocol::Tcp);
+        let edited = build_edited_rule(
+            &old,
+            &RuleEditPatch {
+                target: Some("1.2.3.4".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rule_edit_snapshot(&edited).target, "1.2.3.4");
+        assert_eq!(changed_fields(&old, &edited), vec!["target"]);
+    }
+
+    #[test]
+    fn edit_rule_updates_dport_success() {
+        let old = edit_test_single_rule(30080, 80, "example.com", Protocol::Tcp);
+        let edited = build_edited_rule(
+            &old,
+            &RuleEditPatch {
+                dport: Some(443),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rule_edit_snapshot(&edited).dport, "443");
+        assert_eq!(changed_fields(&old, &edited), vec!["dport"]);
+    }
+
+    #[test]
+    fn edit_rule_updates_protocol_success() {
+        let old = edit_test_single_rule(30080, 80, "example.com", Protocol::Tcp);
+        let edited = build_edited_rule(
+            &old,
+            &RuleEditPatch {
+                protocol: Some(Protocol::Udp),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rule_edit_snapshot(&edited).protocol, "udp");
+        assert_eq!(changed_fields(&old, &edited), vec!["protocol"]);
+    }
+
+    #[test]
+    fn edit_rule_updates_enabled_success() {
+        let old = edit_test_single_rule(30080, 80, "example.com", Protocol::Tcp);
+        let edited = build_edited_rule(
+            &old,
+            &RuleEditPatch {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!rule_edit_snapshot(&edited).enabled);
+        assert_eq!(changed_fields(&old, &edited), vec!["enabled"]);
+    }
+
+    #[test]
+    fn edit_rule_updates_comment_success() {
+        let old = edit_test_single_rule(30080, 80, "example.com", Protocol::Tcp);
+        let edited = build_edited_rule(
+            &old,
+            &RuleEditPatch {
+                comment: Some(Some("new note".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rule_edit_snapshot(&edited).comment.as_deref(),
+            Some("new note")
+        );
+        assert_eq!(changed_fields(&old, &edited), vec!["comment"]);
+    }
+
+    #[test]
+    fn edit_rule_noop_has_no_changed_fields() {
+        let old = edit_test_single_rule(30080, 80, "example.com", Protocol::Tcp);
+        assert!(RuleEditPatch::default().is_empty());
+        assert!(changed_fields(&old, &old).is_empty());
+    }
+
+    #[test]
+    fn edit_rule_cancel_confirmation_means_do_not_save() {
+        assert_eq!(
+            rule_edit_confirmation_from_answer(""),
+            RuleEditConfirmation::Cancel
+        );
+        assert_eq!(
+            rule_edit_confirmation_from_answer("n"),
+            RuleEditConfirmation::Cancel
+        );
+        assert_eq!(
+            rule_edit_confirmation_from_answer("y"),
+            RuleEditConfirmation::Save
+        );
+    }
+
+    #[test]
+    fn edit_rule_safe_write_uses_rule_edit_reason_and_backup() {
+        let dir = safe_write_dir("rule-edit-safe-write");
+        let backup_dir = dir.join("backup");
+        let audit_file = dir.join("audit.log");
+        let target = dir.join("nat.toml");
+        std::fs::write(&target, "rules = []\n").unwrap();
+        let audit_cfg = nat_common::AuditConfig {
+            enabled: true,
+            file: audit_file.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+
+        let backup = safe_write_config_to(
+            &backup_dir,
+            &audit_cfg,
+            target.to_str().unwrap(),
+            "rules = []\n\n[global]\nenabled = false\n",
+            "rule.edit",
+        )
+        .unwrap();
+
+        assert!(backup.is_some(), "rule.edit must create a config backup");
+        let audit = std::fs::read_to_string(&audit_file).unwrap();
+        assert!(audit.contains("\"action\":\"config.write.success\""));
+        assert!(audit.contains("\"reason\":\"rule.edit\""));
+        assert!(!audit.contains("backup_skipped"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_rule_audit_detail_includes_changed_fields_only() {
+        let old = edit_test_single_rule(30080, 80, "example.com", Protocol::Tcp);
+        let edited = build_edited_rule(
+            &old,
+            &RuleEditPatch {
+                target: Some("new.example.com".to_string()),
+                protocol: Some(Protocol::Udp),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let detail = rule_edit_audit_detail(0, &old, &edited).to_string();
+        assert!(detail.contains("\"rule_index\":0"));
+        assert!(detail.contains("\"changed_fields\":[\"target\",\"protocol\"]"));
+        assert!(detail.contains("\"old_target\":\"example.com\""));
+        assert!(detail.contains("\"new_target\":\"new.example.com\""));
+        assert!(detail.contains("\"old_protocol\":\"tcp\""));
+        assert!(detail.contains("\"new_protocol\":\"udp\""));
+        assert!(!detail.contains("bot_token"));
+    }
+
+    #[test]
+    fn edit_rule_port_change_requires_local_port_conflict_check() {
+        let old = edit_test_single_rule(30080, 80, "example.com", Protocol::Tcp);
+        let port_changed = build_edited_rule(
+            &old,
+            &RuleEditPatch {
+                sport: Some(PortRangeSpec::single(30081)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let target_changed = build_edited_rule(
+            &old,
+            &RuleEditPatch {
+                target: Some("new.example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(rule_edit_requires_port_conflict_check(&old, &port_changed));
+        assert!(!rule_edit_requires_port_conflict_check(
+            &old,
+            &target_changed
+        ));
+    }
+
+    #[test]
+    fn edit_rule_rejects_conflict_with_other_rule() {
+        let first = edit_test_single_rule(30080, 80, "a.example.com", Protocol::Tcp);
+        let second = edit_test_single_rule(30081, 81, "b.example.com", Protocol::Tcp);
+        let config = config_with_rules(vec![first.clone(), second]);
+        let edited = build_edited_rule(
+            &first,
+            &RuleEditPatch {
+                sport: Some(PortRangeSpec::single(30081)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = validate_rule_edit_conflicts(&config, 0, &edited).unwrap_err();
+        assert!(err.contains("已有规则 2"));
+    }
+
+    #[test]
+    fn edit_rule_conflict_detection_excludes_self() {
+        let rule = edit_test_single_rule(30080, 80, "a.example.com", Protocol::Tcp);
+        let config = config_with_rules(vec![rule.clone()]);
+        validate_rule_edit_conflicts(&config, 0, &rule).unwrap();
+    }
+
+    #[test]
+    fn edit_rule_detects_port_range_overlap() {
+        let first = edit_test_range_rule(30000, 30010, Protocol::Tcp);
+        let second = edit_test_range_rule(30020, 30030, Protocol::Tcp);
+        let config = config_with_rules(vec![first, second.clone()]);
+        let edited = build_edited_rule(
+            &second,
+            &RuleEditPatch {
+                sport: Some(PortRangeSpec {
+                    start: 30005,
+                    end: 30012,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let conflicts = find_rule_edit_conflicts(&config, 1, &edited);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].other_index, 0);
+    }
+
+    #[test]
+    fn edit_rule_detects_protocol_all_overlap_with_tcp_udp() {
+        let tcp = edit_test_single_rule(30080, 80, "a.example.com", Protocol::Tcp);
+        let udp = edit_test_single_rule(30081, 81, "b.example.com", Protocol::Udp);
+        let config = config_with_rules(vec![tcp.clone(), udp.clone()]);
+        let edited_all = build_edited_rule(
+            &udp,
+            &RuleEditPatch {
+                sport: Some(PortRangeSpec::single(30080)),
+                protocol: Some(Protocol::All),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(find_rule_edit_conflicts(&config, 1, &edited_all).len(), 1);
+
+        let edited_udp = build_edited_rule(
+            &udp,
+            &RuleEditPatch {
+                sport: Some(PortRangeSpec::single(30080)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(find_rule_edit_conflicts(&config, 1, &edited_udp).is_empty());
+    }
+
+    #[test]
+    fn edit_rule_global_disabled_message_allows_saved_config() {
+        let mut config = config_with_rules(vec![edit_test_single_rule(
+            30080,
+            80,
+            "example.com",
+            Protocol::Tcp,
+        )]);
+        config.global.enabled = false;
+        let lines = rule_edit_post_save_messages(&config, 0).join("\n");
+        assert!(lines.contains("全局转发当前关闭"));
+    }
+
+    #[test]
+    fn edit_rule_disabled_message_mentions_no_nft_generation() {
+        let mut rule = edit_test_single_rule(30080, 80, "example.com", Protocol::Tcp);
+        rule.set_enabled(false);
+        let config = config_with_rules(vec![rule]);
+        let lines = rule_edit_post_save_messages(&config, 0).join("\n");
+        assert!(lines.contains("该规则当前 disabled"));
+        assert!(lines.contains("不会生成 nft 规则"));
+    }
+
+    #[test]
+    fn edit_rule_target_change_prunes_stale_last_good_cache() {
+        use nat_common::last_good::LastGoodRule;
+
+        let dir = safe_write_dir("rule-edit-last-good-prune");
+        let config_path = dir.join("nat.toml");
+        let last_good_path = dir.join("last-good-state.json");
+        let audit_path = dir.join("audit.log");
+        let mut config = config_with_rules(vec![edit_test_single_rule(
+            30080,
+            80,
+            "old.example.com",
+            Protocol::Tcp,
+        )]);
+        config.last_good.file = last_good_path.to_string_lossy().to_string();
+        config.audit = nat_common::AuditConfig {
+            enabled: true,
+            file: audit_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let old_identity = last_good::identities_from_rules(&config.rules)
+            .pop()
+            .unwrap();
+        let state = LastGoodState {
+            last_success_at: None,
+            rules: vec![LastGoodRule {
+                rule_id: "r0".to_string(),
+                rule_key: Some(old_identity.rule_key),
+                comment: None,
+                domain: "old.example.com".to_string(),
+                last_good_ip: "10.0.0.1".to_string(),
+                last_resolved_at: chrono::Utc::now(),
+                egress_allowed: true,
+                last_apply_status: "ok".to_string(),
+            }],
+            last_good_nft_hash: None,
+        };
+        state.save(last_good_path.to_str().unwrap()).unwrap();
+
+        let edited = build_edited_rule(
+            &config.rules[0],
+            &RuleEditPatch {
+                target: Some("new.example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        apply_rule_edit_to_config(&mut config, 0, edited).unwrap();
+        std::fs::write(&config_path, config.to_toml_string().unwrap()).unwrap();
+        prune_last_good_cache_after_rule_edit(config_path.to_str().unwrap(), &config);
+
+        let pruned = LastGoodState::load(last_good_path.to_str().unwrap());
+        assert!(pruned.rules.is_empty());
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(audit.contains("\"trigger\":\"rule.edit\""));
+        assert!(audit.contains("\"removed\":1"));
+    }
+
+    #[test]
+    fn edit_rule_preserves_quota_fields_and_updates_stats_label_alignment() {
+        let mut disabled = edit_test_single_rule(30079, 79, "disabled.example.com", Protocol::Tcp);
+        disabled.set_enabled(false);
+        let mut quota_rule = edit_test_single_rule(30080, 80, "old.example.com", Protocol::Tcp);
+        if let NftCell::Single {
+            quota_enabled,
+            quota_bytes,
+            ..
+        } = &mut quota_rule
+        {
+            *quota_enabled = true;
+            *quota_bytes = 1024;
+        }
+        let mut config = config_with_rules(vec![disabled, quota_rule.clone()]);
+        let edited = build_edited_rule(
+            &quota_rule,
+            &RuleEditPatch {
+                sport: Some(PortRangeSpec::single(30090)),
+                comment: Some(Some("edited".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        apply_rule_edit_to_config(&mut config, 1, edited).unwrap();
+
+        assert!(config.rules[1].quota_enabled());
+        assert_eq!(config.rules[1].quota_bytes(), 1024);
+        let labels = traffic_stats::rule_labels_from_config(&config);
+        assert!(labels.get("r0").unwrap().contains("30090"));
+        assert!(labels.get("r0").unwrap().contains("edited"));
+
+        let mut stats = StatsState::default();
+        stats.per_rule_monthly_bytes.insert("r0".to_string(), 512);
+        let usages = quota::compute_usages(&config.rules, &stats, chrono::Utc::now());
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].rule_id, "r0");
+        assert_eq!(usages[0].original_index, 1);
+    }
+
+    #[test]
+    fn edit_rule_eof_prompt_result_cancels_without_panic() {
+        let result = prompt_result_to_rule_edit_input(Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "stdin EOF",
+        )))
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn edit_rule_validates_target_address() {
+        assert_eq!(
+            validate_target_address("  localhost ").unwrap(),
+            "localhost"
+        );
+        assert!(validate_target_address("2001:db8::1").is_ok());
+        assert!(validate_target_address("https://example.com").is_err());
+        assert!(validate_target_address("bad host").is_err());
+    }
+
+    #[test]
+    fn rule_edit_reason_is_nft_affecting() {
+        assert!(reason_affects_nft("rule.edit"));
     }
 
     #[test]
@@ -8468,8 +10047,8 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
         let menu_src = include_str!("menu.rs");
         // v0.4.3：主菜单标签 + 页面文案明确「手动排查」/「不自动采集」
         assert!(
-            menu_src.contains("14) 最近来源 IP 观察（手动排查）"),
-            "主菜单 14) 必须带「手动排查」后缀"
+            menu_src.contains("15) 最近来源 IP 观察（手动排查）"),
+            "主菜单 15) 必须带「手动排查」后缀"
         );
         assert!(
             menu_src.contains("当前版本**不**自动采集最近来源 IP"),
