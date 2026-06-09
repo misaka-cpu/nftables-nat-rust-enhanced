@@ -9187,40 +9187,20 @@ domain = "a.example.com"
             "README should document SNAT modes"
         );
         assert!(
-            readme.contains("mode = \"fixed\""),
-            "README should show fixed example"
+            readme.contains("`fixed`：生成 `snat to <fixed_source_ip>`"),
+            "README should describe the fixed SNAT mode"
         );
         assert!(
-            readme.contains("### MSS clamp"),
+            readme.contains("`mss_clamp`") && readme.contains("TCP SYN 写 MSS"),
             "README should document MSS clamp"
         );
         assert!(
-            readme.contains("size = 1452"),
-            "README should mention default MSS size"
+            readme.contains("源地址改写（masquerade / fixed / off）"),
+            "README should label snat as source rewrite with its modes"
         );
         assert!(
-            readme.contains("### 组合策略说明"),
-            "README should have combined policy section"
-        );
-        assert!(
-            readme.contains("`access_control`") && readme.contains("来源 IP / CIDR"),
-            "README combined-policy section should label access_control as source IP restriction"
-        );
-        assert!(
-            readme.contains("`egress_control`") && readme.contains("目标 IP / CIDR"),
-            "README combined-policy section should label egress_control as target IP restriction"
-        );
-        assert!(
-            readme.contains("`snat`") && readme.contains("源地址改写"),
-            "README combined-policy section should label snat as source rewrite"
-        );
-        assert!(
-            readme.contains("`mss_clamp`") && readme.contains("TCP MSS 调整"),
-            "README combined-policy section should label mss_clamp as TCP MSS adjustment"
-        );
-        assert!(
-            readme.contains("多个来源限制同时开启时采用叠加限制（AND），不是 OR 放行"),
-            "README should state AND semantics, not OR"
+            readme.contains("AND 叠加") && readme.contains("`egress_control` 是目标限制，独立判断"),
+            "README should state AND source semantics and independent target restriction"
         );
     }
 
@@ -9364,32 +9344,17 @@ domain = "a.example.com"
     fn readme_documents_quota() {
         let readme = include_str!("../../README.md");
         assert!(
-            readme.contains("### 规则级流量配额 quota"),
-            "README should document quota"
-        );
-        assert!(readme.contains("[quota]"));
-        assert!(readme.contains("quota_enabled"));
-        assert!(readme.contains("quota_period"));
-        assert!(
-            readme.contains("100GB") && readme.contains("MiB"),
-            "README should document size formats"
+            readme.contains("`quota`：基于 Stats"),
+            "README should document quota and that it builds on Stats"
         );
         assert!(
-            readme.contains("Stats 流量统计")
-                && (readme.contains("不另起一套") || readme.contains("基于现有")),
-            "README should explain quota uses existing Stats"
+            readme.contains("超额自动禁用规则")
+                || readme.contains("超额后把规则 `enabled` 置 false"),
+            "README should explain quota auto-disable on exceed"
         );
         assert!(
-            readme.contains("自动禁用"),
-            "README should explain auto-disable"
-        );
-        assert!(
-            readme.contains("不直接执行 `nft -f`") || readme.contains("不直接执行 nft -f"),
-            "README must state quota does not directly run nft"
-        );
-        assert!(
-            readme.contains("每个 period 内通知") && readme.contains("一次"),
-            "README should describe notification dedup"
+            readme.contains("不直接 `nft -f`") && readme.contains("不删规则"),
+            "README must state quota does not directly run nft or delete rules"
         );
     }
 
@@ -9397,16 +9362,12 @@ domain = "a.example.com"
     fn readme_documents_last_good_and_audit() {
         let readme = include_str!("../../README.md");
         assert!(
-            readme.contains("### last-good 状态缓存"),
-            "README should document last-good"
+            readme.contains("### last-good / Stats / quota / audit"),
+            "README should document last-good and audit"
         );
         assert!(
-            readme.contains("### audit 审计日志"),
-            "README should document audit"
-        );
-        assert!(
-            readme.contains("[last_good]") && readme.contains("[audit]"),
-            "README should show TOML sections"
+            readme.contains("`last_good`") && readme.contains("`audit`"),
+            "README should document both last_good and audit"
         );
         assert!(
             readme.contains("Telegram") && readme.contains("脱敏"),
@@ -9420,56 +9381,39 @@ domain = "a.example.com"
 
     #[test]
     fn readme_documents_v0_6_1_save_hint_split_and_script_hash() {
-        let readme = include_str!("../../README.md");
-        // 保存提示分流
+        // v0.6.1 的实现细节（保存提示分流 / script_hash）已下沉到 CHANGELOG。
+        let changelog = include_str!("../../CHANGELOG.md");
         assert!(
-            readme.contains("无需等待 nft 应用") && readme.contains("不影响 nft 规则的 reason"),
-            "README 应说明 v0.6.1 配置保存提示按 reason 分流"
-        );
-        // script_hash 行为
-        assert!(
-            readme.contains("stable_script_hash") || readme.contains("script_hash"),
-            "README 应说明 v0.6.1 用 hash 判断脚本变化"
+            changelog.contains("保存提示按 reason 分流"),
+            "CHANGELOG 应说明配置保存提示按 reason 分流"
         );
         assert!(
-            readme.contains("FNV") || readme.contains("FNV-1a"),
-            "README 应说明 hash 算法选择"
+            changelog.contains("stable_script_hash") || changelog.contains("script_hash"),
+            "CHANGELOG 应说明用 hash 判断脚本变化"
+        );
+        assert!(
+            changelog.contains("FNV") || changelog.contains("FNV-1a"),
+            "CHANGELOG 应说明 hash 算法选择"
         );
     }
 
     #[test]
     fn readme_documents_v0_6_0_audit_rotation_and_safe_write_and_latest_resolution() {
         let readme = include_str!("../../README.md");
-        // audit 内置轻量轮转
+        // audit 内置轻量轮转（精简首页保留高层说明，具体参数下沉到 CLI / 源码）
         assert!(
-            readme.contains("内置轻量轮转")
-                && readme.contains("max_size_mb")
-                && readme.contains("max_backups"),
-            "README 应说明 audit 内置轮转参数"
+            readme.contains("内置轻量轮转"),
+            "README 应说明 audit 内置轮转"
         );
-        // 默认值描述
-        assert!(
-            readme.contains("max_size_mb = 10") && readme.contains("max_backups = 3"),
-            "README 应给出 audit 默认轮转参数"
-        );
-        // safe_write_config 安全写配置流程
+        // safe_write_config 安全写配置流程（README 与 CHANGELOG 均应有）
         assert!(
             readme.contains("safe_write_config") || readme.contains("安全写配置"),
             "README 应描述安全写配置流程"
         );
+        let changelog = include_str!("../../CHANGELOG.md");
         assert!(
-            readme.contains("config.write.success") && readme.contains("config.write.fail"),
-            "README 应说明 audit 事件 config.write.success / fail"
-        );
-        // 一键更新 latest 解析行为
-        assert!(
-            readme.contains("解析 GitHub 最新 release tag")
-                || readme.contains("解析 GitHub 最新 release"),
-            "README 应说明 CLI latest 解析行为"
-        );
-        assert!(
-            readme.contains("选择来源") && readme.contains("specified"),
-            "README 应说明更新摘要中的『选择来源』字段"
+            changelog.contains("safe_write_config"),
+            "CHANGELOG 应记录 safe_write_config 安全写配置流程"
         );
     }
 
@@ -9477,28 +9421,28 @@ domain = "a.example.com"
     fn readme_documents_combined_policy() {
         let readme = include_str!("../../README.md");
         assert!(
-            readme.contains("### access_control 与 GeoIP 的组合策略"),
-            "README should document the combined policy"
+            readme.contains("### 来源与目标控制"),
+            "README should document the combined source/target policy"
         );
         assert!(
-            readme.contains("黑名单优先级最高"),
+            readme.contains("AND 叠加"),
+            "README should state AND semantics"
+        );
+        assert!(
+            readme.contains("黑名单优先拒绝"),
             "README should state blacklist priority"
         );
         assert!(
-            readme.contains("白名单是精确来源限制"),
+            readme.contains("白名单精确放行"),
             "README should describe whitelist as exact-source restriction"
         );
         assert!(
-            readme.contains("GeoIP 是国家/地区来源限制"),
+            readme.contains("GeoIP 地区放行"),
             "README should describe GeoIP as country restriction"
         );
         assert!(
-            readme.contains("两者可以同时启用，叠加生效，不是互相覆盖"),
-            "README should state layering, not OR override"
-        );
-        assert!(
-            readme.contains("同时启用 = AND"),
-            "README should state AND semantics"
+            readme.contains("`egress_control` 是目标限制，独立判断"),
+            "README should state egress_control is an independent target restriction"
         );
     }
 
@@ -9506,12 +9450,12 @@ domain = "a.example.com"
     fn readme_documents_auto_reload_after_update() {
         let readme = include_str!("../../README.md");
         assert!(
-            readme.contains("CLI 一键更新成功后会自动重新载入新版 `nat --menu`"),
+            readme.contains("成功后自动重载新版菜单"),
             "README should note that the CLI auto-reloads after one-key update"
         );
         assert!(
-            readme.contains("如果当前环境无 TTY 或自动重载失败"),
-            "README should document the fallback path for auto-reload"
+            readme.contains("更新前备份旧二进制 / service，失败尝试回滚"),
+            "README should document update backup/rollback safety"
         );
     }
 
@@ -9856,13 +9800,11 @@ System clock synchronized: yes
 
     #[test]
     fn readme_documents_quota_total_traffic_mode_relation() {
-        // v0.4.1: README 必须说明 quota_period = "total" 与 stats.traffic_mode 的关系
+        // quota 与 stats.traffic_mode 的关系：quota 基于 Stats 的当前口径统计。
         let readme = include_str!("../../README.md");
         assert!(
-            readme.contains("quota_period = \"total\"")
-                && readme.contains("traffic_mode")
-                && readme.contains("不会自动重算"),
-            "README 必须解释 total 与 traffic_mode 切换的影响"
+            readme.contains("`quota`：基于 Stats") && readme.contains("traffic_mode"),
+            "README 必须说明 quota 基于 Stats 当前 traffic_mode 口径"
         );
     }
 
@@ -10937,8 +10879,8 @@ time_format = "%Y-%m-%d %H:%M:%S %Z"
     fn readme_documents_short_external_test_hint() {
         let readme = include_str!("../../README.md");
         assert!(
-            readme.contains("CLI 默认只展示简短测试提示") && readme.contains("输入 h 查看"),
-            "README 应说明默认简短测试提示与 h 入口"
+            readme.contains("测试转发规则连通性") && readme.contains("SNAT 出口诊断"),
+            "README 应说明测试转发规则连通性与 SNAT 出口诊断"
         );
     }
 
@@ -11877,10 +11819,12 @@ HTTP/2 200
     #[test]
     fn readme_documents_source_whitelist_troubleshooting() {
         let readme = include_str!("../../README.md");
-        assert!(readme.contains("## 来源白名单排查"));
-        assert!(readme.contains("查询来源 IP 命中情况"));
-        assert!(readme.contains("dynamic_whitelist` 是来源 IP 动态白名单"));
-        assert!(readme.contains("egress_control` 用于限制目标 IP"));
+        assert!(readme.contains("查询某来源 IP 是否命中"));
+        assert!(readme.contains("dynamic_whitelist"));
+        assert!(
+            readme.contains("`egress_control` 是目标限制，独立判断"),
+            "README should distinguish egress_control (target) from source restrictions"
+        );
     }
 
     // ===== v0.8.1 草案：动态 DDNS 来源白名单子菜单简化测试 =====
