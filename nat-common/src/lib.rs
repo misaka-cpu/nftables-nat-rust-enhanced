@@ -572,6 +572,8 @@ pub struct DynamicWhitelistConfig {
     #[serde(default = "default_dynamic_whitelist_cidr_expand_ipv4")]
     pub cidr_expand_ipv4: u8,
     #[serde(default)]
+    pub file_sources: Vec<String>,
+    #[serde(default)]
     pub domains: Vec<DynamicWhitelistDomainConfig>,
 }
 
@@ -586,6 +588,7 @@ impl Default for DynamicWhitelistConfig {
             notify_on_change: true,
             state_file: default_dynamic_whitelist_state_file(),
             cidr_expand_ipv4: default_dynamic_whitelist_cidr_expand_ipv4(),
+            file_sources: Vec::new(),
             domains: Vec::new(),
         }
     }
@@ -1608,6 +1611,14 @@ impl DynamicWhitelistConfig {
                 self.cidr_expand_ipv4
             ));
         }
+        for (idx, path) in self.file_sources.iter().enumerate() {
+            if path.trim().is_empty() {
+                return Err(format!(
+                    "dynamic_whitelist.file_sources[{}] 不能为空",
+                    idx + 1
+                ));
+            }
+        }
         for (idx, domain) in self.domains.iter().enumerate() {
             domain
                 .validate()
@@ -1672,7 +1683,7 @@ pub fn validate_dynamic_whitelist_domain(domain: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_access_entry(entry: &str) -> Result<(), String> {
+pub(crate) fn validate_access_entry(entry: &str) -> Result<(), String> {
     if entry.trim().is_empty() {
         return Err("access_control entries 不能为空".to_string());
     }
@@ -2498,6 +2509,48 @@ snat_ip = "198.51.100.20"
         assert!(config.dynamic_whitelist.notify_on_change);
         assert_eq!(config.dynamic_whitelist.cidr_expand_ipv4, 32);
         assert!(config.dynamic_whitelist.domains.is_empty());
+    }
+
+    #[test]
+    fn dynamic_whitelist_defaults_file_sources_empty() {
+        let config = TomlConfig::from_toml_str("rules = []").unwrap_or_else(|e| panic!("{e}"));
+        assert!(config.dynamic_whitelist.file_sources.is_empty());
+    }
+
+    #[test]
+    fn dynamic_whitelist_parses_file_sources() {
+        let config = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[dynamic_whitelist]
+enabled = true
+file_sources = ["/var/lib/nft-auth-whitelist/allow.txt"]
+"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(config.dynamic_whitelist.enabled);
+        assert_eq!(
+            config.dynamic_whitelist.file_sources,
+            vec!["/var/lib/nft-auth-whitelist/allow.txt"]
+        );
+    }
+
+    #[test]
+    fn dynamic_whitelist_rejects_blank_file_source() {
+        let err = TomlConfig::from_toml_str(
+            r#"
+rules = []
+
+[dynamic_whitelist]
+enabled = true
+file_sources = [" "]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("dynamic_whitelist.file_sources[1]"));
     }
 
     #[test]
