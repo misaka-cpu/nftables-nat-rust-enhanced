@@ -857,8 +857,11 @@ fn format_ip_list_truncated(ips: &[String], max: usize) -> String {
 }
 
 // File sources are loaded before access_control mode filtering on purpose:
-// a configured invalid/unreadable source file is an input error and must block
+// invalid content or unreadable existing files are input errors and must block
 // refresh/apply instead of being silently ignored when access_control is off.
+// Missing files are handled by nat_common as empty contributions so a receive
+// host can start before nft-auth-receive writes the first allow.txt; with
+// access_control=whitelist, an empty merged whitelist keeps forwarding closed.
 // Valid file-source entries still only affect generated rules through whitelist
 // mode in access_config_with_dynamic_whitelist().
 fn dynamic_whitelist_effective_sources(
@@ -1845,6 +1848,46 @@ refresh_interval_seconds = 123
             &DynamicWhitelistState::default(),
         )
         .unwrap_or_else(|e| panic!("{e}"));
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Whitelist,
+            entries: Vec::new(),
+        };
+        let effective = access_config_with_dynamic_whitelist(&access, &sources);
+        let script = build_new_script(
+            &single_ipv4_tcp_cell(),
+            &DnsConfig::default(),
+            &effective,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(!script.contains("counter dnat"));
+        assert!(!script.contains("ip saddr {  }"));
+        let _ = fs::remove_dir_all(path.parent().unwrap_or_else(|| panic!("missing parent")));
+    }
+
+    #[test]
+    fn missing_file_whitelist_keeps_forward_closed() {
+        let path = temp_file_source_dir("missing").join("allow.txt");
+        let mut dynamic_config = DynamicWhitelistConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        dynamic_config.file_sources = vec![path.to_string_lossy().to_string()];
+
+        let sources = dynamic_whitelist_effective_sources(
+            &dynamic_config,
+            &DynamicWhitelistState::default(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(sources.is_empty());
+
         let access = nat_common::AccessControlConfig {
             mode: nat_common::AccessControlMode::Whitelist,
             entries: Vec::new(),
