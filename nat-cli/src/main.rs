@@ -1883,8 +1883,23 @@ refresh_interval_seconds = 123
             entries: Vec::new(),
         };
         let effective = access_config_with_dynamic_whitelist(&access, &sources);
+        let script = build_new_script(
+            &single_ipv4_tcp_cell(),
+            &DnsConfig::default(),
+            &effective,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
 
         assert!(effective.entries.is_empty());
+        assert!(script.contains("tcp dport 30080 counter dnat"));
+        assert!(!script.contains("ip saddr { 203.0.113.10 }"));
         let _ = fs::remove_dir_all(path.parent().unwrap_or_else(|| panic!("missing parent")));
     }
 
