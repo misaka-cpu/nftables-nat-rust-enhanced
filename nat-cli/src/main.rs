@@ -27,7 +27,7 @@ use nat_common::{
     last_good::{self, LastGoodState, ResolutionLog},
     logger, stats as traffic_stats,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::process::Command;
@@ -254,10 +254,30 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
                 dynamic_whitelist_state = refreshed.state;
                 last_dynamic_whitelist_refresh = Some(loop_now);
             }
-            let dynamic_whitelist_ips = dynamic_whitelist::effective_sources_for_config(
+            let dynamic_whitelist_ips = match dynamic_whitelist_effective_sources(
                 &dynamic_whitelist_config,
                 &dynamic_whitelist_state,
-            );
+            ) {
+                Ok(ips) => ips,
+                Err(e) => {
+                    error!(
+                        "读取 dynamic_whitelist file_sources 失败，保持上一版已应用规则并等待下一次刷新: {e}"
+                    );
+                    sleep(next_loop_sleep_with_dynamic_whitelist(
+                        refresh_interval,
+                        &stats_config,
+                        last_ddns_refresh,
+                        last_stats_collect,
+                        Local::now(),
+                        DynamicWhitelistSleepContext {
+                            config: &dynamic_whitelist_config,
+                            interval_seconds: dynamic_whitelist_interval,
+                            last_refresh: last_dynamic_whitelist_refresh,
+                        },
+                    ));
+                    continue;
+                }
+            };
             warn_dynamic_whitelist_policy(
                 &access_config,
                 &dynamic_whitelist_config,
@@ -412,10 +432,10 @@ pub(crate) fn refresh_once(args: &Args) -> Result<(), io::Error> {
         );
         dynamic_whitelist_state = refreshed.state;
     }
-    let dynamic_whitelist_ips = dynamic_whitelist::effective_sources_for_config(
+    let dynamic_whitelist_ips = dynamic_whitelist_effective_sources(
         &runtime_config.dynamic_whitelist,
         &dynamic_whitelist_state,
-    );
+    )?;
     warn_dynamic_whitelist_policy(
         &runtime_config.access_control,
         &runtime_config.dynamic_whitelist,
@@ -834,6 +854,26 @@ fn format_ip_list_truncated(ips: &[String], max: usize) -> String {
     }
     let shown = ips[..max].join(", ");
     format!("{shown}, … (+{} more)", ips.len() - max)
+}
+
+fn dynamic_whitelist_effective_sources(
+    config: &DynamicWhitelistConfig,
+    state: &DynamicWhitelistState,
+) -> Result<Vec<String>, io::Error> {
+    let ddns_sources = dynamic_whitelist::effective_sources_for_config(config, state);
+    let file_sources = dynamic_whitelist::file_sources_for_config(config)?;
+    Ok(merge_source_entries(&ddns_sources, &file_sources))
+}
+
+fn merge_source_entries(left: &[String], right: &[String]) -> Vec<String> {
+    let mut merged = BTreeSet::new();
+    for entry in left {
+        merged.insert(entry.clone());
+    }
+    for entry in right {
+        merged.insert(entry.clone());
+    }
+    merged.into_iter().collect()
 }
 
 fn access_config_with_dynamic_whitelist(
@@ -1270,6 +1310,42 @@ mod safe_apply_tests {
     static FAKE_NFT_SEQ: AtomicU64 = AtomicU64::new(0);
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn temp_file_source_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nat-file-whitelist-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn write_file_source(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = temp_file_source_dir(name);
+        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.join("allow.txt");
+        fs::write(&path, body).unwrap_or_else(|e| panic!("{e}"));
+        path
+    }
+
+    fn single_ipv4_tcp_cell() -> Vec<config::RuntimeCell> {
+        vec![config::RuntimeCell::Rule(nat_common::NftCell::Single {
+            enabled: true,
+            sport: 30080,
+            dport: 80,
+            domain: "93.184.216.34".to_string(),
+            protocol: nat_common::Protocol::Tcp,
+            ip_version: nat_common::IpVersion::V4,
+            snat_ip: None,
+            comment: None,
+            quota_enabled: false,
+            quota_bytes: 0,
+            quota_period: nat_common::QuotaPeriod::default(),
+            quota_action: nat_common::QuotaAction::default(),
+        })]
+    }
+
     struct FakeNftEnv {
         root: PathBuf,
         nft_bin: PathBuf,
@@ -1671,6 +1747,145 @@ refresh_interval_seconds = 123
         .unwrap();
         assert!(script.contains("ip saddr { 1.2.3.4, 5.6.7.0/24 } tcp dport 30080 counter dnat"));
         assert!(!script.contains(" counter drop "));
+    }
+
+    #[test]
+    fn file_whitelist_source_generates_saddr_match() {
+        let path = write_file_source("saddr", "203.0.113.10\n");
+        let mut dynamic_config = DynamicWhitelistConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        dynamic_config.file_sources = vec![path.to_string_lossy().to_string()];
+
+        let sources = dynamic_whitelist_effective_sources(
+            &dynamic_config,
+            &DynamicWhitelistState::default(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(sources, vec!["203.0.113.10"]);
+
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Whitelist,
+            entries: Vec::new(),
+        };
+        let effective = access_config_with_dynamic_whitelist(&access, &sources);
+        let script = build_new_script(
+            &single_ipv4_tcp_cell(),
+            &DnsConfig::default(),
+            &effective,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(script.contains("ip saddr { 203.0.113.10 } tcp dport 30080 counter dnat"));
+        assert!(!script.contains("ct state new tcp dport 30080 counter dnat"));
+        let _ = fs::remove_dir_all(path.parent().unwrap_or_else(|| panic!("missing parent")));
+    }
+
+    #[test]
+    fn file_whitelist_source_merges_with_static_entries() {
+        let path = write_file_source("static-merge", "203.0.113.10\n");
+        let mut dynamic_config = DynamicWhitelistConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        dynamic_config.file_sources = vec![path.to_string_lossy().to_string()];
+
+        let sources = dynamic_whitelist_effective_sources(
+            &dynamic_config,
+            &DynamicWhitelistState::default(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Whitelist,
+            entries: vec!["198.51.100.20".to_string()],
+        };
+        let effective = access_config_with_dynamic_whitelist(&access, &sources);
+        let script = build_new_script(
+            &single_ipv4_tcp_cell(),
+            &DnsConfig::default(),
+            &effective,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(script.contains("ip saddr { 198.51.100.20, 203.0.113.10 } tcp dport 30080 counter dnat"));
+        let _ = fs::remove_dir_all(path.parent().unwrap_or_else(|| panic!("missing parent")));
+    }
+
+    #[test]
+    fn empty_file_whitelist_keeps_forward_closed() {
+        let path = write_file_source("empty", "\n# no entries\n");
+        let mut dynamic_config = DynamicWhitelistConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        dynamic_config.file_sources = vec![path.to_string_lossy().to_string()];
+
+        let sources = dynamic_whitelist_effective_sources(
+            &dynamic_config,
+            &DynamicWhitelistState::default(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Whitelist,
+            entries: Vec::new(),
+        };
+        let effective = access_config_with_dynamic_whitelist(&access, &sources);
+        let script = build_new_script(
+            &single_ipv4_tcp_cell(),
+            &DnsConfig::default(),
+            &effective,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &ResolutionLog::new(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(!script.contains("counter dnat"));
+        assert!(!script.contains("ip saddr {  }"));
+        let _ = fs::remove_dir_all(path.parent().unwrap_or_else(|| panic!("missing parent")));
+    }
+
+    #[test]
+    fn file_whitelist_does_not_affect_access_control_off() {
+        let path = write_file_source("access-off", "203.0.113.10\n");
+        let mut dynamic_config = DynamicWhitelistConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        dynamic_config.file_sources = vec![path.to_string_lossy().to_string()];
+
+        let sources = dynamic_whitelist_effective_sources(
+            &dynamic_config,
+            &DynamicWhitelistState::default(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Off,
+            entries: Vec::new(),
+        };
+        let effective = access_config_with_dynamic_whitelist(&access, &sources);
+
+        assert!(effective.entries.is_empty());
+        let _ = fs::remove_dir_all(path.parent().unwrap_or_else(|| panic!("missing parent")));
     }
 
     #[test]
