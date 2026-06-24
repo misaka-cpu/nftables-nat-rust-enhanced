@@ -856,6 +856,11 @@ fn format_ip_list_truncated(ips: &[String], max: usize) -> String {
     format!("{shown}, … (+{} more)", ips.len() - max)
 }
 
+// File sources are loaded before access_control mode filtering on purpose:
+// a configured invalid/unreadable source file is an input error and must block
+// refresh/apply instead of being silently ignored when access_control is off.
+// Valid file-source entries still only affect generated rules through whitelist
+// mode in access_config_with_dynamic_whitelist().
 fn dynamic_whitelist_effective_sources(
     config: &DynamicWhitelistConfig,
     state: &DynamicWhitelistState,
@@ -1862,6 +1867,34 @@ refresh_interval_seconds = 123
         assert!(!script.contains("counter dnat"));
         assert!(!script.contains("ip saddr {  }"));
         let _ = fs::remove_dir_all(path.parent().unwrap_or_else(|| panic!("missing parent")));
+    }
+
+    #[test]
+    fn invalid_file_whitelist_errors_before_access_control_off_can_ignore_it() {
+        let path = write_file_source("invalid-access-off", "example.com\n");
+        let mut dynamic_config = DynamicWhitelistConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        dynamic_config.file_sources = vec![path.to_string_lossy().to_string()];
+        let access = nat_common::AccessControlConfig {
+            mode: nat_common::AccessControlMode::Off,
+            entries: Vec::new(),
+        };
+        assert!(matches!(
+            access.mode,
+            nat_common::AccessControlMode::Off
+        ));
+
+        let result = dynamic_whitelist_effective_sources(
+            &dynamic_config,
+            &DynamicWhitelistState::default(),
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap_or_else(|| panic!("missing parent")));
+        let err = result.unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("example.com"));
     }
 
     #[test]
