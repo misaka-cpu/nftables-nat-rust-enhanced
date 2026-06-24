@@ -3,7 +3,7 @@
 //! 该模块只处理“来源 IP 白名单”的动态解析状态，不复用目标 last-good state，
 //! 也不接触 egress_control / 目标域名解析。
 
-use crate::{DynamicWhitelistConfig, atomic};
+use crate::{DynamicWhitelistConfig, atomic, validate_access_entry};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -394,6 +394,64 @@ pub fn effective_sources_for_config(
     values.into_iter().collect()
 }
 
+pub fn file_sources_for_config(config: &DynamicWhitelistConfig) -> io::Result<Vec<String>> {
+    if !config.enabled {
+        return Ok(Vec::new());
+    }
+    read_file_sources(&config.file_sources)
+}
+
+pub fn read_file_sources(paths: &[String]) -> io::Result<Vec<String>> {
+    let mut values = BTreeSet::new();
+    for path in paths {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dynamic whitelist file source path is empty",
+            ));
+        }
+
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                log::warn!("dynamic whitelist file source not found ({path}); no entries loaded");
+                continue;
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("dynamic whitelist file source read failed ({path}): {e}"),
+                ));
+            }
+        };
+
+        let before = values.len();
+        for (line_idx, raw_line) in content.lines().enumerate() {
+            let entry = raw_line.trim();
+            if entry.is_empty() || entry.starts_with('#') {
+                continue;
+            }
+            validate_access_entry(entry).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "dynamic whitelist file source {path}:{} invalid entry {entry:?}: {e}",
+                        line_idx + 1
+                    ),
+                )
+            })?;
+            values.insert(entry.to_string());
+        }
+
+        if values.len() == before {
+            log::warn!("dynamic whitelist file source is empty ({path})");
+        }
+    }
+
+    Ok(values.into_iter().collect())
+}
+
 /// 取单个 domain state 的「生效来源条目」视图。
 ///
 /// 若 state 中的 `cidr_expand_ipv4` 与配置一致且 `effective_sources` 已经记录，
@@ -538,6 +596,70 @@ mod tests {
             std::process::id(),
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn file_sources_parse_ip_cidr_ipv6_comments_and_blanks() {
+        let path = temp_path("file-source-parse");
+        fs::write(
+            &path,
+            "\n# comment\n203.0.113.10\n203.0.113.0/24\n2001:db8::1\n203.0.113.10\n",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let sources = read_file_sources(&[path.to_string_lossy().to_string()])
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(
+            sources,
+            vec!["2001:db8::1", "203.0.113.0/24", "203.0.113.10"]
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_sources_missing_file_contributes_empty() {
+        let path = temp_path("file-source-missing");
+        let sources = read_file_sources(&[path.to_string_lossy().to_string()])
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn file_sources_reject_invalid_entry() {
+        let path = temp_path("file-source-invalid");
+        fs::write(&path, "example.com\n").unwrap_or_else(|e| panic!("{e}"));
+
+        let err = read_file_sources(&[path.to_string_lossy().to_string()]).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("example.com"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_sources_read_error_is_returned() {
+        let path = temp_path("file-source-directory");
+        fs::create_dir_all(&path).unwrap_or_else(|e| panic!("{e}"));
+
+        let err = read_file_sources(&[path.to_string_lossy().to_string()]).unwrap_err();
+
+        assert_ne!(err.kind(), io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn file_sources_disabled_config_returns_empty_without_reading() {
+        let config = DynamicWhitelistConfig {
+            enabled: false,
+            file_sources: vec!["/path/that/does/not/exist".to_string()],
+            ..Default::default()
+        };
+
+        let sources = file_sources_for_config(&config).unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(sources.is_empty());
     }
 
     #[test]
