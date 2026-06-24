@@ -1766,11 +1766,9 @@ refresh_interval_seconds = 123
         };
         dynamic_config.file_sources = vec![path.to_string_lossy().to_string()];
 
-        let sources = dynamic_whitelist_effective_sources(
-            &dynamic_config,
-            &DynamicWhitelistState::default(),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let sources =
+            dynamic_whitelist_effective_sources(&dynamic_config, &DynamicWhitelistState::default())
+                .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(sources, vec!["203.0.113.10"]);
 
         let access = nat_common::AccessControlConfig {
@@ -1806,11 +1804,9 @@ refresh_interval_seconds = 123
         };
         dynamic_config.file_sources = vec![path.to_string_lossy().to_string()];
 
-        let sources = dynamic_whitelist_effective_sources(
-            &dynamic_config,
-            &DynamicWhitelistState::default(),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let sources =
+            dynamic_whitelist_effective_sources(&dynamic_config, &DynamicWhitelistState::default())
+                .unwrap_or_else(|e| panic!("{e}"));
         let access = nat_common::AccessControlConfig {
             mode: nat_common::AccessControlMode::Whitelist,
             entries: vec!["198.51.100.20".to_string()],
@@ -1830,7 +1826,10 @@ refresh_interval_seconds = 123
         )
         .unwrap_or_else(|e| panic!("{e}"));
 
-        assert!(script.contains("ip saddr { 198.51.100.20, 203.0.113.10 } tcp dport 30080 counter dnat"));
+        assert!(
+            script
+                .contains("ip saddr { 198.51.100.20, 203.0.113.10 } tcp dport 30080 counter dnat")
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap_or_else(|| panic!("missing parent")));
     }
 
@@ -1843,11 +1842,9 @@ refresh_interval_seconds = 123
         };
         dynamic_config.file_sources = vec![path.to_string_lossy().to_string()];
 
-        let sources = dynamic_whitelist_effective_sources(
-            &dynamic_config,
-            &DynamicWhitelistState::default(),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let sources =
+            dynamic_whitelist_effective_sources(&dynamic_config, &DynamicWhitelistState::default())
+                .unwrap_or_else(|e| panic!("{e}"));
         let access = nat_common::AccessControlConfig {
             mode: nat_common::AccessControlMode::Whitelist,
             entries: Vec::new(),
@@ -1881,11 +1878,9 @@ refresh_interval_seconds = 123
         };
         dynamic_config.file_sources = vec![path.to_string_lossy().to_string()];
 
-        let sources = dynamic_whitelist_effective_sources(
-            &dynamic_config,
-            &DynamicWhitelistState::default(),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let sources =
+            dynamic_whitelist_effective_sources(&dynamic_config, &DynamicWhitelistState::default())
+                .unwrap_or_else(|e| panic!("{e}"));
         assert!(sources.is_empty());
 
         let access = nat_common::AccessControlConfig {
@@ -1924,15 +1919,10 @@ refresh_interval_seconds = 123
             mode: nat_common::AccessControlMode::Off,
             entries: Vec::new(),
         };
-        assert!(matches!(
-            access.mode,
-            nat_common::AccessControlMode::Off
-        ));
+        assert!(matches!(access.mode, nat_common::AccessControlMode::Off));
 
-        let result = dynamic_whitelist_effective_sources(
-            &dynamic_config,
-            &DynamicWhitelistState::default(),
-        );
+        let result =
+            dynamic_whitelist_effective_sources(&dynamic_config, &DynamicWhitelistState::default());
         let _ = fs::remove_dir_all(path.parent().unwrap_or_else(|| panic!("missing parent")));
         let err = result.unwrap_err();
 
@@ -1949,11 +1939,9 @@ refresh_interval_seconds = 123
         };
         dynamic_config.file_sources = vec![path.to_string_lossy().to_string()];
 
-        let sources = dynamic_whitelist_effective_sources(
-            &dynamic_config,
-            &DynamicWhitelistState::default(),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let sources =
+            dynamic_whitelist_effective_sources(&dynamic_config, &DynamicWhitelistState::default())
+                .unwrap_or_else(|e| panic!("{e}"));
         let access = nat_common::AccessControlConfig {
             mode: nat_common::AccessControlMode::Off,
             entries: Vec::new(),
