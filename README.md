@@ -135,6 +135,7 @@ entries = []
 
 - `access_control`：来源 IP/CIDR 白名单或黑名单，只作用于本项目转发端口，不影响 SSH。
 - `dynamic_whitelist`：定期解析自有 DDNS 域名，把结果并入来源白名单，仅在 `whitelist` 模式参与放行；DNS 失败可用 last-good 来源 IP 兜底。可选 `/24` 扩展（`cidr_expand_ipv4`，默认 `/32`，切换需二次确认）。
+- `dynamic_whitelist.file_sources`：读取本机文件中的来源 IP/CIDR，并入来源白名单；适合接入 `nft-auth-whitelist` 在 receive 端生成的 `/var/lib/nft-auth-whitelist/allow.txt`。只作用于本项目管理的转发端口，不保护本机 SSH 或其它本机监听端口。缺失的 allow.txt 按空贡献处理；已有文件不可读或内容无效会阻止刷新/应用。
 - `geoip`：可选，仅 IPv4。限制转发端口 / SSH 只允许中国大陆 IPv4（+可选 LAN）。SSH 限制有锁死风险，开启前务必确认。
 - `egress_control`：限制本机只能转发到 `allowed_target_cidrs`，防止被当成开放代理。
 
@@ -177,6 +178,7 @@ GeoIP 默认通过 `cn4_url` 拉取 `cn4.nft` 作为中国大陆 IPv4 set。`cn4
 - **nft 规则未找到**：`nft list table ip self-nat`；常见原因是服务未运行、规则尚未应用（等一个检测周期）、配置解析失败或 fake-ip 被拒。
 - **Stats 为 0**：首次采集建立 baseline；确认 `stats.enabled=true`、有流量经过、`traffic_mode` 符合口径。
 - **白名单导致不通**：`whitelist` 模式未命中来源不会匹配规则，检查 `access_control.entries`。
+- **nft-auth 白名单未生效**：确认 `[access_control] mode = "whitelist"`，`[dynamic_whitelist] enabled = true`，并且 `dynamic_whitelist.file_sources` 指向 receive 端写出的 `allow.txt`。文件为空或无有效条目时不会打开转发端口。
 - **GLIBC_x.xx not found**：release 与系统 glibc 不兼容，升级 release 或 `bash install.sh --core-only --build-from-source`。
 - **release 下载失败**：`bash install.sh --core-only --use-release --version v0.8.10`，或回退源码编译。
 
