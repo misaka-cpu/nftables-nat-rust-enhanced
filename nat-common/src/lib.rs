@@ -148,6 +148,17 @@ pub struct Args {
     pub compatible_config_file: Option<String>,
     #[arg(long, value_name = "TOML_CONFIG", help = "toml配置文件")]
     pub toml: Option<String>,
+    /// 只生成并检查 nftables 脚本，不应用规则
+    #[arg(long, help = "只生成并检查 nftables 脚本，不应用规则")]
+    pub check_only: bool,
+    /// check-only 模式下输出生成脚本的路径
+    #[arg(
+        long,
+        value_name = "SCRIPT_PATH",
+        requires = "check_only",
+        help = "check-only 模式下输出生成脚本的路径"
+    )]
+    pub output_script: Option<String>,
 }
 
 /// Legacy配置解析错误
@@ -2151,6 +2162,23 @@ mod tests {
         assert_eq!(resolve_build_version(None), "dev");
         assert_eq!(resolve_build_version(Some("")), "dev");
         assert_eq!(resolve_build_version(Some("   ")), "dev");
+    }
+
+    #[test]
+    fn args_parse_check_only_and_output_script() {
+        let args = Args::try_parse_from([
+            "nat",
+            "--toml",
+            "/tmp/nat.toml",
+            "--check-only",
+            "--output-script",
+            "/tmp/nat-preview.nft",
+        ])
+        .unwrap();
+
+        assert!(args.check_only);
+        assert_eq!(args.output_script.as_deref(), Some("/tmp/nat-preview.nft"));
+        assert_eq!(args.toml.as_deref(), Some("/tmp/nat.toml"));
     }
 
     #[test]
