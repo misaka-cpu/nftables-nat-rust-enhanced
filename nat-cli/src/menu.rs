@@ -2315,6 +2315,8 @@ fn refresh_ddns_interactive(
         menu: false,
         compatible_config_file: None,
         toml: Some(path.to_string()),
+        check_only: false,
+        output_script: None,
     };
     audit_cli(
         path,

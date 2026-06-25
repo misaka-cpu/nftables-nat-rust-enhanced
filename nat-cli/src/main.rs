@@ -56,6 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return menu::run_menu(args.toml.as_deref());
     }
 
+    if args.check_only {
+        return Ok(run_check_only(&args)?);
+    }
+
     // 启动时解析一次配置文件，并且快速失败
     if let Err(e) = parse_conf(&args).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)) {
         info!("解析配置文件失败: {e:?}");
@@ -398,6 +402,88 @@ fn handle_loop(args: &Args) -> Result<(), io::Error> {
             },
         ));
     }
+}
+
+pub(crate) fn run_check_only(args: &Args) -> Result<(), io::Error> {
+    run_check_only_with(args, "/usr/sbin/nft")
+}
+
+pub(crate) fn run_check_only_with(args: &Args, nft_bin: &str) -> Result<(), io::Error> {
+    let runtime_config = load_runtime_config(args);
+    let nat_cells = parse_conf(args).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let last_good_state = LastGoodState::load(&runtime_config.last_good.file);
+    let dynamic_whitelist_state =
+        DynamicWhitelistState::load(&runtime_config.dynamic_whitelist.state_file);
+    let dynamic_whitelist_ips = dynamic_whitelist_effective_sources(
+        &runtime_config.dynamic_whitelist,
+        &dynamic_whitelist_state,
+    )?;
+    warn_dynamic_whitelist_policy(
+        &runtime_config.access_control,
+        &runtime_config.dynamic_whitelist,
+        &dynamic_whitelist_ips,
+    );
+    let effective_access_config = access_config_with_dynamic_whitelist(
+        &runtime_config.access_control,
+        &dynamic_whitelist_ips,
+    );
+    let resolution_log = ResolutionLog::new();
+    let script = build_new_script_with_global(
+        runtime_config.global.enabled,
+        &nat_cells,
+        &runtime_config.dns,
+        &effective_access_config,
+        &runtime_config.geoip,
+        &runtime_config.egress_control,
+        &runtime_config.snat,
+        &runtime_config.mss_clamp,
+        &runtime_config.last_good,
+        &last_good_state,
+        &resolution_log,
+    )?;
+    let output_path = check_only_output_path(args);
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = File::create(&output_path)?;
+    file.write_all(script.as_bytes())?;
+
+    let output = Command::new(nft_bin)
+        .arg("-c")
+        .arg("-f")
+        .arg(&output_path)
+        .output()?;
+    info!(
+        "check-only nft -c -f {} status: {}",
+        output_path.display(),
+        output.status
+    );
+    info!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+    error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "nft check failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
+}
+
+fn check_only_output_path(args: &Args) -> std::path::PathBuf {
+    args.output_script
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "nat-check-only-{}-{}.nft",
+                std::process::id(),
+                Local::now().timestamp_nanos_opt().unwrap_or_default()
+            ))
+        })
 }
 
 pub(crate) fn refresh_once(args: &Args) -> Result<(), io::Error> {
@@ -1457,6 +1543,111 @@ exit 1
         }
     }
 
+    fn write_check_only_toml(
+        dir: &std::path::Path,
+        allow_path: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let toml_path = dir.join("nat.toml");
+        let dynamic_state_path = dir.join("dynamic-whitelist.json");
+        let audit_path = dir.join("audit.log");
+        fs::write(
+            &toml_path,
+            format!(
+                r#"[[rules]]
+type = "single"
+sport = 30080
+dport = 80
+domain = "10.100.0.10"
+protocol = "tcp"
+ip_version = "ipv4"
+enabled = true
+
+[access_control]
+mode = "whitelist"
+entries = []
+
+[dynamic_whitelist]
+enabled = true
+state_file = "{}"
+file_sources = ["{}"]
+
+[audit]
+enabled = true
+file = "{}"
+"#,
+                dynamic_state_path.display(),
+                allow_path.display(),
+                audit_path.display(),
+            ),
+        )
+        .unwrap();
+        toml_path
+    }
+
+    #[test]
+    fn check_only_writes_script_and_runs_nft_check_only() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let fake = FakeNftEnv::new("check-only");
+        let config_dir = fake.root.join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let allow_path = write_file_source("check-only", "203.0.113.10\n");
+        let toml_path = write_check_only_toml(&config_dir, &allow_path);
+        let output_script = fake.root.join("preview.nft");
+        let args = Args {
+            menu: false,
+            compatible_config_file: None,
+            toml: Some(toml_path.to_string_lossy().to_string()),
+            check_only: true,
+            output_script: Some(output_script.to_string_lossy().to_string()),
+        };
+
+        let result = run_check_only_with(&args, fake.nft_bin.to_str().unwrap());
+        let _ = fs::remove_dir_all(
+            allow_path
+                .parent()
+                .unwrap_or_else(|| panic!("missing parent")),
+        );
+        result.unwrap();
+
+        assert_eq!(
+            fake.log_lines(),
+            vec![format!("-c -f {}", output_script.display())]
+        );
+        let script = fs::read_to_string(&output_script).unwrap();
+        assert!(script.contains("ip saddr { 203.0.113.10 } tcp dport 30080 counter dnat"));
+    }
+
+    #[test]
+    fn check_only_rejects_invalid_file_source_before_nft() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let fake = FakeNftEnv::new("check-only-invalid");
+        let config_dir = fake.root.join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let allow_path = write_file_source("check-only-invalid", "not-an-ip\n");
+        let toml_path = write_check_only_toml(&config_dir, &allow_path);
+        let output_script = fake.root.join("preview.nft");
+        let args = Args {
+            menu: false,
+            compatible_config_file: None,
+            toml: Some(toml_path.to_string_lossy().to_string()),
+            check_only: true,
+            output_script: Some(output_script.to_string_lossy().to_string()),
+        };
+
+        let result = run_check_only_with(&args, fake.nft_bin.to_str().unwrap());
+        let _ = fs::remove_dir_all(
+            allow_path
+                .parent()
+                .unwrap_or_else(|| panic!("missing parent")),
+        );
+        let err = result.unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("not-an-ip"));
+        assert!(fake.log_lines().is_empty());
+        assert!(!output_script.exists());
+    }
+
     #[test]
     fn apply_checks_script_before_loading_it() {
         let _guard = TEST_LOCK.lock().unwrap();
@@ -1679,6 +1870,8 @@ refresh_interval_seconds = 123
             menu: false,
             compatible_config_file: None,
             toml: Some(config_path.to_string_lossy().to_string()),
+            check_only: false,
+            output_script: None,
         };
         let runtime_config = load_runtime_config(&args);
         assert_eq!(runtime_config.ddns.refresh_interval_seconds, 123);
@@ -4233,12 +4426,16 @@ state_file = "{}"
             menu: false,
             compatible_config_file: None,
             toml: Some(toml_path.to_string_lossy().to_string()),
+            check_only: false,
+            output_script: None,
         });
         run_quota_check_with(
             &Args {
                 menu: false,
                 compatible_config_file: None,
                 toml: Some(toml_path.to_string_lossy().to_string()),
+                check_only: false,
+                output_script: None,
             },
             &runtime_config.quota,
             &runtime_config.audit,
@@ -4324,6 +4521,8 @@ state_file = "{}"
             menu: false,
             compatible_config_file: None,
             toml: Some(toml_path.to_string_lossy().to_string()),
+            check_only: false,
+            output_script: None,
         };
         let runtime_config = load_runtime_config(&args);
 
@@ -4396,6 +4595,8 @@ state_file = "{}"
             menu: false,
             compatible_config_file: None,
             toml: Some(toml_path.to_string_lossy().to_string()),
+            check_only: false,
+            output_script: None,
         };
         let runtime_config = load_runtime_config(&args);
         run_quota_check_with(
@@ -4460,6 +4661,8 @@ state_file = "{}"
             menu: false,
             compatible_config_file: None,
             toml: Some(toml_path.to_string_lossy().to_string()),
+            check_only: false,
+            output_script: None,
         };
         let runtime_config = load_runtime_config(&args);
         run_quota_check(
@@ -4510,6 +4713,8 @@ state_file = "{}"
             menu: false,
             compatible_config_file: None,
             toml: Some(toml_path.to_string_lossy().to_string()),
+            check_only: false,
+            output_script: None,
         };
         let runtime_config = load_runtime_config(&args);
         run_quota_check_with(
