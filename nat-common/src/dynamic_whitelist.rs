@@ -402,7 +402,18 @@ pub fn file_sources_for_config(config: &DynamicWhitelistConfig) -> io::Result<Ve
 }
 
 pub fn read_file_sources(paths: &[String]) -> io::Result<Vec<String>> {
+    let (values, empty_paths) = read_file_sources_impl(paths)?;
+    for path in &empty_paths {
+        log::warn!("dynamic whitelist file source is empty ({path})");
+    }
+    Ok(values)
+}
+
+/// 返回 (去重后的条目, 自身不含有效条目的文件路径)。判空按单文件解析出的
+/// 有效条目数统计，条目与其它文件重复（BTreeSet 不增长）不算空。
+fn read_file_sources_impl(paths: &[String]) -> io::Result<(Vec<String>, Vec<String>)> {
     let mut values = BTreeSet::new();
+    let mut empty_paths = Vec::new();
     for path in paths {
         let path = path.trim();
         if path.is_empty() {
@@ -426,7 +437,7 @@ pub fn read_file_sources(paths: &[String]) -> io::Result<Vec<String>> {
             }
         };
 
-        let before = values.len();
+        let mut file_entries = 0usize;
         for (line_idx, raw_line) in content.lines().enumerate() {
             let entry = raw_line.trim();
             if entry.is_empty() || entry.starts_with('#') {
@@ -442,14 +453,15 @@ pub fn read_file_sources(paths: &[String]) -> io::Result<Vec<String>> {
                 )
             })?;
             values.insert(entry.to_string());
+            file_entries += 1;
         }
 
-        if values.len() == before {
-            log::warn!("dynamic whitelist file source is empty ({path})");
+        if file_entries == 0 {
+            empty_paths.push(path.to_string());
         }
     }
 
-    Ok(values.into_iter().collect())
+    Ok((values.into_iter().collect(), empty_paths))
 }
 
 /// 取单个 domain state 的「生效来源条目」视图。
@@ -636,6 +648,44 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("example.com"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_sources_duplicate_entries_across_files_not_flagged_empty() {
+        let first = temp_path("file-source-dup-first");
+        let second = temp_path("file-source-dup-second");
+        fs::write(&first, "203.0.113.10/32\n").unwrap_or_else(|e| panic!("{e}"));
+        fs::write(&second, "203.0.113.10/32\n").unwrap_or_else(|e| panic!("{e}"));
+
+        let (values, empty_paths) = read_file_sources_impl(&[
+            first.to_string_lossy().to_string(),
+            second.to_string_lossy().to_string(),
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(values, vec!["203.0.113.10/32"]);
+        assert!(empty_paths.is_empty(), "{empty_paths:?}");
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+    }
+
+    #[test]
+    fn file_sources_empty_file_still_flagged_empty() {
+        let first = temp_path("file-source-empty-first");
+        let second = temp_path("file-source-empty-second");
+        fs::write(&first, "203.0.113.10/32\n").unwrap_or_else(|e| panic!("{e}"));
+        fs::write(&second, "\n# comment only\n").unwrap_or_else(|e| panic!("{e}"));
+
+        let (values, empty_paths) = read_file_sources_impl(&[
+            first.to_string_lossy().to_string(),
+            second.to_string_lossy().to_string(),
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(values, vec!["203.0.113.10/32"]);
+        assert_eq!(empty_paths, vec![second.to_string_lossy().to_string()]);
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
     }
 
     #[test]
